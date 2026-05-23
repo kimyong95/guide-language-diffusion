@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3",
+                "PYTHONPATH": ".",
+            }
+        },
+        {
+            "name": "Flow Direct",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3",
+                "PYTHONPATH": ".",
+                "WANDB_MODE": "offline",
+            },
+            "args": [
+                "--num_processes=1",
+                "--main_process_port=0",
+                "trainer/flow-direct.py",
+                "--config", "config/flow-direct.py:base",
+            ]
+        },
+    ]
+}

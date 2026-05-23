@@ -1,0 +1,19 @@
+name: guide-language-diffusion
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cuda-toolkit=12.8.2
+  - pip
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch==2.8.*
+    - torchvision==0.23.*
+    - transformers==4.57.*
+    - diffusers==0.37.*
+    - huggingface-hub==0.34.*
+    - accelerate==1.13.*
+    - sentencepiece==0.2.1
+    - einops
+    - wandb
+    - ml-collections
