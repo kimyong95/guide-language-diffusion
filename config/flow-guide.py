@@ -4,9 +4,9 @@ def base():
     config = ml_collections.ConfigDict()
 
     config.seed = 0
-    config.run_name = "flow-direct"
+    config.run_name = "flow-guide"
 
-    config.max_epochs = 100
+    config.max_epochs = 50
 
     config.model = "GSAI-ML/LLaDA-8B-Instruct"
     config.task = "sudoku:0"
@@ -15,10 +15,10 @@ def base():
 
     # total objective evaluations: 100*16=1600
     config.sample = ml_collections.ConfigDict()
-    config.sample.total_samples = 8
+    config.sample.total_samples = 32
     config.sample.num_inference_steps = 100
     config.sample.gen_length = 100
-    config.sample.temperature = 1.0
+    config.sample.temperature = 0.5
 
     return config
 

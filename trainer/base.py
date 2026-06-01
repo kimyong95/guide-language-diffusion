@@ -1,6 +1,5 @@
 import os
 import sys
-import html
 import torch
 import wandb
 from accelerate import Accelerator
@@ -17,11 +16,17 @@ class BaseTrainer:
         self.setup_task()
         self.setup_model()
         self.log_code()
+        self.text_table = {
+            "sampling": wandb.Table(
+                columns=["objective-evaluations", "idx", "reward", "text"],
+                log_mode="INCREMENTAL",
+            ),
+        }
 
     def setup_accelerator(self):
         self.accelerator = Accelerator(log_with="wandb")
         self.accelerator.init_trackers(
-            project_name="guide-llada",
+            project_name="guide-language-diffusion",
             config=self.config,
             init_kwargs={"wandb": {"name": self.config.run_name, "config": self.config.to_dict()}}
         )
@@ -84,17 +89,6 @@ class BaseTrainer:
     def decode_texts(self, xt):
         return self.pipeline.tokenizer.batch_decode(xt, skip_special_tokens=True)
 
-    def make_wandb_texts(self, rewards, texts):
-        return [
-            wandb.Html(
-                f'<div style="font-family:monospace;padding:6px;border:1px solid #ccc;margin:4px">'
-                f'<div><b>i={idx}, r={reward.item():.4f}</b></div>'
-                f'<pre style="white-space:pre-wrap;margin:0">{html.escape(text)}</pre>'
-                f'</div>'
-            )
-            for idx, (text, reward) in enumerate(zip(texts, rewards))
-        ]
-
     def log_rewards(self, objective_evaluations, rewards, stage, extra={}):
         log_dict = {
             "objective-evaluations": objective_evaluations,
@@ -107,9 +101,12 @@ class BaseTrainer:
     def log_texts(self, objective_evaluations, rewards, texts, stage, extra={}):
         if not self.accelerator.is_main_process:
             return
+        table = self.text_table[stage]
+        for idx, (text, reward) in enumerate(zip(texts, rewards)):
+            table.add_data(objective_evaluations, idx, reward.item(), text)
         log_dict = {
             "objective-evaluations": objective_evaluations,
-            f"{stage}/texts": self.make_wandb_texts(rewards, texts),
+            f"{stage}/texts": table,
             **extra,
         }
         self.accelerator.get_tracker("wandb").log(log_dict)

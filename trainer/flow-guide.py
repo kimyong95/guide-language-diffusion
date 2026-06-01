@@ -11,7 +11,7 @@ from tqdm import tqdm
 from base import BaseTrainer
 
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", "config/flow-direct.py", "Training configuration.")
+config_flags.DEFINE_config_file("config", "config/flow-guide.py", "Training configuration.")
 
 def gp_grad(X, Y, x):
     N, d = X.shape[0], X.shape[1:]
