@@ -54,8 +54,7 @@ class LLaDAScheduler:
         """
         num_transfer = self.get_coefficients(timestep)["num_transfer"]
 
-        pred_logits = add_gumbel_noise(pred_logits, self.temperature)
-        pred_tokens = pred_logits.argmax(dim=-1) # (B, L)
+        pred_tokens = add_gumbel_noise(pred_logits, self.temperature).argmax(dim=-1)
         p = F.softmax(pred_logits.to(torch.float64), dim=-1)
         conf = torch.gather(p, -1, pred_tokens.unsqueeze(-1)).squeeze(-1) # (B, L)
 

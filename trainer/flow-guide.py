@@ -2,6 +2,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import einops
 import torch
 import wandb
 from absl import flags
@@ -21,8 +22,8 @@ def gp_grad(X, Y, x):
     Y = Y.reshape(N, 1).to(dtype=torch.float64)
     x = x.reshape(n, -1).to(dtype=torch.float64)
 
-    K      = torch.exp(-torch.cdist(X, X).pow(2) / 2)             # (N, N)
-    k_star = torch.exp(-torch.cdist(x, X).pow(2) / 2)             # (n, N)
+    K      = torch.exp(-torch.cdist(X, X) ** 2 / 2)             # (N, N)
+    k_star = torch.exp(-torch.cdist(x, X) ** 2 / 2)             # (n, N)
 
     L      = torch.linalg.cholesky(K + 1e-6 * torch.eye(N, dtype=torch.float64, device=K.device))
     alpha  = torch.cholesky_solve(Y, L)                         # (N, 1)
