@@ -2,19 +2,18 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
+import einops
 
 MASK_ID = 126336  # [MASK] token id for LLaDA-8B
 
 
-def add_gumbel_noise(logits, temperature):
+def sample_token(logits, temperature):
     """Gumbel-max sampling. temperature=0 → greedy argmax."""
     if temperature == 0:
-        return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
+        return logits.argmax(dim=-1)
+    noise = torch.rand_like(logits)
     gumbel_noise = (-torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
-
+    return (logits.exp() / gumbel_noise).argmax(dim=-1)
 class LLaDAScheduler:
     """
     Diffusers-style full-diffusion scheduler. Each timestep commits the
@@ -54,8 +53,9 @@ class LLaDAScheduler:
         """
         num_transfer = self.get_coefficients(timestep)["num_transfer"]
 
-        pred_tokens = add_gumbel_noise(pred_logits, self.temperature).argmax(dim=-1)
-        p = F.softmax(pred_logits.to(torch.float64), dim=-1)
+        pred_logits = pred_logits.to(torch.float64)
+        pred_tokens = sample_token(pred_logits, self.temperature)
+        p = F.softmax(pred_logits, dim=-1)
         conf = torch.gather(p, -1, pred_tokens.unsqueeze(-1)).squeeze(-1) # (B, L)
 
         for i in range(xt.shape[0]):
@@ -93,23 +93,30 @@ class LLaDAPipeline:
         return torch.full((batch_size, self.scheduler.gen_length), self.mask_id, dtype=torch.long, device=self.device)
 
     @torch.no_grad()
-    def predict_latents(self, xt, question):
-        """One transformer forward pass over `[prompt | xt]`; return gen-position hidden states.
+    def model_predict(self, xt_tokens, question_tokens):
+        """One transformer forward pass over `[prompt | xt]`; return gen-position logits.
 
         Args:
             xt (B, L): current committed tokens (mask_id at uncommitted positions), dtype long.
-            question (str): the task prompt; re-encoded internally each call.
+            question_tokens (P): the task prompt; re-encoded internally each call.
 
         Returns:
-            latents (B, L, H): last-layer hidden state at the gen positions, dtype bfloat16.
+            logits (B, L, V)
+            hidden_states (H, B, L, d)
         """
-        qes_tokens = self.encode_prompt(question).expand(xt.shape[0], -1)
-        all_tokens = torch.cat([qes_tokens, xt], dim=1)
-        P = qes_tokens.shape[1]
-        out = self.transformer(all_tokens, output_hidden_states=True)
-        return out.hidden_states[-1][:, P:, :]
+        B, L = xt_tokens.shape
+        P = question_tokens.shape[0]
 
-    def decode(self, xt):
+        question_tokens = einops.repeat(question_tokens, "P -> B P", B=B)
+        all_tokens = torch.cat([question_tokens, xt_tokens], dim=1)
+        out = self.transformer(all_tokens, output_hidden_states=True)
+
+        logits = out.logits[:, P:, :] # (B, L, V)
+        hidden_states = torch.stack(out.hidden_states[:-1], dim=0)[:, :, P:, :] # (H, B, L, d)
+
+        return logits, hidden_states
+
+    def decode(self, xt, skip_special_tokens=True):
         """Decode committed tokens to text strings via the tokenizer.
 
         Args:
@@ -119,7 +126,7 @@ class LLaDAPipeline:
             texts (list[str], length B): one decoded string per batch element,
                 with special tokens removed.
         """
-        return self.tokenizer.batch_decode(xt, skip_special_tokens=True)
+        return self.tokenizer.batch_decode(xt, skip_special_tokens=skip_special_tokens)
 
 
 def retrieve_timesteps(scheduler, num_inference_steps, device=None):

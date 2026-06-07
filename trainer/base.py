@@ -46,8 +46,6 @@ class BaseTrainer:
         )
         self.pipeline.transformer.requires_grad_(False)
 
-        self.latent_shape = (self.config.sample.gen_length, self.pipeline.hidden_size)
-
     def log_code(self):
         if not self.accelerator.is_main_process:
             return
@@ -64,17 +62,6 @@ class BaseTrainer:
         self.accelerator.get_tracker("wandb").run.log_code(".", include_fn=lambda path: path in imported_py_files)
 
     @torch.no_grad()
-    def latents_to_logits(self, latents):
-        """
-        Args:
-            latents (B, L, H): last-layer hidden state.
-
-        Returns:
-            logits (B, L, V): output-projection logits.
-        """
-        return self.pipeline.transformer.model.transformer.ff_out(latents)
-
-    @torch.no_grad()
     def tokens_to_latents(self, tokens):
         """
         Args:
@@ -86,8 +73,8 @@ class BaseTrainer:
         return self.pipeline.transformer.model.transformer.ff_out.weight[tokens]
 
     @torch.no_grad()
-    def decode_texts(self, xt):
-        return self.pipeline.tokenizer.batch_decode(xt, skip_special_tokens=True)
+    def tokens_to_text(self, xt, skip_special_tokens=True):
+        return self.pipeline.tokenizer.batch_decode(xt, skip_special_tokens=skip_special_tokens)
 
     def log_rewards(self, objective_evaluations, rewards, stage, extra={}):
         log_dict = {
