@@ -1,134 +1,156 @@
 import torch
-import numpy as np
-import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
-import einops
+from transformers import AutoConfig, AutoProcessor, DiffusionGemmaForBlockDiffusion
+from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
+    EntropyBoundSampler,
+    EntropyBoundSamplerConfig,
+    LinearTemperatureScheduleLogitsProcessor,
+    StableAndConfidentStoppingCriteria,
+)
+from gemma_utils import build_device_map
 
-MASK_ID = 126336  # [MASK] token id for LLaDA-8B
+class DiffusionGemmaScheduler:
+    """Stateless scheduler for one DiffusionGemma diffusion pass over a single sequence.
 
-
-def sample_token(logits, temperature):
-    """Gumbel-max sampling. temperature=0 → greedy argmax."""
-    if temperature == 0:
-        return logits.argmax(dim=-1)
-    noise = torch.rand_like(logits)
-    gumbel_noise = (-torch.log(noise)) ** temperature
-    return (logits.exp() / gumbel_noise).argmax(dim=-1)
-class LLaDAScheduler:
+    xt_tokens: (L,) long; xt_logits: (L, V) float.
     """
-    Diffusers-style full-diffusion scheduler. Each timestep commits the
-    most-confident masked positions over the entire gen sequence; no block
-    structure.
 
-    xt is the committed token state, shape (B, L) long;
-    logits are the prediction, shape (B, L, V); L = gen_length (no prompt).
-    """
-    def __init__(self, gen_length=128, temperature=1.0, mask_id=MASK_ID):
+    def __init__(
+        self,
+        vocab_size,
+        gen_length=256,
+        entropy_bound=0.1,
+        t_min=0.4,
+        t_max=0.8,
+        stability_threshold=1,
+        confidence_threshold=0.005,
+    ):
         self.gen_length = gen_length
-        self.temperature = temperature
-        self.mask_id = mask_id
+        self.t_min = t_min
+        self.t_max = t_max
+
+        self.sampler = EntropyBoundSampler(
+            config=EntropyBoundSamplerConfig(entropy_bound=entropy_bound),
+            canvas_length=gen_length,
+            vocab_size=vocab_size,
+            max_denoising_steps=0,  # unused by this sampler
+        )
+        self.stopping_criteria = StableAndConfidentStoppingCriteria(
+            stability_threshold=stability_threshold,
+            confidence_threshold=confidence_threshold,
+        )
 
     def set_timesteps(self, num_inference_steps, device):
-        base = self.gen_length // num_inference_steps
-        rem  = self.gen_length %  num_inference_steps
-        self.transfer_per_step = [base + (1 if i < rem else 0) for i in range(num_inference_steps)]
-        self.timesteps = torch.arange(num_inference_steps, device=device)
+        """
+        Args:
+            num_inference_steps: DiffusionGemma's max_denoising_steps.
+        Returns:
+            timesteps: (num_inference_steps,) counting down N..1.
+        """
+        self.max_denoising_steps = num_inference_steps
+        self.temperature = LinearTemperatureScheduleLogitsProcessor(
+            t_min=self.t_min, t_max=self.t_max, max_denoising_steps=num_inference_steps
+        )
+        self.timesteps = torch.arange(num_inference_steps, 0, -1, device=device)
         return self.timesteps
 
-    def get_coefficients(self, timestep):
-        return {"num_transfer": self.transfer_per_step[int(timestep)], "t": timestep / len(self.timesteps)}
+    def init_tokens(self, device):
+        """Returns: (L,) random initial tokens; resets the stopping criteria."""
+        self.stopping_criteria.reset()
+        return self.sampler.initialize_canvas(batch_size=1, device=device)[0]  # (L,)
 
-
-    def step(self, xt, pred_logits, timestep):
-        """One denoising step: Gumbel-max sample from `logits` and commit the
-        top-k most-confident sampled tokens into `xt`.
-
-        Args:
-            xt (B, L): current committed tokens (mask_id at uncommitted positions), dtype long.
-            logits (B, L, V): predicted logits.
-            timestep (int | scalar tensor): step index in [0, num_inference_steps).
-
-        Returns:
-            xt (B, L): updated committed tokens (in-place; same tensor object), dtype long.
+    def step(self, xt_tokens, xt_logits, timestep):
         """
-        num_transfer = self.get_coefficients(timestep)["num_transfer"]
-
-        pred_logits = pred_logits.to(torch.float64)
-        pred_tokens = sample_token(pred_logits, self.temperature)
-        p = F.softmax(pred_logits, dim=-1)
-        conf = torch.gather(p, -1, pred_tokens.unsqueeze(-1)).squeeze(-1) # (B, L)
-
-        for i in range(xt.shape[0]):
-            masked_pos = torch.where(xt[i] == self.mask_id)[0]
-            select = masked_pos[conf[i, masked_pos].topk(num_transfer).indices]
-            xt[i, select] = pred_tokens[i, select]
-
-        return xt
-
-class LLaDAPipeline:
-    def __init__(self, model_name, device, gen_length, temperature, dtype=torch.bfloat16):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.transformer = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype=dtype).to(device).eval()
-        self.device = device
-        self.mask_id = MASK_ID
-        self.vocab_size = self.transformer.config.vocab_size
-        self.hidden_size = self.transformer.config.hidden_size
-        self.scheduler = LLaDAScheduler(gen_length=gen_length, temperature=temperature)
-
-    def encode_prompt(self, question):
-        messages = [{"role": "user", "content": question}]
-        text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        ids = self.tokenizer(text)['input_ids']
-        return torch.tensor(ids, device=self.device).unsqueeze(0)
-
-    def init_tokens(self, batch_size):
-        """Initialize the sampling state with all mask tokens.
-
         Args:
-            batch_size (int): number of samples in the batch.
-
+            xt_tokens: (L,) long working tokens.
+            xt_logits: (L, V) temperature-processed logits.
         Returns:
-            xt (B, L): mask_id at every position, dtype long.
+            next_xt_tokens: (L,) renoised tokens for the next step.
+            x1_tokens: (L,) clean prediction.
+            finished: scalar bool from the stopping criteria.
         """
-        return torch.full((batch_size, self.scheduler.gen_length), self.mask_id, dtype=torch.long, device=self.device)
+        # sampler / stopping utilities are batched; add a temporary batch-1 dim
+        xt_tokens_b = xt_tokens[None]  # (1, L)
+        xt_logits_b = xt_logits[None]  # (1, L, V)
+
+        probs = torch.softmax(xt_logits, dim=-1, dtype=torch.float32)          # (L, V)
+        denoiser_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (L,)
+        x1_tokens = torch.argmax(xt_logits, dim=-1)                            # (L,)
+
+        accepted_tokens = self.sampler.accept_canvas(xt_tokens_b, denoiser_tokens[None], xt_logits_b, timestep)
+        next_xt_tokens = self.sampler.renoise_canvas(accepted_tokens, timestep)[0]  # (L,)
+
+        finished = self.stopping_criteria(x1_tokens[None], xt_logits_b)[0]  # scalar bool
+
+        return next_xt_tokens, x1_tokens, finished
+
+
+class DiffusionGemmaPipeline:
+    def __init__(self, model_name, entropy_bound=0.1, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, gen_length):
+        self.processor = AutoProcessor.from_pretrained(model_name)
+
+        # pin the decoder canvas length to gen_length (else it stays at the model default 256)
+        config = AutoConfig.from_pretrained(model_name)
+        config.canvas_length = gen_length
+        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(model_name, config=config, dtype=dtype, device_map=build_device_map())
+
+        # no image input: drop the vision modules
+        del self.model.model.encoder.vision_tower
+        del self.model.model.encoder.embed_vision
+
+        self.gen_length = self.model.config.canvas_length
+        self.vocab_size = self.model.config.text_config.vocab_size
+        self.hidden_size = self.model.config.text_config.hidden_size
+        self.input_device = self.model.get_input_embeddings().weight.device
+
+        self.scheduler = DiffusionGemmaScheduler(
+            vocab_size=self.vocab_size,
+            gen_length=self.gen_length,
+            entropy_bound=entropy_bound,
+            t_min=t_min,
+            t_max=t_max,
+        )
+
+        # encoder KV cache + decoder positions, set by set_prompt
+        self.kv_cache = None
+        self.dec_pos = None
+
+    def init_tokens(self):
+        """Returns: (L,) random initial tokens; resets the stopping criteria."""
+        random_tokens = self.scheduler.init_tokens(self.input_device)
+        return random_tokens
 
     @torch.no_grad()
-    def model_predict(self, xt_tokens, question_tokens):
-        """One transformer forward pass over `[prompt | xt]`; return gen-position logits.
+    def set_prompt(self, prompt):
+        """Encode `prompt` into the batch-1 KV cache (`self.kv_cache`) and set `self.dec_pos`."""
+        input_ids = self.processor.apply_chat_template([{"role": "user", "content": prompt}],tokenize=True,add_generation_prompt=True,return_dict=True,return_tensors="pt",enable_thinking=False,)["input_ids"].to(self.input_device)  # (1, P)
+        P = input_ids.shape[1]
+        L = self.gen_length
+        self.dec_pos = torch.arange(P, P + L, device=self.input_device).unsqueeze(0)  # (1, L)
+        out = self.model.model.encoder(input_ids=input_ids)
+        self.kv_cache = out.past_key_values
 
-        Args:
-            xt (B, L): current committed tokens (mask_id at uncommitted positions), dtype long.
-            question_tokens (P): the task prompt; re-encoded internally each call.
-
-        Returns:
-            logits (B, L, V)
-            hidden_states (H, B, L, d)
+    @torch.no_grad()
+    def model_predict(self, xt_tokens, self_conditioning_logits, timestep, output_hidden_states=True):
         """
-        B, L = xt_tokens.shape
-        P = question_tokens.shape[0]
-
-        question_tokens = einops.repeat(question_tokens, "P -> B P", B=B)
-        all_tokens = torch.cat([question_tokens, xt_tokens], dim=1)
-        out = self.transformer(all_tokens, output_hidden_states=True)
-
-        logits = out.logits[:, P:, :] # (B, L, V)
-        hidden_states = torch.stack(out.hidden_states[:-1], dim=0)[:, :, P:, :] # (H, B, L, d)
-
-        return logits, hidden_states
-
-    def decode(self, xt, skip_special_tokens=True):
-        """Decode committed tokens to text strings via the tokenizer.
-
         Args:
-            xt (B, L): committed tokens, dtype long.
-
+            xt_tokens: (L,) long.
+            self_conditioning_logits: (L, V) from the previous step, or None.
         Returns:
-            texts (list[str], length B): one decoded string per batch element,
-                with special tokens removed.
+            xt_logits: (L, V) temperature-processed logits.
+            hidden_states: (H+1, L, D) per-layer hidden states.
         """
-        return self.tokenizer.batch_decode(xt, skip_special_tokens=skip_special_tokens)
+        out = self.model(
+            input_ids=None,
+            past_key_values=self.kv_cache,
+            decoder_input_ids=xt_tokens[None],  # (1, L)
+            decoder_position_ids=self.dec_pos,
+            self_conditioning_logits=self_conditioning_logits,
+            output_hidden_states=output_hidden_states,
+        )
+        hidden_states = torch.stack(out.hidden_states, dim=0)[:, 0]  # (H+1, L, D)
+        xt_logits = self.scheduler.temperature(None, out.logits, cur_step=timestep)[0]  # (L, V)
+        return xt_logits, hidden_states
 
-
-def retrieve_timesteps(scheduler, num_inference_steps, device=None):
-    timesteps = scheduler.set_timesteps(num_inference_steps, device)
-    return timesteps, num_inference_steps
+    def tokens_to_text(self, tokens, skip_special_tokens=False):
+        """Decode a single (T,) token sequence into a string."""
+        return self.processor.decode(tokens, skip_special_tokens=skip_special_tokens)

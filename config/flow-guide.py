@@ -8,20 +8,19 @@ def base():
 
     config.max_epochs = 100
 
-    config.model = "GSAI-ML/LLaDA-8B-Instruct"
+    config.model = "google/diffusiongemma-26B-A4B-it"
     config.task = "sudoku:0"
-
-    # TODO(text): guidance hyperparameters
 
     # total objective evaluations: 100*16=1600
     config.sample = ml_collections.ConfigDict()
-    config.sample.total_samples = 16
-    config.sample.num_inference_steps = 100
+    config.sample.total_samples = 8
+    config.sample.num_inference_steps = 48
     config.sample.gen_length = 256
-    config.sample.temperature = 1.0
-    config.sample.max_batch_size_per_device = 4 # only to avoid OOM, does not affect the mathematics
+    config.sample.entropy_bound = 0.1
+    config.sample.t_min = 0.4
+    config.sample.t_max = 0.8
 
-    config.guide_layer_id = 15
+    config.guide_scale = 50
 
     return config
 

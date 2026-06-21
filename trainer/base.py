@@ -4,7 +4,7 @@ import torch
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from pipeline import LLaDAPipeline
+from pipeline import DiffusionGemmaPipeline
 import tasks
 
 
@@ -31,20 +31,48 @@ class BaseTrainer:
             init_kwargs={"wandb": {"name": self.config.run_name, "config": self.config.to_dict()}}
         )
         set_seed(self.config.seed, device_specific=True)
-        assert torch.cuda.device_count() == self.accelerator.num_processes, f"Number of avaliable GPUs does not match the number of processes ({self.accelerator.num_processes})"
+        # assert torch.cuda.device_count() == self.accelerator.num_processes, f"Number of avaliable GPUs does not match the number of processes ({self.accelerator.num_processes})"
         assert self.config.sample.total_samples % self.accelerator.num_processes == 0, "total_samples must be divisible by num GPUs"
 
     def setup_task(self):
         self.task = tasks.get_reward_fn(self.config.task)
 
     def setup_model(self):
-        self.pipeline = LLaDAPipeline(
+        self.pipeline = DiffusionGemmaPipeline(
             self.config.model,
-            device=self.accelerator.device,
             gen_length=self.config.sample.gen_length,
-            temperature=self.config.sample.temperature,
+            entropy_bound=self.config.sample.entropy_bound,
+            t_min=self.config.sample.t_min,
+            t_max=self.config.sample.t_max,
         )
-        self.pipeline.transformer.requires_grad_(False)
+        self.pipeline.model.requires_grad_(False)
+
+    @torch.no_grad()
+    def completion(self, prompt, x1_tokens, max_new_tokens=4096):
+        """Generate the answer that follows an already-generated thinking canvas.
+
+        Splices the thinking canvas after the same thinking-enabled chat prompt the pipeline
+        encodes, then lets the official `model.generate` autoregressively write the answer.
+
+        Args:
+            prompt: the user question (str).
+            x1_tokens: (L,) long thinking canvas.
+        Returns:
+            decoded thinking + answer text (special tokens kept).
+        """
+        prompt_ids = self.pipeline.processor.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=False,
+        )["input_ids"].to(self.pipeline.input_device)  # (1, P)
+        P = prompt_ids.shape[1]
+
+        input_ids = torch.cat([prompt_ids, x1_tokens[None]], dim=-1)  # (1, P+L)
+        output = self.pipeline.model.generate(input_ids=input_ids, max_new_tokens=max_new_tokens)
+        return self.pipeline.tokens_to_text(output.sequences[0, P:])  # thinking + answer
 
     def log_code(self):
         if not self.accelerator.is_main_process:
@@ -60,21 +88,6 @@ class BaseTrainer:
                     imported_py_files.add(abs_path)
 
         self.accelerator.get_tracker("wandb").run.log_code(".", include_fn=lambda path: path in imported_py_files)
-
-    @torch.no_grad()
-    def tokens_to_latents(self, tokens):
-        """
-        Args:
-            tokens (B, L): token ids, dtype long.
-
-        Returns:
-            latents (B, L, H): per-position ff_out weight row for the token.
-        """
-        return self.pipeline.transformer.model.transformer.ff_out.weight[tokens]
-
-    @torch.no_grad()
-    def tokens_to_text(self, xt, skip_special_tokens=True):
-        return self.pipeline.tokenizer.batch_decode(xt, skip_special_tokens=skip_special_tokens)
 
     def log_rewards(self, objective_evaluations, rewards, stage, extra={}):
         log_dict = {

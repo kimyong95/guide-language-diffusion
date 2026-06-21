@@ -12,7 +12,6 @@ from ml_collections import config_flags
 from tqdm import tqdm
 
 from base import BaseTrainer
-from utils import batch_slices
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/flow-guide.py", "Training configuration.")
@@ -20,83 +19,117 @@ config_flags.DEFINE_config_file("config", "config/flow-guide.py", "Training conf
 def rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """RMS-normalization
     Args:
-        x: (B, L, d) hidden states
+        x: (n, L, D) hidden states
     Returns:
-        x: (B, L, d) normalized hidden states
+        x: (n, L, D) normalized hidden states
     """
-    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return x * torch.rsqrt((x**2).mean(dim=-1, keepdim=True) + eps)
 
-def gp_grad(X, Y, x):
-    # X: (N, d) data points, Y: (N,) rewards, x: (n, d) query points
-    # returns grad: (n, d)
-    N, d = X.shape[0], X.shape[1]
+def gp_alpha(X, Y):
+    # X: (N, M) support points, Y: (N,) rewards  (M = L*D feature dim)
+    # returns alpha: (N, 1) dual weights = (K + eps I)^-1 Y
+    # The O(N^2 M) cdist + Cholesky here depend only on the (fixed-per-epoch) support
+    # set, so this is cached and reused across every query of an epoch. Kept in float64.
+    N, M = X.shape
 
     X = X.to(dtype=torch.float64)
     Y = einops.rearrange(Y, "N -> N 1").to(dtype=torch.float64)
-    x = x.to(dtype=torch.float64)
 
-    K      = torch.exp(-torch.cdist(X, X) ** 2 / 2 / (d**0.5))  # (N, N)
-    k_star = torch.exp(-torch.cdist(x, X) ** 2 / 2 / (d**0.5))  # (n, N)
+    K     = torch.exp(-torch.cdist(X, X) ** 2 / 2 / M)  # (N, N)
+    chol  = torch.linalg.cholesky(K + 1e-6 * torch.eye(N, dtype=torch.float64, device=K.device))
+    alpha = torch.cholesky_solve(Y, chol)               # (N, 1)
 
-    L      = torch.linalg.cholesky(K + 1e-6 * torch.eye(N, dtype=torch.float64, device=K.device))
-    alpha  = torch.cholesky_solve(Y, L)                         # (N, 1)
+    return alpha.to(dtype=torch.float32)
 
-    w      = k_star * alpha.T                                   # (n, N)
-    y_hat  = k_star @ alpha                                     # (n, 1)
-    grad   = w @ X - y_hat * x                                  # (n, d)
 
-    return grad.to(dtype=torch.float32)
+def gp_grad(X, alpha, x):
+    # X: (N, M) support points, alpha: (N, 1) dual weights, x: (n, M) query points
+    # returns grad: (n, M)
+    # Per-query O(n N M) part. cdist stays accurate enough in float32 thanks to the /2M
+    # normalization; matmuls run in float32 since the caller renormalizes the direction.
+    N, M = X.shape
+
+    X = X.to(dtype=torch.float32)
+    x = x.to(dtype=torch.float32)
+
+    k_star = torch.exp(-torch.cdist(x, X) ** 2 / 2 / M)  # (n, N)
+
+    w      = k_star * alpha.T                             # (n, N)
+    y_hat  = k_star @ alpha                               # (n, 1)
+    grad   = w @ X - y_hat * x                            # (n, M)
+
+    return grad / (M**0.5) / (N**0.5)
 
 class Trainer(BaseTrainer):
     def __init__(self, config):
 
         super().__init__(config)
-        self.enable_guide = True
+        self.guide_enabled = False
         self.init_extention()
 
         N = self.config.sample.total_samples
         G = self.accelerator.num_processes
         self.N_local = N // G
 
-        self.question = self.task.question_prompt()
-        self.question_tokens = self.pipeline.encode_prompt(self.question)[0]
+        self.prompt = self.task.prompt()
 
+        # GP data + solve live on the last GPU (cuda:0 when there is only one device)
+        self.gp_device = torch.device(f"cuda:{torch.cuda.device_count() - 1}")
+
+        self.num_layers = len(self.pipeline.model.model.decoder.layers)  # H
+        # support set on the last GPU so the per-query solve never round-trips to CPU
         self.data = {
-            "x1_hs": torch.empty(0, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16),
-            "rewards": torch.empty(0, device=self.accelerator.device),
+            "x1_hs": torch.empty(0, self.num_layers, self.pipeline.gen_length, self.pipeline.hidden_size, device=self.gp_device, dtype=torch.bfloat16),  # (N, H, L, D)
+            "rewards": torch.empty(0, device=self.gp_device),
+            "alpha": {},  # layer_id -> dual weights; cleared whenever the support set grows (see increment_data)
         }
 
     def init_extention(self):
-        guidance_block = self.pipeline.transformer.model.transformer.blocks[self.config.guide_layer_id]
-
-        guidance_block.forward_original = guidance_block.forward
-        guidance_block.forward = partial(Trainer.extended_llada_block_forward, guidance_block, external_self=self)
+        for block in self.pipeline.model.model.decoder.layers:
+            # Wrap each layer's forward: guide the block input, then call the unmodified layer.
+            block.forward = partial(
+                Trainer.extended_decoder_layer_forward,
+                block,
+                external_self=self,
+                original_forward=block.forward,
+            )
 
     @contextmanager
-    def guide_disabled(self):
-        prev = self.enable_guide
-        self.enable_guide = False
+    def enable_guide(self):
+        prev = self.guide_enabled
+        self.guide_enabled = True
         try:
             yield
         finally:
-            self.enable_guide = prev
+            self.guide_enabled = prev
     
-    # Extension to LLaDALlamaBlock.forward
     @staticmethod
     @torch.no_grad()
-    def extended_llada_block_forward(
-        self,                      # the LLaDALlamaBlock instance
-        x,                         # (B, L, d_model) block input hidden state
-        attention_bias=None,
-        layer_past=None,
-        use_cache=False,
-        external_self=None,        # -> the Trainer (this `self`)
+    def extended_decoder_layer_forward(
+        self,
+        hidden_states,
+        *args,
+        external_self=None,
+        original_forward=None,
+        **kwargs,
     ):
-        if external_self.enable_guide:
-            P = len(external_self.question_tokens)
-            g = external_self.gp_grad(x[:, P:, :]).to(device=x.device, dtype=x.dtype)
-            x[:, P:, :] = x[:, P:, :] + g
-        return self.forward_original(x,attention_bias=attention_bias,layer_past=layer_past,use_cache=use_cache)
+        """Guidance sublayer wrapping each decoder layer (installed by init_extention).
+
+        Args:
+            self: the decoder layer instance.
+            hidden_states: (n, L, D) block input.
+            external_self: the Trainer.
+            original_forward: the layer's unmodified forward.
+        """
+        x = hidden_states
+        # input of layer i == output of layer i-1; steer with that layer's data (layer 0 unguided)
+        if external_self.guide_enabled and self.layer_idx >= 1:
+            g = external_self.gp_grad(x, self.layer_idx - 1).to(device=x.device, dtype=x.dtype)  # (n, L, D)
+            external_self.info[f"g-norm-{self.layer_idx}"].append(g.float().norm(dim=(-2, -1)))  # (n,)
+            x_guided = x + g * external_self.config.guide_scale
+            x = x_guided * (x.norm(dim=-1, keepdim=True) / x_guided.norm(dim=-1, keepdim=True).clamp(min=1e-6))
+
+        return original_forward(x, *args, **kwargs)
 
     def run(self):
         for epoch in tqdm(range(1, self.config.max_epochs+1), desc="Epochs", position=0, disable=not self.accelerator.is_main_process):
@@ -107,80 +140,85 @@ class Trainer(BaseTrainer):
 
     @torch.no_grad()
     def sampling_step(self, epoch):
-        self.pipeline.transformer.eval()
+        self.pipeline.model.eval()
 
-        info = defaultdict(list)
+        self.info = defaultdict(list)
 
         timesteps = self.pipeline.scheduler.set_timesteps(
             num_inference_steps=self.config.sample.num_inference_steps,
-            device=self.accelerator.device,
+            device=self.pipeline.input_device,
         )
 
-        x1_tokens = self.pipeline.init_tokens(self.N_local)  # (N_local, L) long
-        x1_hidden_states = torch.empty(self.N_local, self.pipeline.hidden_size,device=self.accelerator.device, dtype=torch.bfloat16,)
+        # same prompt for every sample; encode once, unguided
+        self.pipeline.set_prompt(self.prompt)
 
-        for sl in batch_slices(self.N_local, self.config.sample.max_batch_size_per_device):
-            xt_tokens = self.pipeline.init_tokens(sl.stop - sl.start)  # (b, L) long
-            for time_i, timestep in enumerate(timesteps):
-                logits, _ = self.pipeline.model_predict(xt_tokens, self.question_tokens)  # (b, L, V)
-                xt_tokens = self.pipeline.scheduler.step(xt_tokens, logits, timestep)
+        x1_texts = []  # one (variable-length) completion text per sample
+        x1_hidden_states = torch.empty(self.N_local, self.num_layers, self.pipeline.gen_length, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16,)  # (N_local, H, L, D)
 
-            # generate reference data
-            with self.guide_disabled():
-                _, hidden_states = self.pipeline.model_predict(xt_tokens, self.question_tokens)  # (H, b, L, d)
-            x1_tokens[sl] = xt_tokens
-            hidden_states = hidden_states[self.config.guide_layer_id] # (B, L, d)
-            hidden_states = rms_norm(hidden_states)
-            x1_hidden_states[sl] = einops.reduce(hidden_states, "B L D -> B D", "mean")
+        for i in range(self.N_local):  # one sequence at a time
+            xt_tokens = self.pipeline.init_tokens()  # (L,)
+            xt_logits = None                         # prev step's logits = this step's self-conditioning
+            with self.enable_guide():
+                for timestep in timesteps:
+                    xt_logits, _ = self.pipeline.model_predict(xt_tokens, xt_logits, timestep)  # (L, V)
+                    xt_tokens, x1, finished = self.pipeline.scheduler.step(xt_tokens, xt_logits, timestep)
+                    if finished:
+                        break
 
-        x1_texts = self.tokens_to_text(x1_tokens)
+            # reference data (hidden states only; self-conditioning None) + unguided answer completion
+            _, hidden_states = self.pipeline.model_predict(x1, None, timesteps[-1])  # (H+1, L, D)
+            x1_texts.append(self.pipeline.tokens_to_text(x1))  # thinking (x1) + generated answer
+            x1_hidden_states[i] = rms_norm(hidden_states)[:-1]  # (H, L, D), drop final-norm
+
         rewards = self.task.evaluate(x1_texts).to(self.accelerator.device)
 
         gathered_x1_hidden_states = self.accelerator.gather(x1_hidden_states)
         gathered_x1_texts         = self.accelerator.gather_for_metrics(x1_texts)
         gathered_rewards          = self.accelerator.gather(rewards)
+        gathered_info             = {key: self.accelerator.gather(torch.cat(values)) for key, values in self.info.items()}
 
         self.increment_data(gathered_x1_hidden_states, gathered_rewards)
 
         objective_evaluations = epoch * self.config.sample.total_samples
         self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling")
         self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_x1_texts, stage="sampling")
-        self.log_info(objective_evaluations=objective_evaluations, info=info, stage="sampling")
+        self.log_info(objective_evaluations=objective_evaluations, info=gathered_info, stage="sampling")
 
 
     @torch.no_grad()
-    def gp_grad(self, xt):
-        # Input:
-        #   xt: (n, L, D)  per-token hidden states
-        # Output:
-        #   grad: (n, L, D)  same update direction for every token l
-
+    def gp_grad(self, xt, layer_id):
+        """
+        Args:
+            xt: (n, L, D) block input for layer (layer_id+1) == output of layer_id.
+            layer_id: which layer's stored output data to regress against.
+        Returns:
+            grad: (n, L, D) per-position guidance direction.
+        """
         n, L, D = xt.shape
 
-        X1 = self.data["x1_hs"]    # (N, D) mean-pooled hidden states
-        Y = self.data["rewards"]   # (N,)
+        X1 = self.data["x1_hs"][:, layer_id]   # (N, L, D), on gp_device, already rms_norm'd
+        Y = self.data["rewards"]               # (N,)
 
         if len(X1) < 2:
-            return torch.zeros_like(xt)
-        
-        xt = rms_norm(xt)
-        Y = (Y - Y.mean(dim=0, keepdim=True)) / Y.std(dim=0,keepdim=True).clamp(min=1e-3)
+            return torch.zeros(n, L, D, device=xt.device, dtype=xt.dtype)
 
-        # the GP lives in the mean-pooled (D,) space, so pool the query over L
-        x = einops.reduce(xt, "n L D -> n D", "mean")
+        X1 = X1.reshape(len(X1), L * D)                            # (N, L*D)
+        x = rms_norm(xt).reshape(n, L * D).to(self.gp_device)      # (n, L*D)
 
-        grad = gp_grad(X1, Y, x)   # (n, D)
+        alpha = self.data["alpha"].get(layer_id)
+        if alpha is None:  # cache miss: O(N^2 M) solve, reused for every query this epoch
+            Yz = (Y - Y.mean(dim=0, keepdim=True)) / Y.std(dim=0, keepdim=True).clamp(min=1e-3)
+            alpha = gp_alpha(X1, Yz)
+            self.data["alpha"][layer_id] = alpha
 
-        # broadcast the same update direction to every token l in L
-        grad = einops.repeat(grad, "n D -> n L D", L=L)
+        grad = gp_grad(X1, alpha, x)   # (n, L*D), on gp_device
 
-        return grad.to(device=xt.device, dtype=xt.dtype)
+        return grad.reshape(n, L, D).to(device=xt.device, dtype=xt.dtype)
 
     def increment_data(self, x1_hidden_states, rewards):
-        self.data["x1_hs"] = torch.cat([self.data["x1_hs"], x1_hidden_states], dim=0)
-        self.data["rewards"] = torch.cat([self.data["rewards"], rewards], dim=0)
-
-        # self.pipeline.transformer.model.transformer.blocks[0].attn_norm.weight
+        self.data["x1_hs"] = torch.cat([self.data["x1_hs"], x1_hidden_states.to(self.gp_device)], dim=0)
+        self.data["rewards"] = torch.cat([self.data["rewards"], rewards.to(self.gp_device)], dim=0)
+        self.data["alpha"] = {}  # support set changed -> invalidate cached dual weights
 
         torch.cuda.empty_cache()
 
@@ -190,7 +228,9 @@ class Trainer(BaseTrainer):
 
         wandb_tracker = self.accelerator.get_tracker("wandb")
         file_path = f"{wandb_tracker.run.dir}/data.pt"
-        torch.save(data_dict, file_path)
+        # save the support set on CPU (portable); the alpha cache is transient
+        save_dict = {"x1_hs": data_dict["x1_hs"].cpu(), "rewards": data_dict["rewards"].cpu()}
+        torch.save(save_dict, file_path)
         artifact = wandb.Artifact(name=Path(__file__).stem, type="data")
         artifact.add_file(file_path)
         wandb_tracker.run.log_artifact(artifact, aliases=[wandb_tracker.run.id])
@@ -198,7 +238,7 @@ class Trainer(BaseTrainer):
     def log_info(self, objective_evaluations, info, stage):
         log_dict = {"objective-evaluations": objective_evaluations}
         for key, values in info.items():
-            log_dict[f"info/{stage}/{key}"] = torch.stack(values).mean().item()
+            log_dict[f"info/{stage}/{key}"] = values.mean().item()
         self.accelerator.log(log_dict)
 
 

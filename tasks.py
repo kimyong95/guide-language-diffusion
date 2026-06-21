@@ -1,60 +1,36 @@
 import inspect
-from itertools import islice
-import csv
 import re
 import torch
+from datasets import load_dataset
 
 class Sudoku:
 
-    QUESTION_PROMPT_TEMPLATE = inspect.cleandoc("""
-        Please solve the following 4x4 Sudoku puzzle. The puzzle is provided as a 16-character string reading left-to-right, top-to-bottom, where '0' represents empty cells.
-
-        **Rules:**
-        - Fill empty cells with digits 1-4.
-        - Each row must contain digits 1-4 exactly once.
-        - Each column must contain digits 1-4 exactly once.
-        - Each 2x2 box must contain digits 1-4 exactly once.
-
-        **Example:**
-        Puzzle: 0401002010030310
-        This puzzle grid looks like this:
-        0 4 | 0 1
-        0 0 | 2 0
-        ----+----
-        1 0 | 0 3
-        0 3 | 1 0
-
-        Solution: 2431312412434312
-        The solved grid looks like this:
-        2 4 | 3 1
-        3 1 | 2 4
-        ----+----
-        1 2 | 4 3
-        4 3 | 1 2
-
-        **Important:** Your solution must be a COMPLETE 16-character string with only the digits 1-4, representing your final solved grid.
-
-        Respond in this exact format:
-        <reasoning>
-        Your step-by-step solving process
-        </reasoning>
-        <answer>
-        [16-character solution string with no spaces or separators]
-        </answer>                                
-
-        Now, solve the following Sudoku puzzle: {puzzle}
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Solve the following Sudoku puzzle, where 0 represents the empty cells to be filled:
+        {puzzle}
+        
+        Response 9x9 grid with no spaces, rows separated by newlines.
     """)
 
-    def __init__(self, puzzle_id):
-        with open('data/4x4_sudoku_unique_puzzles.csv', 'r', encoding='utf-8', newline='') as file:
-            reader = csv.reader(file)
-            self.puzzle, self.ground_truth = next(islice(reader, int(puzzle_id)+1, int(puzzle_id)+2), None)
-        
+    # a row is exactly 9 digits (not part of a longer digit run); a grid is 9 such rows
+    ROW_RE = r"(?<![0-9])[0-9]{9}(?![0-9])"
+    GRID_RE = re.compile(rf"{ROW_RE}(?:[ \t]*\r?\n[ \t]*{ROW_RE}){{8}}")
+
+    def __init__(self, puzzle_id=0):
+        ds = load_dataset("sapientinc/sudoku-extreme",split="test",converters={"question": str, "answer": str},)
+        row = ds.sort("rating")[int(puzzle_id)]
+        self.puzzle = self.to_grid(row["question"].replace(".", "0"))
+        self.ground_truth = row["answer"]
+
+    @staticmethod
+    def to_grid(digits: str) -> str:
+        return "\n".join(digits[i:i + 9] for i in range(0, 81, 9))
+
     def evaluate_one(self, response: str) -> float:
-        matches = re.findall(r"<answer>(.*?)</answer>", response, re.DOTALL)
+        matches = self.GRID_RE.findall(response)
         if not matches:
             return 0.0
-        solution = "".join(char for char in matches[-1].strip() if char.isdigit())
+        solution = "".join(char for char in matches[-1] if char.isdigit())
         N = len(self.ground_truth)
         if len(solution) != N:
             return 0.0
@@ -63,8 +39,8 @@ class Sudoku:
     def evaluate(self, responses: list[str]) -> torch.Tensor:
         return torch.tensor([self.evaluate_one(r) for r in responses], dtype=torch.float32)
 
-    def question_prompt(self):
-        return self.QUESTION_PROMPT_TEMPLATE.format(puzzle=self.puzzle)
+    def prompt(self):
+        return self.PROMPT_TEMPLATE.format(puzzle=self.puzzle)
 
 TASKS_CLS = {
     "sudoku": Sudoku,
