@@ -20,7 +20,7 @@ def base():
     config.sample.t_min = 0.4
     config.sample.t_max = 0.8
 
-    config.guide_scale = 50
+    config.guide_scale = 10
 
     return config
 
