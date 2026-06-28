@@ -49,18 +49,29 @@ class Sudoku:
         return self.PROMPT_TEMPLATE.format(puzzle=self.puzzle)
 
 
+GENERAL_PROMPT_TEMPLATE = inspect.cleandoc("""
+    # Reference Program
+    ```{language}
+    {program}
+    ```
+
+    # Task
+    Rewrite the program to {instruction}.
+    Provide the complete new program code.
+
+    IMPORTANT: Make sure your rewritten program maintains the same inputs and outputs as the original program, but with improved internal implementation.
+
+    Response in the format:
+    ```{language}
+    # Your rewritten program here
+    ```
+""")
+
+
 class FunctionMinimization:
 
-    PROMPT_TEMPLATE = inspect.cleandoc("""
-        Minimize the function:
-
-        f(x, y) = sin(x) * cos(y) + sin(x * y) + (x^2 + y^2) / 20
-
-        Write Python code defining a function named run_search().
-        run_search() must return either (x, y) or (x, y, value), where value is f(x, y).
-    """)
-
-    CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+    LANGUAGE = "python"
+    INSTRUCTION = "minimize the function f(x, y) = sin(x) * cos(y) + sin(x * y) + (x^2 + y^2) / 20"
 
     @staticmethod
     @lru_cache(maxsize=1)
@@ -80,16 +91,39 @@ class FunctionMinimization:
         spec.loader.exec_module(evaluator)
         return evaluator
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def initial_program() -> str:
+        program_path = (
+            Path(__file__).resolve().parent
+            / "openevolve"
+            / "examples"
+            / "function_minimization"
+            / "initial_program.py"
+        )
+        code = program_path.read_text(encoding="utf-8")
+
+        # Strip openevolve-specific marker/annotation comments (whole line each).
+        markers = (
+            "# EVOLVE-BLOCK-START",
+            "# EVOLVE-BLOCK-END",
+            "# This part remains fixed (not evolved)",
+            "# AlphaEvolve improved this to",
+        )
+        lines = [l for l in code.splitlines() if not any(m in l for m in markers)]
+        return "\n".join(lines)
+
     @classmethod
-    def extract_code(cls, response: str) -> str:
-        matches = cls.CODE_FENCE_RE.findall(response)
-        if matches:
-            return matches[-1].strip()
-        return response.strip()
+    def extract_program(cls, response: str) -> str | None:
+        from openevolve.utils.code_utils import parse_full_rewrite
+
+        # Rewrite mode: pull the complete rewritten program out of the response.
+        code = parse_full_rewrite(response, cls.LANGUAGE)
+        return code or None
 
     def evaluate_one(self, response: str) -> float:
-        code = self.extract_code(response)
-        if not code:
+        code = self.extract_program(response)
+        if code is None:
             return 0.0
 
         evaluator = self.example_evaluator()
@@ -107,7 +141,11 @@ class FunctionMinimization:
         return torch.tensor([self.evaluate_one(r) for r in responses], dtype=torch.float32)
 
     def prompt(self):
-        return self.PROMPT_TEMPLATE
+        return GENERAL_PROMPT_TEMPLATE.format(
+            language=self.LANGUAGE,
+            program=self.initial_program(),
+            instruction=self.INSTRUCTION,
+        )
 
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 TASKS_CLS = {

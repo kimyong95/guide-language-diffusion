@@ -23,7 +23,7 @@ def rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     Returns:
         x: (n, L, D) normalized hidden states
     """
-    return x * torch.rsqrt((x**2).mean(dim=-1, keepdim=True) + eps)
+    return x * torch.rsqrt((x.float()**2).mean(dim=-1, keepdim=True) + eps).type_as(x)
 
 def gp_alpha(X, Y):
     # X: (N, M) support points, Y: (N,) rewards  (M = L*D feature dim)
