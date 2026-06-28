@@ -1,5 +1,11 @@
 import inspect
+import importlib.util
+import io
+import contextlib
+from functools import lru_cache
+from pathlib import Path
 import re
+import tempfile
 import torch
 from datasets import load_dataset
 
@@ -42,8 +48,71 @@ class Sudoku:
     def prompt(self):
         return self.PROMPT_TEMPLATE.format(puzzle=self.puzzle)
 
+
+class FunctionMinimization:
+
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Minimize the function:
+
+        f(x, y) = sin(x) * cos(y) + sin(x * y) + (x^2 + y^2) / 20
+
+        Write Python code defining a function named run_search().
+        run_search() must return either (x, y) or (x, y, value), where value is f(x, y).
+    """)
+
+    CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def example_evaluator():
+        evaluator_path = (
+            Path(__file__).resolve().parent
+            / "openevolve"
+            / "examples"
+            / "function_minimization"
+            / "evaluator.py"
+        )
+        spec = importlib.util.spec_from_file_location("function_minimization_evaluator", evaluator_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load evaluator from {evaluator_path}")
+
+        evaluator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(evaluator)
+        return evaluator
+
+    @classmethod
+    def extract_code(cls, response: str) -> str:
+        matches = cls.CODE_FENCE_RE.findall(response)
+        if matches:
+            return matches[-1].strip()
+        return response.strip()
+
+    def evaluate_one(self, response: str) -> float:
+        code = self.extract_code(response)
+        if not code:
+            return 0.0
+
+        evaluator = self.example_evaluator()
+        with tempfile.TemporaryDirectory(prefix="function_minimization_") as tmpdir:
+            program_path = Path(tmpdir) / "candidate.py"
+            program_path.write_text(code, encoding="utf-8")
+
+            # The OpenEvolve evaluator is verbose by design; keep task rewards quiet.
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                result = evaluator.evaluate(str(program_path))
+
+        return float(result.metrics.get("combined_score", 0.0))
+
+    def evaluate(self, responses: list[str]) -> torch.Tensor:
+        return torch.tensor([self.evaluate_one(r) for r in responses], dtype=torch.float32)
+
+    def prompt(self):
+        return self.PROMPT_TEMPLATE
+
+# git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 TASKS_CLS = {
     "sudoku": Sudoku,
+    "func-min": FunctionMinimization,
 }
 
 def get_reward_fn(key: str):

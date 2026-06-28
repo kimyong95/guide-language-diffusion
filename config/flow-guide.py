@@ -21,6 +21,7 @@ def base():
     config.sample.t_max = 0.8
 
     config.guide_scale = 10
+    config.guidance_layers = tuple(range(30))  # all 30 layers
 
     return config
 

@@ -16,14 +16,21 @@ dependencies = [
     "wandb",
     "ml-collections",
     "matplotlib",
+    "openevolve",
 ]
 
+# conda create -n cu129 cuda-toolkit=12.9.2
+# Install vllm (see: https://github.com/vllm-project/vllm/issues/43435#issuecomment-4525734897)
+# uv pip install vllm --prerelease=allow --extra-index-url https://wheels.vllm.ai/nightly/cu129 --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
+
+[tool.uv]
+python-preference = "only-managed"
+
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128" }]
-torchvision = [{ index = "pytorch-cu128" }]
-vllm = [{ url = "https://github.com/vllm-project/vllm/releases/download/v0.23.0/vllm-0.23.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" }]
+torch = [{ index = "pytorch-cu129" }]
+torchvision = [{ index = "pytorch-cu129" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true

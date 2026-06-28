@@ -91,8 +91,13 @@ class DiffusionGemmaPipeline:
         # pin the decoder canvas length to gen_length (else it stays at the model default 256)
         config = AutoConfig.from_pretrained(model_name)
         config.canvas_length = gen_length
-        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(model_name, config=config, dtype=dtype, device_map=build_device_map())
 
+        if model_name == "RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic":
+            from extend_diffusion_gemma_fp8 import patch_diffusion_gemma_fp8
+            patch_diffusion_gemma_fp8()
+        
+        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(model_name, config=config, dtype=dtype, device_map="cuda")
+        
         # no image input: drop the vision modules
         del self.model.model.encoder.vision_tower
         del self.model.model.encoder.embed_vision
