@@ -140,10 +140,7 @@ class Trainer(BaseTrainer):
 
         self.info = defaultdict(list)
 
-        timesteps = self.pipeline.scheduler.set_timesteps(
-            num_inference_steps=self.config.sample.num_inference_steps,
-            device=self.pipeline.input_device,
-        )
+        timesteps = self.pipeline.scheduler.set_timesteps(num_inference_steps=self.config.sample.num_inference_steps,device=self.accelerator.device)
 
         # same prompt for every sample; encode once, unguided
         self.pipeline.set_prompt(self.prompt)
@@ -152,18 +149,13 @@ class Trainer(BaseTrainer):
         x1_hidden_states = torch.empty(self.N_local, len(self.config.guidance_layers), self.pipeline.gen_length, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16,)  # (N_local, G, L, D)
 
         for i in range(self.N_local):  # one sequence at a time
-            xt_tokens = self.pipeline.init_tokens()  # (L,)
-            xt_logits = None                         # prev step's logits = this step's self-conditioning
+            xt_logits = None  # (L, V)
             with self.enable_guide():
                 for timestep in timesteps:
-                    xt_logits, _ = self.pipeline.model_predict(xt_tokens, xt_logits, timestep)  # (L, V)
-                    xt_tokens, x1, finished = self.pipeline.scheduler.step(xt_tokens, xt_logits, timestep)
-                    if finished:
+                    xt_logits, hidden_states, early_stop = self.pipeline.model_predict_step(xt_logits, timestep)  # (L, V)
+                    if early_stop:
                         break
-
-            # reference data (hidden states only; self-conditioning None) + unguided answer completion
-            _, hidden_states = self.pipeline.model_predict(x1, None, timesteps[-1])  # (H+1, L, D)
-            x1_texts.append(self.pipeline.tokens_to_text(x1, skip_special_tokens=True))  # thinking (x1) + generated answer
+            x1_texts.append(self.pipeline.argmax_logits_to_text(xt_logits))  # one completion string per sample
             x1_hidden_states[i] = rms_norm(hidden_states)[list(self.config.guidance_layers)]  # (G, L, D)
 
         rewards = self.task.evaluate(x1_texts).to(self.accelerator.device)
