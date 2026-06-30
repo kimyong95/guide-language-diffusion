@@ -149,7 +149,7 @@ class Trainer(BaseTrainer):
         x1_hidden_states = torch.empty(self.N_local, len(self.config.guidance_layers), self.pipeline.gen_length, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16,)  # (N_local, G, L, D)
 
         for i in range(self.N_local):  # one sequence at a time
-            xt_logits = None  # (L, V)
+            xt_logits = torch.ones(self.pipeline.gen_length, self.pipeline.vocab_size, device=self.accelerator.device, dtype=torch.bfloat16)  # (L, V)
             with self.enable_guide():
                 for timestep in timesteps:
                     xt_logits, hidden_states, early_stop = self.pipeline.model_predict_step(xt_logits, timestep)  # (L, V)

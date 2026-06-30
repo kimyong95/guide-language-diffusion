@@ -71,10 +71,6 @@ class DiffusionGemmaPipeline:
         self.kv_cache = None
         self.dec_pos = None
 
-    def init_tokens(self):
-        """Returns: (L,) uniform-random initial tokens (the step-0 decoder canvas)."""
-        return torch.randint(self.vocab_size, (self.gen_length,), device=self.device)  # (L,)
-
     def sample_logits_to_tokens(self, xt_logits):
         """Entropy-bound sample of the next renoised canvas from logits.
 
@@ -137,30 +133,30 @@ class DiffusionGemmaPipeline:
             hidden_states: (H+1, L, D) per-layer hidden states.
             early_stop: bool from the stopping criteria (False on step 0).
         """
-        # step 0 (xt_logits is None): uniform-random decoder canvas + zero self-conditioning.
-        # step k>0: re-derive the decoder canvas by sampling from the previous step's logits.
-        decoder_input_ids = (
-            self.sample_logits_to_tokens(xt_logits)[None] if xt_logits is not None
-            else self.init_tokens()[None]
-        )  # (1, L)
+        
+        xt_tokens = self.sample_logits_to_tokens(xt_logits)[None]
 
         out = self.model(
             input_ids=None,
             past_key_values=self.kv_cache,
             decoder_position_ids=self.dec_pos,
-            decoder_input_ids=decoder_input_ids,
-            self_conditioning_logits=xt_logits,
+            decoder_input_ids=xt_tokens,
+            self_conditioning_logits=xt_logits if timestep != self.scheduler.timesteps[0] else None,  # None on step 0
             output_hidden_states=output_hidden_states,
         )
         hidden_states = torch.stack(out.hidden_states, dim=0)[:, 0]  # (H+1, L, D)
         xt_logits_next = self.scheduler.temperature(out.logits, timstep=timestep)[0]  # (L, V)
 
-        early_stop = xt_logits is not None and self.early_stop(xt_logits, xt_logits_next)
+        early_stop = self.early_stop(xt_logits, xt_logits_next)
 
         return xt_logits_next, hidden_states, early_stop
 
+    def argmax_logits_to_tokens(self, logits):
+        """Select argmax logits as the tokens"""
+        return torch.argmax(logits, dim=-1)  # (L,)
+
     def argmax_logits_to_text(self, logits, skip_special_tokens=True):
         """Decode a single (T,) token sequence into a string."""
-        tokens = torch.argmax(logits, dim=-1)  # (L,)
+        tokens = self.argmax_logits_to_tokens(logits)  # (L,)
         texts = self.processor.decode(tokens, skip_special_tokens=skip_special_tokens)
         return texts
