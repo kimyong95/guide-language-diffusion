@@ -159,7 +159,7 @@ class DiffusionGemmaPipeline:
 
         return xt_logits_next, hidden_states, early_stop
 
-    def argmax_logits_to_text(self, logits, skip_special_tokens=False):
+    def argmax_logits_to_text(self, logits, skip_special_tokens=True):
         """Decode a single (T,) token sequence into a string."""
         tokens = torch.argmax(logits, dim=-1)  # (L,)
         texts = self.processor.decode(tokens, skip_special_tokens=skip_special_tokens)

@@ -156,6 +156,11 @@ class Trainer(BaseTrainer):
                     if early_stop:
                         break
             x1_texts.append(self.pipeline.argmax_logits_to_text(xt_logits))  # one completion string per sample
+
+            # Reference hidden states: one clean, unguided pass over the final answer tokens
+            x1_tokens = torch.argmax(xt_logits, dim=-1)  # (L,)
+            out = self.pipeline.model(input_ids=None,past_key_values=self.pipeline.kv_cache,decoder_position_ids=self.pipeline.dec_pos,decoder_input_ids=x1_tokens[None],self_conditioning_logits=None,output_hidden_states=True,)  # (1, L)
+            hidden_states = torch.stack(out.hidden_states, dim=0)[:, 0]  # (H+1, L, D)
             x1_hidden_states[i] = rms_norm(hidden_states)[list(self.config.guidance_layers)]  # (G, L, D)
 
         rewards = self.task.evaluate(x1_texts).to(self.accelerator.device)
