@@ -131,7 +131,6 @@ class Trainer(BaseTrainer):
         for epoch in tqdm(range(1, self.config.max_epochs+1), desc="Epochs", position=0, disable=not self.accelerator.is_main_process):
             self.sampling_step(epoch)
 
-        self.log_data(self.data)
         self.accelerator.end_training()
 
     @torch.no_grad()
@@ -216,18 +215,6 @@ class Trainer(BaseTrainer):
 
         torch.cuda.empty_cache()
 
-    def log_data(self, data_dict):
-        if not self.accelerator.is_main_process:
-            return
-
-        wandb_tracker = self.accelerator.get_tracker("wandb")
-        file_path = f"{wandb_tracker.run.dir}/data.pt"
-        # save the support set on CPU (portable); the alpha cache is transient
-        save_dict = {"x1_hs": data_dict["x1_hs"].cpu(), "rewards": data_dict["rewards"].cpu()}
-        torch.save(save_dict, file_path)
-        artifact = wandb.Artifact(name=Path(__file__).stem, type="data")
-        artifact.add_file(file_path)
-        wandb_tracker.run.log_artifact(artifact, aliases=[wandb_tracker.run.id])
 
     def log_info(self, objective_evaluations, info, stage):
         log_dict = {"objective-evaluations": objective_evaluations}
