@@ -21,7 +21,7 @@ dependencies = [
 
 # conda create -n cu129 cuda-toolkit=12.9.2
 # Install vllm (see: https://github.com/vllm-project/vllm/issues/43435#issuecomment-4525734897)
-# uv pip install vllm --prerelease=allow --extra-index-url https://wheels.vllm.ai/nightly/cu129 --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
+# uv pip install vllm==0.24.0 --extra-index-url https://wheels.vllm.ai/0.24.0/cu129 --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
 
 [tool.uv]
 python-preference = "only-managed"
