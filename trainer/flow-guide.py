@@ -25,40 +25,25 @@ def rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """
     return x * torch.rsqrt((x.float()**2).mean(dim=-1, keepdim=True) + eps).type_as(x)
 
-def gp_alpha(X, Y):
-    # X: (N, M) support points, Y: (N,) rewards  (M = L*D feature dim)
-    # returns alpha: (N, 1) dual weights = (K + eps I)^-1 Y
-    # The O(N^2 M) cdist + Cholesky here depend only on the (fixed-per-epoch) support
-    # set, so this is cached and reused across every query of an epoch. Kept in float64.
-    N, M = X.shape
-
-    X = X.to(dtype=torch.float64)
-    Y = einops.rearrange(Y, "N -> N 1").to(dtype=torch.float64)
-
-    K     = torch.exp(-torch.cdist(X, X) ** 2 / 2 / M)  # (N, N)
-    chol  = torch.linalg.cholesky(K + 1e-6 * torch.eye(N, dtype=torch.float64, device=K.device))
-    alpha = torch.cholesky_solve(Y, chol)               # (N, 1)
-
-    return alpha.to(dtype=torch.float32)
-
-
-def gp_grad(X, alpha, x):
-    # X: (N, M) support points, alpha: (N, 1) dual weights, x: (n, M) query points
-    # returns grad: (n, M)
-    # Per-query O(n N M) part. cdist stays accurate enough in float32 thanks to the /2M
-    # normalization; matmuls run in float32 since the caller renormalizes the direction.
-    N, M = X.shape
+def nw_grad(X, Y, x):
+    # Batched Nadaraya-Watson gradient  grad_x y_hat(x),  y_hat(x) = sum_n p_n y_n.
+    # X: (Q, N, D) per-query support tokens (rms-normed), Y: (N,) rewards, x: (Q, D) queries.
+    # All vectors are rms-normed, so ||x - x_n||^2 = 2D - 2 x.x_n and the Gaussian kernel
+    # reduces (up to a cancelling constant) to a softmax over scores s_n = x.x_n / sqrt(D).
+    # grad = sum_n p_n y_n x_n - y_hat * x_bar = Cov_p(y, x),  x_bar = sum_n p_n x_n.
+    Q, N, D = X.shape
 
     X = X.to(dtype=torch.float32)
     x = x.to(dtype=torch.float32)
+    Y = Y.to(dtype=torch.float32)
 
-    k_star = torch.exp(-torch.cdist(x, X) ** 2 / 2 / M)  # (n, N)
+    s     = torch.einsum("qd,qnd->qn", x, X) / (D**0.5)              # (Q, N) scores
+    p     = torch.softmax(s, dim=-1)                                 # (Q, N) kernel weights
+    y_hat = p @ Y                                                    # (Q,)
+    x_bar = torch.einsum("qn,qnd->qd", p, X)                        # (Q, D) weighted-mean support
+    grad  = torch.einsum("qn,qnd->qd", p * Y, X) - y_hat[:, None] * x_bar   # (Q, D)
 
-    w      = k_star * alpha.T                             # (n, N)
-    y_hat  = k_star @ alpha                               # (n, 1)
-    grad   = w @ X - y_hat * x                            # (n, M)
-
-    return grad / (M**0.5) / (N**0.5)
+    return grad / (D**0.5)
 
 class Trainer(BaseTrainer):
     def __init__(self, config):
@@ -77,7 +62,6 @@ class Trainer(BaseTrainer):
         self.data = {
             "x1_hs": torch.empty(0, len(self.config.guidance_layers), self.pipeline.gen_length, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16),  # (N, G, L, D)
             "rewards": torch.empty(0, device=self.accelerator.device),
-            "alpha": {},  # layer_id -> dual weights; cleared whenever the support set grows (see increment_data)
         }
 
     def init_extention(self):
@@ -120,7 +104,7 @@ class Trainer(BaseTrainer):
         x = hidden_states
         if external_self.guide_enabled and self.layer_idx in external_self.config.guidance_layers:
             x_normed = rms_norm(x)
-            g = external_self.gp_grad(x_normed, self.layer_idx).to(device=x.device, dtype=x.dtype)  # (n, L, D)
+            g = external_self.nw_grad(x_normed, self.layer_idx).to(device=x.device, dtype=x.dtype)  # (n, L, D)
             external_self.info[f"g-norm-{self.layer_idx}"].append(g.float().norm(dim=(-2, -1)))  # (n,)
             x_guided = x + g * external_self.config.guide_scale
             x = x_guided * (x.norm(dim=-1, keepdim=True) / x_guided.norm(dim=-1, keepdim=True).clamp(min=1e-6))
@@ -178,7 +162,7 @@ class Trainer(BaseTrainer):
 
 
     @torch.no_grad()
-    def gp_grad(self, xt, layer_id):
+    def nw_grad(self, xt, layer_id):
         """
         Args:
             xt: (n, L, D) input to layer layer_id, already rms_norm'd by the caller.
@@ -189,29 +173,25 @@ class Trainer(BaseTrainer):
         n, L, D = xt.shape
 
         l = self.config.guidance_layers.index(layer_id)
-        X1 = self.data["x1_hs"][:, l]   # (N, L, D), already rms_norm'd
-        Y = self.data["rewards"]               # (N,)
+        X1 = self.data["x1_hs"][:, l].float()   # (N, L, D) support tokens, already rms_norm'd
+        Y = self.data["rewards"]                # (N,)
+        N = len(X1)
 
-        if len(X1) < 2:
+        if N < 2:
             return torch.zeros(n, L, D, device=xt.device, dtype=xt.dtype)
 
-        X1 = X1.reshape(len(X1), L * D)                            # (N, L*D)
-        x = xt.reshape(n, L * D).to(self.accelerator.device)      # (n, L*D)
+        Yz = (Y - Y.mean()) / Y.std().clamp(min=1e-3)                 # std-normalize reward scale
+        q = xt.reshape(n * L, D).float().to(self.accelerator.device)  # (Q, D) query tokens
 
-        alpha = self.data["alpha"].get(layer_id)
-        if alpha is None:  # cache miss: O(N^2 M) solve, reused for every query this epoch
-            Yz = (Y - Y.mean(dim=0, keepdim=True)) / Y.std(dim=0, keepdim=True).clamp(min=1e-3)
-            alpha = gp_alpha(X1, Yz)
-            self.data["alpha"][layer_id] = alpha
-
-        grad = gp_grad(X1, alpha, x)   # (n, L*D)
+        idx  = torch.einsum("qd,nld->qnl", q, X1).argmax(dim=-1)      # (Q, N) closest token per sentence
+        X_nn = X1[torch.arange(N, device=X1.device), idx]            # (Q, N, D) selected support
+        grad = nw_grad(X_nn, Yz, q)                                  # (Q, D) batched standalone
 
         return grad.reshape(n, L, D).to(device=xt.device, dtype=xt.dtype)
 
     def increment_data(self, x1_hidden_states, rewards):
         self.data["x1_hs"] = torch.cat([self.data["x1_hs"], x1_hidden_states.to(self.accelerator.device)], dim=0)
         self.data["rewards"] = torch.cat([self.data["rewards"], rewards.to(self.accelerator.device)], dim=0)
-        self.data["alpha"] = {}  # support set changed -> invalidate cached dual weights
 
         torch.cuda.empty_cache()
 

@@ -47,33 +47,6 @@ class BaseTrainer:
         )
         self.pipeline.model.requires_grad_(False)
 
-    @torch.no_grad()
-    def completion(self, prompt, x1_tokens, max_new_tokens=4096):
-        """Generate the answer that follows an already-generated thinking canvas.
-
-        Splices the thinking canvas after the same thinking-enabled chat prompt the pipeline
-        encodes, then lets the official `model.generate` autoregressively write the answer.
-
-        Args:
-            prompt: the user question (str).
-            x1_tokens: (L,) long thinking canvas.
-        Returns:
-            decoded thinking + answer text (special tokens kept).
-        """
-        prompt_ids = self.pipeline.processor.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            enable_thinking=False,
-        )["input_ids"].to(self.pipeline.input_device)  # (1, P)
-        P = prompt_ids.shape[1]
-
-        input_ids = torch.cat([prompt_ids, x1_tokens[None]], dim=-1)  # (1, P+L)
-        output = self.pipeline.model.generate(input_ids=input_ids, max_new_tokens=max_new_tokens)
-        return self.pipeline.tokens_to_text(output.sequences[0, P:])  # thinking + answer
-
     def log_code(self):
         if not self.accelerator.is_main_process:
             return
