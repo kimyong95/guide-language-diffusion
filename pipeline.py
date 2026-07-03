@@ -34,9 +34,13 @@ class DiffusionGemmaScheduler:
     def temperature(self, logits, timstep):
         """Linear temperature schedule t = t_min + (t_max - t_min) * (timstep / N).
 
-        timstep counts down N..1 (steps remaining). Shape-preserving: returns logits / t.
+        timstep counts down N..1 (steps remaining), scalar or a per-position (L,) vector.
+        Shape-preserving: returns logits / t. A vector timstep is broadcast over the vocab
+        dim (unsqueezed to (L, 1)); a scalar / 0-dim timstep is left as-is.
         """
         t = self.t_min + (self.t_max - self.t_min) * (timstep / self.num_inference_steps)
+        if torch.is_tensor(t) and t.ndim > 0:
+            t = t.unsqueeze(-1)  # (L,) -> (L, 1) to divide (L, V) per position
         return logits / t
 
 
@@ -67,9 +71,7 @@ class DiffusionGemmaPipeline:
         self.confidence_threshold = confidence_threshold
         self.scheduler = DiffusionGemmaScheduler(t_min=t_min, t_max=t_max)
 
-        # encoder KV cache + decoder positions, set by set_prompt
-        self.kv_cache = None
-        self.dec_pos = None
+        self.eos_token_id = self.model.generation_config.eos_token_id
 
     def sample_logits_to_tokens(self, xt_logits):
         """Entropy-bound sample of the next renoised canvas from logits.
@@ -97,57 +99,89 @@ class DiffusionGemmaPipeline:
         return torch.where(accept, sampled, noise)                           # x_{t-1}[i], (L,)
     
     def early_stop(self, xt_logits, xt_logits_next):
-        """Stateless stopping check: stop when the clean prediction is stable and confident.
+        """Per-position stopping mask: a position is finished when it is stable and confident.
 
-        - stable: the argmax (clean) prediction is unchanged from the previous step's logits.
-        - confident: the mean token entropy of the current logits is below `confidence_threshold`.
+        - stable[i]: the argmax (clean) prediction at position i is unchanged from the
+          previous step's logits.
+        - confident[i]: the left-to-right cumulative mean token entropy over positions
+          [0..i] is below `confidence_threshold` (so confident[-1] uses the whole canvas).
 
         Args:
             xt_logits: (L, V) previous step's temperature-processed logits.
             xt_logits_next: (L, V) current step's temperature-processed logits.
         Returns:
-            finished: bool, True if the diffusion should stop.
+            finished: (L,) bool mask; the caller checks `.all()` to stop the diffusion.
         """
-        stable = bool((torch.argmax(xt_logits, dim=-1) == torch.argmax(xt_logits_next, dim=-1)).all())
-        confident = bool(token_entropy(xt_logits_next).mean() < self.confidence_threshold)
-        return stable and confident
+        stable = torch.argmax(xt_logits, dim=-1) == torch.argmax(xt_logits_next, dim=-1)  # (L,)
+        entropy = token_entropy(xt_logits_next)  # (L,)
+        cum_mean = torch.cumsum(entropy, dim=-1) / torch.arange(1, entropy.shape[-1] + 1, device=entropy.device)
+        confident = cum_mean < self.confidence_threshold  # (L,)
+        return stable & confident  # (L,)
 
     @torch.no_grad()
-    def set_prompt(self, prompt):
-        """Encode `prompt` into the batch-1 KV cache (`self.kv_cache`) and set `self.dec_pos`."""
-        input_ids = self.processor.apply_chat_template([{"role": "user", "content": prompt}],tokenize=True,add_generation_prompt=True,return_dict=True,return_tensors="pt",enable_thinking=False,)["input_ids"].to(self.device)  # (1, P)
-        P = input_ids.shape[1]
-        L = self.gen_length
-        self.dec_pos = torch.arange(P, P + L, device=self.device).unsqueeze(0)  # (1, L)
-        out = self.model.model.encoder(input_ids=input_ids)
-        self.kv_cache = out.past_key_values
+    def build_prompt_tokens(self, prompt, enable_thinking=False):
+        """Tokenize `prompt` into a batch-1 (1, P) input_ids tensor via the chat template."""
+        input_ids = self.processor.apply_chat_template([{"role": "user", "content": prompt}],tokenize=True,add_generation_prompt=True,return_dict=True,return_tensors="pt",enable_thinking=enable_thinking,)["input_ids"].to(self.device)  # (1, P)
+        return input_ids
 
     @torch.no_grad()
-    def model_predict_step(self, xt_logits, timestep, output_hidden_states=True):
+    def build_kv_cache(self, tokens):
+        """Encode prompt `tokens` (1, P) into a batch-1 encoder KV cache.
+
+        The caller holds the returned cache and passes it to `model_predict_step`.
+        """
+        out = self.model.model.encoder(input_ids=tokens)
+        return out.past_key_values
+
+    @torch.no_grad()
+    def append_kv_cache(self, kv_cache, tokens):
+        """Append a finished canvas `tokens` (1, L) to an existing encoder KV cache.
+
+        Grows `kv_cache` in place by re-encoding `tokens` (the encoder self-attention
+        calls `past_key_values.update(...)`); with position ids left unset the encoder
+        places them in the next L slots (`arange(L) + kv_cache.get_seq_length()`). Only
+        the encoder ever writes the cache -- the decoder reads it -- so this is how the
+        official `generate` grows the cache one canvas per block. Returns `kv_cache`.
+        """
+        self.model.model.encoder(input_ids=tokens, past_key_values=kv_cache)
+        return kv_cache
+
+    @torch.no_grad()
+    def model_predict_step(self, xt_logits, timesteps, kv_cache, output_hidden_states=True):
         """
         Args:
             xt_logits: (L, V) previous step's temperature-processed logits, or None on step 0.
-            timestep: scalar timestep, counting down N..1.
+            timesteps: per-position "time lives", counting down N..1; a (L,) vector or a
+                scalar (broadcast). Self-conditioning is disabled only while every position
+                is still at its initial value `scheduler.timesteps[0]` (i.e. the first call).
+            kv_cache: batch-1 encoder KV cache from `build_kv_cache`.
         Returns:
             xt_logits_next: (L, V) temperature-processed logits.
             hidden_states: (H+1, L, D) per-layer hidden states.
-            early_stop: bool from the stopping criteria (False on step 0).
+            early_stop: (L,) bool mask from `early_stop`; reduce with `.all()` to stop.
         """
-        
+
         xt_tokens = self.sample_logits_to_tokens(xt_logits)[None]
+
+        # decoder canvas sits right after the prompt: positions P .. P+L-1
+        P = kv_cache.get_seq_length()
+        L = xt_logits.shape[0]
+
+        # no self-conditioning until at least one position has advanced (first call only)
+        first_step = bool((timesteps == self.scheduler.timesteps[0]).all())
 
         out = self.model(
             input_ids=None,
-            past_key_values=self.kv_cache,
-            decoder_position_ids=self.dec_pos,
+            past_key_values=kv_cache,
+            decoder_position_ids=torch.arange(P, P + L, device=self.device).unsqueeze(0),
             decoder_input_ids=xt_tokens,
-            self_conditioning_logits=xt_logits if timestep != self.scheduler.timesteps[0] else None,  # None on step 0
+            self_conditioning_logits=None if first_step else xt_logits,
             output_hidden_states=output_hidden_states,
         )
         hidden_states = torch.stack(out.hidden_states, dim=0)[:, 0]  # (H+1, L, D)
-        xt_logits_next = self.scheduler.temperature(out.logits, timstep=timestep)[0]  # (L, V)
+        xt_logits_next = self.scheduler.temperature(out.logits[0], timstep=timesteps)  # (L, V)
 
-        early_stop = self.early_stop(xt_logits, xt_logits_next)
+        early_stop = self.early_stop(xt_logits, xt_logits_next)  # (L,)
 
         return xt_logits_next, hidden_states, early_stop
 
