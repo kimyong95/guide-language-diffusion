@@ -64,7 +64,7 @@ for block in range(MAX_BLOCKS):
 
     canvas = pipeline.argmax_logits_to_tokens(xt_logits)
     generated.append(canvas)
-    if torch.isin(canvas, pipeline.eos_token_ids).any():
+    if torch.isin(canvas, pipeline.eos_token_id).any():
         break
     kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)
 
