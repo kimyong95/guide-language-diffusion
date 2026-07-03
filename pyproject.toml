@@ -5,6 +5,7 @@ requires-python = "==3.12.*"
 dependencies = [
     "torch==2.11.*",
     "torchvision==0.26.*",
+    "torchaudio==2.11.*",
     "transformers==5.12.*",
     "diffusers==0.38.*",
     "huggingface-hub==1.19.*",
@@ -17,20 +18,25 @@ dependencies = [
     "ml-collections",
     "matplotlib",
     "openevolve",
+    "vllm==0.24.0",
 ]
 
 # conda create -n cu129 cuda-toolkit=12.9.2
-# Install vllm (see: https://github.com/vllm-project/vllm/issues/43435#issuecomment-4525734897)
-# uv pip install vllm==0.24.0 --extra-index-url https://wheels.vllm.ai/0.24.0/cu129 --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
 
 [tool.uv]
 python-preference = "only-managed"
+index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu129" }]
 torchvision = [{ index = "pytorch-cu129" }]
+torchaudio = [{ index = "pytorch-cu129" }]
+vllm = [{ index = "vllm" }]
 
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
-explicit = true
+
+[[tool.uv.index]]
+name = "vllm"
+url = "https://wheels.vllm.ai/0.24.0/cu129"
