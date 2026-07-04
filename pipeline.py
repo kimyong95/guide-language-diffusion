@@ -74,7 +74,7 @@ class DiffusionGemmaScheduler:
 
 
 class DiffusionGemmaPipeline:
-    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, gen_length, tp_plan=None, device_mesh=None):
+    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, gen_length, device_map="auto", tp_plan=None, device_mesh=None):
         self.processor = AutoProcessor.from_pretrained(model_name)
 
         # pin the decoder canvas length to gen_length (else it stays at the model default 256)
@@ -85,8 +85,7 @@ class DiffusionGemmaPipeline:
             from extend_diffusion_gemma_fp8 import patch_diffusion_gemma_fp8
             patch_diffusion_gemma_fp8()
 
-        placement = {"tp_plan": tp_plan, "device_mesh": device_mesh} if tp_plan is not None else {"device_map": "cuda"}
-        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(model_name, config=config, dtype=dtype, **placement)
+        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(model_name, config=config, dtype=dtype, device_map=device_map, tp_plan=tp_plan, device_mesh=device_mesh)
 
         # no image input: drop the vision modules
         del self.model.model.encoder.vision_tower

@@ -35,6 +35,7 @@ pipeline = DiffusionGemmaPipeline(
     entropy_bound=0.1,
     t_min=0.4,
     t_max=0.8,
+    device_map=None,
     tp_plan=tp_plan,
     device_mesh=device_mesh,
 )
