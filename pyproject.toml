@@ -6,7 +6,7 @@ dependencies = [
     "torch==2.11.*",
     "torchvision==0.26.*",
     "torchaudio==2.11.*",
-    "transformers==5.12.*",
+    "transformers==5.13.*",
     "diffusers==0.38.*",
     "huggingface-hub==1.19.*",
     "accelerate==1.14.*",
@@ -19,12 +19,15 @@ dependencies = [
     "matplotlib",
     "openevolve",
     "vllm==0.24.0",
+    "lm_eval[api,hf,vllm]==0.4.12",
+    "deepspeed==0.19.*",
 ]
 
 # conda create -n cu129 cuda-toolkit=12.9.2
 
 [tool.uv]
 python-preference = "only-managed"
+environments = ["sys_platform == 'linux'"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu129" }]
@@ -35,7 +38,9 @@ vllm = [{ index = "vllm" }]
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
+explicit = true
 
 [[tool.uv.index]]
 name = "vllm"
 url = "https://wheels.vllm.ai/0.24.0/cu129"
+explicit = true
