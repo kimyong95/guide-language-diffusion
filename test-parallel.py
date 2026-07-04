@@ -68,7 +68,8 @@ for block in range(MAX_BLOCKS):
         break
     kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)
 
-text = pipeline.processor.decode(torch.cat(generated), skip_special_tokens=False)
+gen_tokens = pipeline.strip_thinking_tokens(torch.cat(generated))
+text = pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
 print(f"[{accelerator.process_index}]: {text}")
 
 accelerator.wait_for_everyone()

@@ -201,3 +201,12 @@ class DiffusionGemmaPipeline:
         tokens = self.argmax_logits_to_tokens(logits)  # (L,)
         texts = self.processor.decode(tokens, skip_special_tokens=skip_special_tokens)
         return texts
+
+    def strip_thinking_tokens(self, tokens):
+        """Drop everything up to and including the last <channel|> (eoc) token.
+        """
+        eoc_id = self.processor.tokenizer.eoc_token_id
+        positions = (tokens == eoc_id).nonzero()
+        if len(positions) == 0:
+            return tokens
+        return tokens[positions[-1].item() + 1:]
