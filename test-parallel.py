@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 from accelerate import Accelerator
 
-from pipeline import DiffusionGemmaPipeline, early_stop
+from pipeline import DiffusionGemmaPipeline
 
 MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 PROMPT = "Why is the sky blue?"
@@ -26,16 +26,12 @@ accelerator = Accelerator()
 DP_SIZE = accelerator.num_processes // TP_SIZE
 device_mesh = dist.init_device_mesh("cuda", (DP_SIZE, TP_SIZE), mesh_dim_names=("dp", "tp"))
 
-tp_group = device_mesh["tp"].get_group()
-tp_root = dist.get_process_group_ranks(tp_group)[0]  # this rank's TP-group root, as a *global* rank
-
 pipeline = DiffusionGemmaPipeline(
     MODEL_ID,
     gen_length=256,
     entropy_bound=0.1,
     t_min=0.4,
     t_max=0.8,
-    device_map=None,
     tp_plan=tp_plan,
     device_mesh=device_mesh,
 )
@@ -54,12 +50,9 @@ generated = []
 for block in range(MAX_BLOCKS):
     xt_logits = None
     xt_tokens = pipeline.sample_init_tokens()[None]
-    dist.broadcast(xt_tokens, src=tp_root, group=tp_group)
     for timestep in timesteps:
         xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
         xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
-        dist.broadcast(xt_tokens, src=tp_root, group=tp_group)
-
         if finished[-1]:
             break
 

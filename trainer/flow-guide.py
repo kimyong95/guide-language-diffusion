@@ -53,7 +53,8 @@ class Trainer(BaseTrainer):
         self.init_extention()
 
         N = self.config.sample.total_samples
-        G = self.accelerator.num_processes
+        G = self.dp_size
+        assert N % G == 0, "total_samples must be divisible by dp_size"
         self.N_local = N // G
 
         self.prompt = self.task.prompt()
@@ -125,33 +126,35 @@ class Trainer(BaseTrainer):
 
         timesteps = self.pipeline.scheduler.set_timesteps(num_inference_steps=self.config.sample.num_inference_steps,device=self.accelerator.device)
 
-        # same prompt for every sample; encode once, unguided
-        self.pipeline.set_prompt(self.prompt)
+        # same prompt for every sample; encode once, reused read-only across the loop below
+        prompt_tokens = self.pipeline.build_prompt_tokens(self.prompt)
+        kv_cache = self.pipeline.build_kv_cache(prompt_tokens)
 
         x1_texts = []  # one (variable-length) completion text per sample
         x1_hidden_states = torch.empty(self.N_local, len(self.config.guidance_layers), self.pipeline.gen_length, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16,)  # (N_local, G, L, D)
 
         for i in range(self.N_local):  # one sequence at a time
-            xt_logits = torch.ones(self.pipeline.gen_length, self.pipeline.vocab_size, device=self.accelerator.device, dtype=torch.bfloat16)  # (L, V)
+            xt_logits = None
+            xt_tokens = self.pipeline.sample_init_tokens()[None]
             with self.enable_guide():
                 for timestep in timesteps:
-                    xt_logits, hidden_states, early_stop = self.pipeline.model_predict_step(xt_logits, timestep)  # (L, V)
-                    if early_stop:
+                    xt_logits, hidden_states, finished = self.pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)  # (L, V)
+                    xt_tokens = self.pipeline.sample_logits_to_tokens(xt_logits)[None]
+                    if finished[-1]:
                         break
             x1_texts.append(self.pipeline.argmax_logits_to_text(xt_logits))  # one completion string per sample
 
-            # Reference hidden states: one clean, unguided pass over the final answer tokens
-            x1_tokens = torch.argmax(xt_logits, dim=-1)  # (L,)
-            out = self.pipeline.model(input_ids=None,past_key_values=self.pipeline.kv_cache,decoder_position_ids=self.pipeline.dec_pos,decoder_input_ids=x1_tokens[None],self_conditioning_logits=None,output_hidden_states=True,)  # (1, L)
-            hidden_states = torch.stack(out.hidden_states, dim=0)[:, 0]  # (H+1, L, D)
+            # Reference hidden states: one clean, unguided pass over the final answer tokens.
+            x1_tokens = self.pipeline.argmax_logits_to_tokens(xt_logits)  # (L,)
+            _, hidden_states, _ = self.pipeline.model_predict(x1_tokens[None], None, timesteps[-1], kv_cache)  # (1, L)
             x1_hidden_states[i] = rms_norm(hidden_states)[list(self.config.guidance_layers)]  # (G, L, D)
 
         rewards = self.task.evaluate(x1_texts).to(self.accelerator.device)
 
-        gathered_x1_hidden_states = self.accelerator.gather(x1_hidden_states)
-        gathered_x1_texts         = self.accelerator.gather_for_metrics(x1_texts)
-        gathered_rewards          = self.accelerator.gather(rewards)
-        gathered_info             = {key: self.accelerator.gather(torch.cat(values).mean().reshape(1)) for key, values in self.info.items()}
+        gathered_x1_hidden_states = self.gather(x1_hidden_states)
+        gathered_x1_texts         = self.gather_object(x1_texts)
+        gathered_rewards          = self.gather(rewards)
+        gathered_info             = {key: self.gather(torch.cat(values).mean().reshape(1)) for key, values in self.info.items()}
 
         self.increment_data(gathered_x1_hidden_states, gathered_rewards)
 
