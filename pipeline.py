@@ -104,7 +104,7 @@ class DiffusionGemmaPipeline:
         return torch.randint(self.vocab_size, (self.gen_length,), device=self.device)  # (L,)
 
     @torch.no_grad()
-    def build_prompt_tokens(self, prompt, enable_thinking=True):
+    def build_prompt_tokens(self, prompt, enable_thinking=False):
         """Tokenize `prompt` into a batch-1 (1, P) input_ids tensor via the chat template."""
         input_ids = self.processor.apply_chat_template([{"role": "user", "content": prompt}],tokenize=True,add_generation_prompt=True,return_dict=True,return_tensors="pt",enable_thinking=enable_thinking,)["input_ids"].to(self.device)  # (1, P)
         return input_ids

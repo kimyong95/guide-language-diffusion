@@ -12,9 +12,8 @@ def base():
     config.task = "circle-packing"
 
     config.sample = ml_collections.ConfigDict()
-    config.sample.mode = "sliding"       # "block" (denoise whole canvas per block) or "sliding" (per-position window)
     config.sample.num_inference_steps = 48
-    config.sample.max_tokens = 262144    # token budget; block mode runs max_tokens // gen_length blocks
+    config.sample.max_tokens = 262144    # token budget; runs max_tokens // gen_length blocks
     config.sample.gen_length = 256
     config.sample.entropy_bound = 0.1
     config.sample.t_min = 0.4

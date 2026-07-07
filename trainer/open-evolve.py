@@ -120,10 +120,10 @@ class Trainer(BaseTrainer):
                     if not any(p.code == migrant.code for p in self.islands[target].values()):
                         self.add(replace(migrant, island=target, migrant=True), island=target)
 
-    # --- generation (full-rewrite; block or sliding-window diffusion, mirrors flow-guide/eval-gemma) ---
+    # --- generation (full-rewrite; block diffusion, mirrors flow-guide/eval-gemma) ---
 
     @torch.no_grad()
-    def generate_block(self, prompt):
+    def generate(self, prompt):
         # Block diffusion: denoise the whole gen_length canvas per block, argmax-commit it, grow the
         # kv_cache, repeat until EOS or the token budget is exhausted (max_tokens // gen_length blocks).
         pipeline = self.pipeline
@@ -148,44 +148,6 @@ class Trainer(BaseTrainer):
         gen_tokens = pipeline.strip_thinking_tokens(torch.cat(generated))
         return pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
 
-    @torch.no_grad()
-    def generate_sliding(self, prompt):
-        pipeline = self.pipeline
-        prompt_tokens = pipeline.build_prompt_tokens(prompt, enable_thinking=self.config.sample.enable_thinking)
-        kv_cache = pipeline.build_kv_cache(prompt_tokens)
-        L, V, device = pipeline.gen_length, pipeline.vocab_size, pipeline.device
-        N = self.config.sample.num_inference_steps
-
-        timesteps = torch.full((L,), N, device=device, dtype=torch.long)  # per-position lives
-        xt_logits = None                                 # self-conditioning off on the first step
-        xt_tokens = pipeline.sample_init_tokens()[None]  # (1, L) fully-noised canvas ~ Uniform(V)
-
-        committed = []       # list of (k,) committed token-id tensors
-        n_committed = 0
-        while n_committed < self.config.sample.max_tokens:
-            xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timesteps, kv_cache)  # (L, V), (L,)
-            timesteps = torch.clamp(timesteps - 1, min=0)  # age every position by one step, floor at 0
-            finished = finished | (timesteps == 0)         # force-commit positions that ran out of steps
-
-            k = int(finished.long().cumprod(dim=0).sum())  # length of the leading all-finished prefix
-            if k > 0:
-                commit = pipeline.argmax_logits_to_tokens(xt_logits[:k])  # (k,) clean tokens
-                committed.append(commit)
-                n_committed += k
-                if torch.isin(commit, pipeline.eos_token_id).any():
-                    break                                    # EOS reached: stop before caching this commit
-                kv_cache = pipeline.build_kv_cache(commit[None], kv_cache)  # grow cache by k -> positions auto-slide
-
-                # slide the window: drop the k committed positions, append k fresh hot positions
-                xt_logits = torch.cat([xt_logits[k:], torch.ones(k, V, device=device, dtype=xt_logits.dtype)], dim=0)
-                timesteps = torch.cat([timesteps[k:], torch.full((k,), N, device=device, dtype=torch.long)], dim=0)
-
-            # renoise for the next step; fresh tail positions (uniform logits) renoise to Uniform(V)
-            xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]  # (1, L)
-
-        gen_tokens = pipeline.strip_thinking_tokens(torch.cat(committed))
-        return pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
-
     def run(self):
         self.pipeline.model.eval()
         for iteration in tqdm(range(1, self.config.total_iterations + 1), desc="Iterations", position=0, disable=not self.accelerator.is_main_process):
@@ -200,8 +162,7 @@ class Trainer(BaseTrainer):
         programs = [(parent.code, parent.reward)] + self.sample_inspirations(parent, island)
         prompt = self.task.build_prompt(programs)
 
-        generate = {"block": self.generate_block, "sliding": self.generate_sliding}[self.config.sample.mode]
-        response = generate(prompt)
+        response = self.generate(prompt)
         code = self.task.extract_program(response)
         reward = self.task.evaluate_program(code)
 

@@ -9,7 +9,7 @@ def base():
     config.max_epochs = 100
 
     config.model = "google/diffusiongemma-26B-A4B-it"
-    config.task = "sudoku:0"
+    config.task = "circle-packing"
 
     # total objective evaluations: 100*16=1600
     config.sample = ml_collections.ConfigDict()
@@ -20,8 +20,9 @@ def base():
     config.sample.entropy_bound = 0.1
     config.sample.t_min = 0.4
     config.sample.t_max = 0.8
+    config.sample.enable_thinking = False
 
-    config.guide_scale = 15
+    config.guide_scale = 1
     config.guidance_layers = (15,) # total L=30 layers: tuple(range(30)) 
 
     return config

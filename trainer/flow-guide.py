@@ -44,7 +44,7 @@ def nw_grad(X, Y, x):
     x_bar = torch.einsum("qn,qnd->qd", p, X)                        # (Q, D) weighted-mean support
     grad  = torch.einsum("qn,qnd->qd", p * Y, X) - y_hat[:, None] * x_bar   # (Q, D)
 
-    return grad / (D**0.5)
+    return grad
 
 class Trainer(BaseTrainer):
     def __init__(self, config):
@@ -58,13 +58,16 @@ class Trainer(BaseTrainer):
         assert N % G == 0, "total_samples must be divisible by num_processes"
         self.N_local = N // G
 
-        self.prompt = self.task.prompt()
-
         self.num_layers = len(self.pipeline.model.model.decoder.layers)  # H
         self.data = {
-            "x1_hs": [],  # list of N tensors, each (G, L_n, D), rms-normed, on device (L_n varies per sample)
+            "x1_hs": [],  # list of N tensors, each (G, L_n, D), rms-normed, on CPU (L_n varies per sample)
             "rewards": torch.empty(0, device=self.accelerator.device),
         }
+
+        # Seed the best-so-far with the initial program (evaluated once, deterministic across ranks).
+        code0 = self.task.initial_program()
+        self.initial = (code0, self.task.evaluate_program(code0))  # (code, reward), fixed
+        self.best = self.initial                                   # (code, reward), updated per epoch
 
     def init_extention(self):
         for block in self.pipeline.model.model.decoder.layers:
@@ -108,7 +111,7 @@ class Trainer(BaseTrainer):
             x_normed = rms_norm(x)
             g = external_self.nw_grad(x_normed, self.layer_idx).to(device=x.device, dtype=x.dtype)  # (n, L, D)
             external_self.info[f"g-norm-{self.layer_idx}"].append(g.float().norm(dim=(-2, -1)))  # (n,)
-            x_guided = x + g * external_self.config.guide_scale
+            x_guided = x_normed + g * external_self.config.guide_scale
             x = x_guided * (x.norm(dim=-1, keepdim=True) / x_guided.norm(dim=-1, keepdim=True).clamp(min=1e-6))
 
         return original_forward(x, *args, **kwargs)
@@ -130,13 +133,13 @@ class Trainer(BaseTrainer):
         Returns:
             text: the decoded completion string.
             x1_hs: (G, L_n, D) reference hidden states over the whole completion
-                (L_n = num_blocks * gen_length), rms-normed, guidance layers only.
+                (L_n = num_blocks * gen_length), rms-normed, guidance layers only, on CPU.
         """
         pipeline = self.pipeline
         kv_cache = pipeline.build_kv_cache(prompt_tokens)  # fresh cache per sample; grown per block
 
         generated = []   # per-block canvas tokens (L,)
-        hs_blocks = []   # per-block reference hidden states (G, L, D)
+        hs_blocks = []   # per-block reference hidden states (G, L, D), moved to CPU
         for _ in range(self.config.sample.max_blocks):
             xt_logits = None
             xt_tokens = pipeline.sample_init_tokens()[None]
@@ -151,7 +154,7 @@ class Trainer(BaseTrainer):
             # Reference hidden states: one clean, unguided pass over this block against the
             # current cache (prompt + prior blocks).
             _, hidden_states, _ = pipeline.model_predict(canvas[None], None, timesteps[-1], kv_cache)  # (H+1, L, D)
-            hs_blocks.append(rms_norm(hidden_states)[list(self.config.guidance_layers)])  # (G, L, D)
+            hs_blocks.append(rms_norm(hidden_states)[list(self.config.guidance_layers)].cpu())  # (G, L, D)
 
             generated.append(canvas)
             if torch.isin(canvas, pipeline.eos_token_id).any():
@@ -172,27 +175,36 @@ class Trainer(BaseTrainer):
         timesteps = self.pipeline.scheduler.set_timesteps(num_inference_steps=self.config.sample.num_inference_steps,device=self.accelerator.device)
 
         # same prompt for every sample; encode once, reused read-only across the loop below
-        prompt_tokens = self.pipeline.build_prompt_tokens(self.prompt)
+        prompt = self.task.build_prompt([self.best, self.initial])  # current best + the initial seed
+        prompt_tokens = self.pipeline.build_prompt_tokens(prompt, enable_thinking=self.config.sample.enable_thinking)
 
-        x1_texts = []          # one (variable-length) completion text per sample
+        x1_codes = []          # one extracted program per sample
         x1_hidden_states = []  # one (G, L_n, D) reference-hidden-state tensor per sample
+        rewards = []
         for _ in range(self.N_local):  # one sequence at a time
             text, x1_hs = self.generate(prompt_tokens, timesteps)
-            x1_texts.append(text)
+            code = self.task.extract_program(text)
+            x1_codes.append(code)
             x1_hidden_states.append(x1_hs)
+            rewards.append(self.task.evaluate_program(code))
+        rewards = torch.tensor(rewards, device=self.accelerator.device, dtype=torch.float32)
 
-        rewards = self.task.evaluate(x1_texts).to(self.accelerator.device)
-
-        gathered_x1_hidden_states = gather_object(x1_hidden_states)  # variable length -> object gather
-        gathered_x1_texts         = gather_object(x1_texts)
+        gathered_x1_hidden_states = gather_object(x1_hidden_states)  # variable length, CPU tensors -> object gather
+        gathered_x1_codes         = gather_object(x1_codes)
         gathered_rewards          = self.accelerator.gather(rewards)
         gathered_info             = {key: self.accelerator.gather(torch.cat(values).mean().reshape(1)) for key, values in self.info.items()}
 
-        self.increment_data(gathered_x1_hidden_states, gathered_rewards)
+        best_idx = gathered_rewards.argmax().item()
+        if gathered_rewards[best_idx].item() > self.best[1]:
+            # New best -> the prompt changes next epoch, so the accumulated guidance data is stale; drop it all.
+            self.best = (gathered_x1_codes[best_idx], gathered_rewards[best_idx].item())
+            self.clear_data()
+        else:
+            self.increment_data(gathered_x1_hidden_states, gathered_rewards)
 
         objective_evaluations = epoch * self.config.sample.total_samples
-        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling")
-        self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_x1_texts, stage="sampling")
+        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/best-so-far": self.best[1]})
+        self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_x1_codes, stage="sampling")
         self.log_info(objective_evaluations=objective_evaluations, info=gathered_info, stage="sampling")
 
 
@@ -221,7 +233,7 @@ class Trainer(BaseTrainer):
         # == L2 proxy since both are rms-normed); Q-parallel, loop over the N variable-length samples.
         X_nn = []
         for s in range(N):
-            Xs = self.data["x1_hs"][s][l].float()                    # (L_s, D) support tokens
+            Xs = self.data["x1_hs"][s][l].to(self.accelerator.device).float()  # (L_s, D) support tokens
             best = (q @ Xs.T).argmax(dim=-1)                         # (Q,) closest token in sample s
             X_nn.append(Xs[best])                                    # (Q, D)
         X_nn = torch.stack(X_nn, dim=1)                             # (Q, N, D) selected support
@@ -230,8 +242,14 @@ class Trainer(BaseTrainer):
         return grad.reshape(n, L, D).to(device=xt.device, dtype=xt.dtype)
 
     def increment_data(self, x1_hidden_states, rewards):
-        self.data["x1_hs"].extend(hs.to(self.accelerator.device) for hs in x1_hidden_states)
+        self.data["x1_hs"].extend(x1_hidden_states)  # kept on CPU; moved to device per-use in nw_grad
         self.data["rewards"] = torch.cat([self.data["rewards"], rewards.to(self.accelerator.device)], dim=0)
+
+        torch.cuda.empty_cache()
+
+    def clear_data(self):
+        self.data["x1_hs"] = []
+        self.data["rewards"] = torch.empty(0, device=self.accelerator.device)
 
         torch.cuda.empty_cache()
 

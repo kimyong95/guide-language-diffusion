@@ -69,7 +69,7 @@ class CirclePacking:
         the prompt is a deterministic function of the archive."""
         
         if programs is None:
-            programs = [(self.initial_program(), 0.0)]
+            programs = [(self.initial_program(), 0.36423689449571406)]
 
         sections = [self.SYSTEM_MESSAGE]
         for idx, (code, reward) in enumerate(programs):
