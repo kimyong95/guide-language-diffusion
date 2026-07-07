@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 from transformers import AutoConfig, AutoProcessor, DiffusionGemmaForBlockDiffusion
 
 
@@ -45,19 +44,16 @@ class DiffusionGemmaScheduler:
 
 
 class DiffusionGemmaPipeline:
-    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, gen_length, tp_plan=None, device_mesh):
+    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, gen_length, device, device_map=None, max_memory=None):
         self.processor = AutoProcessor.from_pretrained(model_name)
 
         # pin the decoder canvas length to gen_length (else it stays at the model default 256)
         config = AutoConfig.from_pretrained(model_name)
         config.canvas_length = gen_length
 
-        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(model_name, config=config, dtype=dtype, tp_plan=tp_plan, device_mesh=device_mesh)
-
-        # TP group + its root rank: sampling is broadcast from the root so every rank in the
-        # group consumes byte-identical tokens (a size-1 group makes the broadcast a no-op).
-        self.tp_group = device_mesh["tp"].get_group()
-        self.tp_main = dist.get_process_group_ranks(self.tp_group)[0]
+        # device_map / max_memory pass straight through: the caller shards each process's full
+        # model across its GPU stride (see test-gemma.py); we place all I/O on `device`.
+        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(model_name, config=config, dtype=dtype, device_map=device_map, max_memory=max_memory)
 
         # no image input: drop the vision modules
         del self.model.model.encoder.vision_tower
@@ -66,7 +62,7 @@ class DiffusionGemmaPipeline:
         self.gen_length = self.model.config.canvas_length
         self.vocab_size = self.model.config.text_config.vocab_size
         self.hidden_size = self.model.config.text_config.hidden_size
-        self.device = self.model.get_input_embeddings().weight.device
+        self.device = device
 
         self.entropy_bound = entropy_bound
         self.confidence_threshold = confidence_threshold
@@ -74,17 +70,11 @@ class DiffusionGemmaPipeline:
 
         self.eos_token_id = torch.tensor(self.model.generation_config.eos_token_id, device=self.device)
 
-    def broadcast_tp(self, tensor):
-        """Broadcast from the TP-group root so every rank agrees (no-op when TP size is 1)."""
-        dist.broadcast(tensor, src=self.tp_main, group=self.tp_group)
-        return tensor
-
     def sample_logits_to_tokens(self, xt_logits):
         """Entropy-bound sample of the next renoised canvas from logits.
 
         Accepted positions are sampled from Categorical(P_t); the rest are renoised to
-        Uniform(V). Equivalent to the official accept_canvas + renoise_canvas. The result is
-        TP-broadcast from the group root, so every rank returns byte-identical tokens.
+        Uniform(V). Equivalent to the official accept_canvas + renoise_canvas.
 
         Args:
             xt_logits: (L, V) temperature-processed logits.
@@ -103,16 +93,15 @@ class DiffusionGemmaPipeline:
         probs = torch.softmax(xt_logits, dim=-1, dtype=torch.float32)         # P_t, (L, V)
         sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)         # Categorical(P_t[i])
         noise = torch.randint(self.vocab_size, entropy.shape, device=xt_logits.device)  # Uniform(V)
-        return self.broadcast_tp(torch.where(accept, sampled, noise))         # x_{t-1}[i], (L,)
+        return torch.where(accept, sampled, noise)                            # x_{t-1}[i], (L,)
 
     def sample_init_tokens(self):
         """Fully-noised initial canvas: (L,) tokens ~ Uniform(V).
 
         Equivalent to `sample_logits_to_tokens` on uniform logits (all positions renoised to
-        Uniform(V)). Like it, the draw is TP-broadcast from the group root so every rank starts
-        the block from byte-identical tokens.
+        Uniform(V)).
         """
-        return self.broadcast_tp(torch.randint(self.vocab_size, (self.gen_length,), device=self.device))  # (L,)
+        return torch.randint(self.vocab_size, (self.gen_length,), device=self.device)  # (L,)
 
     @torch.no_grad()
     def build_prompt_tokens(self, prompt, enable_thinking=True):
@@ -137,9 +126,6 @@ class DiffusionGemmaPipeline:
     def early_stop(self, xt_logits, xt_logits_next):
         """Per-position stopping mask: a position is finished when it is stable and confident.
 
-        The result is TP-broadcast from the group root so every rank's loop length stays in
-        lockstep (guards against float-level disagreement flipping `finished[-1]` on one rank).
-
         - stable[i]: the argmax (clean) prediction at position i is unchanged from the
           previous step's logits.
         - confident[i]: the left-to-right cumulative mean token entropy over positions
@@ -158,7 +144,7 @@ class DiffusionGemmaPipeline:
         entropy = token_entropy(xt_logits_next)  # (L,)
         cum_mean = torch.cumsum(entropy, dim=-1) / torch.arange(1, entropy.shape[-1] + 1, device=entropy.device)
         confident = cum_mean < self.confidence_threshold  # (L,)
-        return self.broadcast_tp(stable & confident)  # (L,)
+        return stable & confident  # (L,)
 
     @torch.no_grad()
     def model_predict(self, xt_tokens, xt_logits, timesteps, kv_cache, output_hidden_states=True):
@@ -166,7 +152,7 @@ class DiffusionGemmaPipeline:
 
         Args:
             xt_tokens: (1, L) renoised canvas tokens for this step (from the pipeline's
-                sampling methods, which TP-broadcast so every rank passes identical tokens).
+                sampling methods).
             xt_logits: (L, V) previous step's temperature-processed logits, used as the
                 self-conditioning signal, or None on the first step (self-conditioning off).
             timesteps: per-position "time lives", counting down N..1; a (L,) vector or a
@@ -188,8 +174,10 @@ class DiffusionGemmaPipeline:
             self_conditioning_logits=xt_logits,
             output_hidden_states=output_hidden_states,
         )
-        hidden_states = torch.stack(out.hidden_states, dim=0)[:, 0]  # (H+1, L, D)
-        xt_logits_next = self.scheduler.temperature(out.logits[0], timstep=timesteps)  # (L, V)
+        # device_map="auto" leaves each layer's output on its own GPU; pull everything onto
+        # self.device before stacking (else torch.stack raises) and before returning.
+        hidden_states = torch.stack([h[0].to(self.device) for h in out.hidden_states], dim=0)  # (H+1, L, D)
+        xt_logits_next = self.scheduler.temperature(out.logits[0].to(self.device), timstep=timesteps)  # (L, V)
 
         finished = self.early_stop(xt_logits, xt_logits_next)  # (L,)
 

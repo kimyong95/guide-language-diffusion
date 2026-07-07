@@ -1,21 +1,11 @@
 import os
 import sys
 import torch
-import torch.distributed as dist
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from pipeline import DiffusionGemmaPipeline
 import tasks
-
-MOE_TP_PLAN = {
-    "model.encoder.language_model.layers.*.experts.gate_up_proj": "packed_colwise",
-    "model.encoder.language_model.layers.*.experts.down_proj": "rowwise",
-    "model.encoder.language_model.layers.*.experts": "moe_tp_experts",
-    "model.decoder.layers.*.experts.gate_up_proj": "packed_colwise",
-    "model.decoder.layers.*.experts.down_proj": "rowwise",
-    "model.decoder.layers.*.experts": "moe_tp_experts",
-}
 
 
 class BaseTrainer:
@@ -23,7 +13,6 @@ class BaseTrainer:
     def __init__(self, config):
         self.config = config
         self.setup_accelerator()
-        self.setup_parallel()
         self.setup_task()
         self.setup_model()
         self.log_code()
@@ -44,34 +33,23 @@ class BaseTrainer:
         set_seed(self.config.seed, device_specific=True)
         # assert torch.cuda.device_count() == self.accelerator.num_processes, f"Number of avaliable GPUs does not match the number of processes ({self.accelerator.num_processes})"
 
-    def setup_parallel(self):
-        self.tp_size = self.config.tp_size
-        self.dp_size = self.accelerator.num_processes // self.tp_size
-        self.device_mesh = dist.init_device_mesh("cuda", (self.dp_size, self.tp_size), mesh_dim_names=("dp", "tp"))
-        self.dp_group = self.device_mesh["dp"].get_group()
-
-    def gather(self, tensor):
-        out = [torch.empty_like(tensor) for _ in range(self.dp_size)]
-        dist.all_gather(out, tensor, group=self.dp_group)
-        return torch.cat(out, dim=0)
-
-    def gather_object(self, objs):
-        shards = [None] * self.dp_size
-        dist.all_gather_object(shards, objs, group=self.dp_group)
-        return [x for shard in shards for x in shard]
-
     def setup_task(self):
         self.task = tasks.get_reward_fn(self.config.task)
 
     def setup_model(self):
+        # Shard this process's full model across its GPU stride (see test-gemma.py); each rank
+        # keeps a disjoint set of GPUs, one full model replica per data-parallel process.
+        max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(self.accelerator.process_index, torch.cuda.device_count(), self.accelerator.num_processes)}
+        
         self.pipeline = DiffusionGemmaPipeline(
             self.config.model,
             gen_length=self.config.sample.gen_length,
             entropy_bound=self.config.sample.entropy_bound,
             t_min=self.config.sample.t_min,
             t_max=self.config.sample.t_max,
-            tp_plan=MOE_TP_PLAN,
-            device_mesh=self.device_mesh,
+            device=self.accelerator.device,
+            device_map="auto",
+            max_memory=max_memory,
         )
         self.pipeline.model.requires_grad_(False)
 

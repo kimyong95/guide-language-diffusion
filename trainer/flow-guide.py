@@ -8,6 +8,7 @@ import einops
 import torch
 import wandb
 from absl import flags
+from accelerate.utils import gather_object
 from ml_collections import config_flags
 from tqdm import tqdm
 
@@ -53,15 +54,15 @@ class Trainer(BaseTrainer):
         self.init_extention()
 
         N = self.config.sample.total_samples
-        G = self.dp_size
-        assert N % G == 0, "total_samples must be divisible by dp_size"
+        G = self.accelerator.num_processes
+        assert N % G == 0, "total_samples must be divisible by num_processes"
         self.N_local = N // G
 
         self.prompt = self.task.prompt()
 
         self.num_layers = len(self.pipeline.model.model.decoder.layers)  # H
         self.data = {
-            "x1_hs": torch.empty(0, len(self.config.guidance_layers), self.pipeline.gen_length, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16),  # (N, G, L, D)
+            "x1_hs": [],  # list of N tensors, each (G, L_n, D), rms-normed, on device (L_n varies per sample)
             "rewards": torch.empty(0, device=self.accelerator.device),
         }
 
@@ -119,6 +120,50 @@ class Trainer(BaseTrainer):
         self.accelerator.end_training()
 
     @torch.no_grad()
+    def generate(self, prompt_tokens, timesteps):
+        """Semi-autoregressive (block-diffusion) sampling of one completion.
+
+        Denoise one canvas of `gen_length` tokens at a time; after each finished block, append it
+        to the encoder KV cache and start the next block conditioned on it. Stops when a block
+        contains an EOS token or after `max_blocks` blocks.
+
+        Returns:
+            text: the decoded completion string.
+            x1_hs: (G, L_n, D) reference hidden states over the whole completion
+                (L_n = num_blocks * gen_length), rms-normed, guidance layers only.
+        """
+        pipeline = self.pipeline
+        kv_cache = pipeline.build_kv_cache(prompt_tokens)  # fresh cache per sample; grown per block
+
+        generated = []   # per-block canvas tokens (L,)
+        hs_blocks = []   # per-block reference hidden states (G, L, D)
+        for _ in range(self.config.sample.max_blocks):
+            xt_logits = None
+            xt_tokens = pipeline.sample_init_tokens()[None]
+            with self.enable_guide():  # guidance wraps only the denoising loop
+                for timestep in timesteps:
+                    xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)  # (L, V)
+                    xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
+                    if finished[-1]:
+                        break
+
+            canvas = pipeline.argmax_logits_to_tokens(xt_logits)  # (L,)
+            # Reference hidden states: one clean, unguided pass over this block against the
+            # current cache (prompt + prior blocks).
+            _, hidden_states, _ = pipeline.model_predict(canvas[None], None, timesteps[-1], kv_cache)  # (H+1, L, D)
+            hs_blocks.append(rms_norm(hidden_states)[list(self.config.guidance_layers)])  # (G, L, D)
+
+            generated.append(canvas)
+            if torch.isin(canvas, pipeline.eos_token_id).any():
+                break
+            kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)  # append finished block
+
+        x1_hs = torch.cat(hs_blocks, dim=1)  # (G, L_n, D)
+        gen_tokens = pipeline.strip_thinking_tokens(torch.cat(generated))
+        text = pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
+        return text, x1_hs
+
+    @torch.no_grad()
     def sampling_step(self, epoch):
         self.pipeline.model.eval()
 
@@ -128,33 +173,20 @@ class Trainer(BaseTrainer):
 
         # same prompt for every sample; encode once, reused read-only across the loop below
         prompt_tokens = self.pipeline.build_prompt_tokens(self.prompt)
-        kv_cache = self.pipeline.build_kv_cache(prompt_tokens)
 
-        x1_texts = []  # one (variable-length) completion text per sample
-        x1_hidden_states = torch.empty(self.N_local, len(self.config.guidance_layers), self.pipeline.gen_length, self.pipeline.hidden_size, device=self.accelerator.device, dtype=torch.bfloat16,)  # (N_local, G, L, D)
-
-        for i in range(self.N_local):  # one sequence at a time
-            xt_logits = None
-            xt_tokens = self.pipeline.sample_init_tokens()[None]
-            with self.enable_guide():
-                for timestep in timesteps:
-                    xt_logits, hidden_states, finished = self.pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)  # (L, V)
-                    xt_tokens = self.pipeline.sample_logits_to_tokens(xt_logits)[None]
-                    if finished[-1]:
-                        break
-            x1_texts.append(self.pipeline.argmax_logits_to_text(xt_logits))  # one completion string per sample
-
-            # Reference hidden states: one clean, unguided pass over the final answer tokens.
-            x1_tokens = self.pipeline.argmax_logits_to_tokens(xt_logits)  # (L,)
-            _, hidden_states, _ = self.pipeline.model_predict(x1_tokens[None], None, timesteps[-1], kv_cache)  # (1, L)
-            x1_hidden_states[i] = rms_norm(hidden_states)[list(self.config.guidance_layers)]  # (G, L, D)
+        x1_texts = []          # one (variable-length) completion text per sample
+        x1_hidden_states = []  # one (G, L_n, D) reference-hidden-state tensor per sample
+        for _ in range(self.N_local):  # one sequence at a time
+            text, x1_hs = self.generate(prompt_tokens, timesteps)
+            x1_texts.append(text)
+            x1_hidden_states.append(x1_hs)
 
         rewards = self.task.evaluate(x1_texts).to(self.accelerator.device)
 
-        gathered_x1_hidden_states = self.gather(x1_hidden_states)
-        gathered_x1_texts         = self.gather_object(x1_texts)
-        gathered_rewards          = self.gather(rewards)
-        gathered_info             = {key: self.gather(torch.cat(values).mean().reshape(1)) for key, values in self.info.items()}
+        gathered_x1_hidden_states = gather_object(x1_hidden_states)  # variable length -> object gather
+        gathered_x1_texts         = gather_object(x1_texts)
+        gathered_rewards          = self.accelerator.gather(rewards)
+        gathered_info             = {key: self.accelerator.gather(torch.cat(values).mean().reshape(1)) for key, values in self.info.items()}
 
         self.increment_data(gathered_x1_hidden_states, gathered_rewards)
 
@@ -176,9 +208,8 @@ class Trainer(BaseTrainer):
         n, L, D = xt.shape
 
         l = self.config.guidance_layers.index(layer_id)
-        X1 = self.data["x1_hs"][:, l].float()   # (N, L, D) support tokens, already rms_norm'd
         Y = self.data["rewards"]                # (N,)
-        N = len(X1)
+        N = len(self.data["x1_hs"])
 
         if N < 2:
             return torch.zeros(n, L, D, device=xt.device, dtype=xt.dtype)
@@ -186,14 +217,20 @@ class Trainer(BaseTrainer):
         Yz = (Y - Y.mean()) / Y.std().clamp(min=1e-3)                 # std-normalize reward scale
         q = xt.reshape(n * L, D).float().to(self.accelerator.device)  # (Q, D) query tokens
 
-        idx  = torch.einsum("qd,nld->qnl", q, X1).argmax(dim=-1)      # (Q, N) closest token per sentence
-        X_nn = X1[torch.arange(N, device=X1.device), idx]            # (Q, N, D) selected support
-        grad = nw_grad(X_nn, Yz, q)                                  # (Q, D) batched standalone
+        # For each dataset sample, pick its single nearest token to each query token (dot product
+        # == L2 proxy since both are rms-normed); Q-parallel, loop over the N variable-length samples.
+        X_nn = []
+        for s in range(N):
+            Xs = self.data["x1_hs"][s][l].float()                    # (L_s, D) support tokens
+            best = (q @ Xs.T).argmax(dim=-1)                         # (Q,) closest token in sample s
+            X_nn.append(Xs[best])                                    # (Q, D)
+        X_nn = torch.stack(X_nn, dim=1)                             # (Q, N, D) selected support
 
+        grad = nw_grad(X_nn, Yz, q)                                  # (Q, D) batched standalone
         return grad.reshape(n, L, D).to(device=xt.device, dtype=xt.dtype)
 
     def increment_data(self, x1_hidden_states, rewards):
-        self.data["x1_hs"] = torch.cat([self.data["x1_hs"], x1_hidden_states.to(self.accelerator.device)], dim=0)
+        self.data["x1_hs"].extend(hs.to(self.accelerator.device) for hs in x1_hidden_states)
         self.data["rewards"] = torch.cat([self.data["rewards"], rewards.to(self.accelerator.device)], dim=0)
 
         torch.cuda.empty_cache()
