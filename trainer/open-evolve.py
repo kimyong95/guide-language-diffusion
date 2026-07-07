@@ -211,20 +211,8 @@ class Trainer(BaseTrainer):
             self.migrate()
 
         rewards = torch.tensor([reward], device=self.accelerator.device, dtype=torch.float32)
-        info = {
-            "best-so-far": torch.tensor(self.best.reward, device=self.accelerator.device),
-            "cells-occupied": torch.tensor(float(sum(len(grid) for grid in self.islands)), device=self.accelerator.device),
-            "generation": torch.tensor(float(child.generation), device=self.accelerator.device),
-        }
-        self.log_rewards(objective_evaluations=iteration, rewards=rewards, stage="sampling")
+        self.log_rewards(objective_evaluations=iteration, rewards=rewards, stage="sampling", extra={"sampling/best-so-far": self.best.reward})
         self.log_texts(objective_evaluations=iteration, rewards=rewards, texts=[code], stage="sampling")
-        self.log_info(objective_evaluations=iteration, info=info, stage="sampling")
-
-    def log_info(self, objective_evaluations, info, stage):
-        log_dict = {"objective-evaluations": objective_evaluations}
-        for key, value in info.items():
-            log_dict[f"info/{stage}/{key}"] = value.item()
-        self.accelerator.log(log_dict)
 
 
 if __name__ == "__main__":

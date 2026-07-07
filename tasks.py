@@ -10,47 +10,6 @@ import tempfile
 import torch
 from datasets import load_dataset
 
-class Sudoku:
-
-    PROMPT_TEMPLATE = inspect.cleandoc("""
-        Solve the following Sudoku puzzle, where 0 represents the empty cells to be filled:
-        {puzzle}
-        
-        Response 9x9 grid with no spaces, rows separated by newlines.
-    """)
-
-    # a row is exactly 9 digits (not part of a longer digit run); a grid is 9 such rows
-    ROW_RE = r"(?<![0-9])[0-9]{9}(?![0-9])"
-    GRID_RE = re.compile(rf"{ROW_RE}(?:[ \t]*\r?\n[ \t]*{ROW_RE}){{8}}")
-
-    def __init__(self, puzzle_id=0):
-        ds = load_dataset("sapientinc/sudoku-extreme",split="test",converters={"question": str, "answer": str},)
-        row = ds.sort("rating")[int(puzzle_id)]
-        self.puzzle = self.to_grid(row["question"].replace(".", "0"))
-        self.ground_truth = row["answer"]
-
-    @staticmethod
-    def to_grid(digits: str) -> str:
-        return "\n".join(digits[i:i + 9] for i in range(0, 81, 9))
-
-    def evaluate_one(self, response: str) -> float:
-        matches = self.GRID_RE.findall(response)
-        if not matches:
-            return 0.0
-        solution = "".join(char for char in matches[-1] if char.isdigit())
-        N = len(self.ground_truth)
-        if len(solution) != N:
-            return 0.0
-        return sum(1 for i in range(N) if solution[i] == self.ground_truth[i]) / N
-
-    def evaluate(self, responses: list[str]) -> torch.Tensor:
-        return torch.tensor([self.evaluate_one(r) for r in responses], dtype=torch.float32)
-
-    def prompt(self):
-        return self.PROMPT_TEMPLATE.format(puzzle=self.puzzle)
-
-
-
 class CirclePacking:
     """OpenEvolve circle-packing task (n=26): the model evolves a constructor program that places 26
     circles in the unit square to maximize the sum of radii. Seed program and evaluator are reused
@@ -104,10 +63,14 @@ class CirclePacking:
         code = (CirclePacking.EXAMPLE / "initial_program.py").read_text(encoding="utf-8")
         return code
 
-    def build_prompt(self, programs: list) -> str:
+    def build_prompt(self, programs: list = None) -> str:
         """Prompt from a list of (code, reward): programs[0] is the current program, the rest are
         prior programs for reference. Renders only the reward score (never other metric floats), so
         the prompt is a deterministic function of the archive."""
+        
+        if programs is None:
+            programs = [(self.initial_program(), 0.0)]
+
         sections = [self.SYSTEM_MESSAGE]
         for idx, (code, reward) in enumerate(programs):
             header = "Current program" if idx == 0 else f"Prior program [{idx}]"
@@ -135,7 +98,6 @@ class CirclePacking:
 
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 TASKS_CLS = {
-    "sudoku": Sudoku,
     "circle-packing": CirclePacking,
 }
 
