@@ -10,7 +10,6 @@ def base():
 
     config.model = "google/diffusiongemma-26B-A4B-it"
     config.task = "circle-packing"
-    config.tp_size = 1
 
     config.sample = ml_collections.ConfigDict()
     config.sample.mode = "sliding"       # "block" (denoise whole canvas per block) or "sliding" (per-position window)

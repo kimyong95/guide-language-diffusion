@@ -10,7 +10,6 @@ def base():
 
     config.model = "google/diffusiongemma-26B-A4B-it"
     config.task = "sudoku:0"
-    config.tp_size = 1
 
     # total objective evaluations: 100*16=1600
     config.sample = ml_collections.ConfigDict()
