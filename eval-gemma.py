@@ -158,7 +158,7 @@ class DiffusionGemmaBlock(DiffusionGemmaEvalHarness):
             xt_logits = None
             xt_tokens = pipeline.sample_init_tokens()[None]
             for timestep in self.timesteps:
-                xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
+                xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
                 xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
                 if finished[-1]:
                     break
@@ -199,7 +199,7 @@ class DiffusionGemmaSliding(DiffusionGemmaEvalHarness):
         committed = []       # list of (k,) committed token-id tensors
         n_committed = 0
         while n_committed < self.max_tokens:
-            xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timesteps, kv_cache)  # (L, V), (L,)
+            xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timesteps, kv_cache)  # (L, V), (L,)
             timesteps = torch.clamp(timesteps - 1, min=0)  # age every position by one step, floor at 0
             finished = finished | (timesteps == 0)
 

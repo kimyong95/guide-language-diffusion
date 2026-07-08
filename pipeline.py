@@ -147,7 +147,7 @@ class DiffusionGemmaPipeline:
         return stable & confident  # (L,)
 
     @torch.no_grad()
-    def model_predict(self, xt_tokens, xt_logits, timesteps, kv_cache, output_hidden_states=True):
+    def model_predict(self, xt_tokens, xt_logits, timesteps, kv_cache):
         """One denoiser step. The caller owns sampling (`xt_tokens`); stopping is `self.early_stop`.
 
         Args:
@@ -160,7 +160,7 @@ class DiffusionGemmaPipeline:
             kv_cache: batch-1 encoder KV cache from `build_kv_cache`.
         Returns:
             xt_logits_next: (L, V) temperature-processed logits.
-            hidden_states: (H+1, L, D) per-layer hidden states.
+            finished: (L,) bool early-stop mask.
         """
         # decoder canvas sits right after the prompt: positions P .. P+L-1
         P = kv_cache.get_seq_length()
@@ -172,16 +172,30 @@ class DiffusionGemmaPipeline:
             decoder_position_ids=torch.arange(P, P + L, device=self.device).unsqueeze(0),
             decoder_input_ids=xt_tokens,
             self_conditioning_logits=xt_logits,
-            output_hidden_states=output_hidden_states,
         )
         # device_map="auto" leaves each layer's output on its own GPU; pull everything onto
         # self.device before stacking (else torch.stack raises) and before returning.
-        hidden_states = torch.stack([h[0].to(self.device) for h in out.hidden_states], dim=0)  # (H+1, L, D)
         xt_logits_next = self.scheduler.temperature(out.logits[0].to(self.device), timstep=timesteps)  # (L, V)
 
         finished = self.early_stop(xt_logits, xt_logits_next)  # (L,)
 
-        return xt_logits_next, hidden_states, finished
+        return xt_logits_next, finished
+
+    @torch.no_grad()
+    def compute_hidden_states(self, tokens):
+        """Per-layer encoder hidden states from one clean pass over `tokens` (1, T).
+
+        Fresh cache, no prompt (prompt-independent, cf. test-hidden.py). Positions are the
+        encoder-layer inputs: hidden_states[0] is the embedding output, hidden_states[i] the
+        input to layer i.
+
+        Args:
+            tokens: (1, T) token ids.
+        Returns:
+            hidden_states: (H+1, T, D) per-layer hidden states, on self.device.
+        """
+        out = self.model.model.encoder(input_ids=tokens, output_hidden_states=True)
+        return torch.stack([h[0].to(self.device) for h in out.hidden_states])  # (H+1, T, D)
 
     def argmax_logits_to_tokens(self, logits):
         """Select argmax logits as the tokens"""

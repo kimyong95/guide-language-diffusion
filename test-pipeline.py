@@ -44,7 +44,7 @@ for _ in range(5):
         xt_logits = None
         xt_tokens = pipeline.sample_init_tokens()[None]
         for timestep in timesteps:
-            xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
+            xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
             xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
             if finished[-1]:
                 break

@@ -11,8 +11,6 @@ def base():
     config.model = "google/diffusiongemma-26B-A4B-it"
     config.task = "circle-packing"
 
-    config.top_k = 3  # best-data archive shown in the prompt (distinct rewards, best-first)
-
     # total objective evaluations: 100*8=800 (max_epochs * sample.total_samples)
     config.sample = ml_collections.ConfigDict()
     config.sample.total_samples = 8

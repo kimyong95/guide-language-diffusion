@@ -139,30 +139,28 @@ class Trainer(BaseTrainer):
         kv_cache = pipeline.build_kv_cache(prompt_tokens)  # fresh cache per sample; grown per block
 
         generated = []   # per-block canvas tokens (L,)
-        hs_blocks = []   # per-block reference hidden states (G, L, D), moved to CPU
         for _ in range(self.config.sample.max_blocks):
             xt_logits = None
             xt_tokens = pipeline.sample_init_tokens()[None]
             with self.enable_guide():  # guidance wraps only the denoising loop
                 for timestep in timesteps:
-                    xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)  # (L, V)
+                    xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)  # (L, V), (L,)
                     xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
                     if finished[-1]:
                         break
 
             canvas = pipeline.argmax_logits_to_tokens(xt_logits)  # (L,)
-            # Reference hidden states: one clean, unguided pass over this block against the
-            # current cache (prompt + prior blocks).
-            _, hidden_states, _ = pipeline.model_predict(canvas[None], None, timesteps[-1], kv_cache)  # (H+1, L, D)
-            hs_blocks.append(rms_norm(hidden_states)[list(self.config.guidance_layers)].cpu())  # (G, L, D)
-
             generated.append(canvas)
             if torch.isin(canvas, pipeline.eos_token_id).any():
                 break
             kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)  # append finished block
 
-        x1_hs = torch.cat(hs_blocks, dim=1)  # (G, L_n, D)
-        gen_tokens = pipeline.strip_thinking_tokens(torch.cat(generated))
+        gen_canvas = torch.cat(generated)  # (L_n,)
+        # Reference hidden states: one clean, prompt-independent encoder pass over the whole completion.
+        hidden_states = pipeline.compute_hidden_states(gen_canvas[None])  # (H+1, L_n, D)
+        x1_hs = rms_norm(hidden_states)[list(self.config.guidance_layers)].cpu()  # (G, L_n, D)
+
+        gen_tokens = pipeline.strip_thinking_tokens(gen_canvas)
         text = pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
         return text, x1_hs
 

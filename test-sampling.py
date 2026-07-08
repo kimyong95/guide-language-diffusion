@@ -48,7 +48,7 @@ xt_tokens = pipeline.sample_init_tokens()[None]  # (1, L) fully-noised canvas ~ 
 committed = []       # list of (k,) committed token-id tensors
 n_committed = 0
 while n_committed < MAX_TOKENS:
-    xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timesteps, kv_cache)  # (L, V), (L,)
+    xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timesteps, kv_cache)  # (L, V), (L,)
     timesteps = torch.clamp(timesteps - 1, min=0)         # age every position by one step, floor at 0
 
     k = int(finished.long().cumprod(dim=0).sum())   # length of the leading all-finished prefix

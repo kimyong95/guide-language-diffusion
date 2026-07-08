@@ -1,3 +1,4 @@
+import os
 import sys
 
 import torch
@@ -36,6 +37,8 @@ class Trainer(BaseTrainer):
         self.initial = (init_code, self.task.evaluate_code(init_code))  # (code, reward), fixed
         self.best = self.initial                                   # (code, reward), updated per epoch
 
+        self.token_records = []  # accumulated {epoch, idx, token_ids (long), reward (float)}, saved each epoch
+
     @torch.no_grad()
     def generate(self, prompt):
         # Block diffusion: denoise the whole canvas_length canvas per block, argmax-commit it, grow the
@@ -49,7 +52,7 @@ class Trainer(BaseTrainer):
             xt_logits = None
             xt_tokens = pipeline.sample_init_tokens()[None]
             for timestep in self.timesteps:
-                xt_logits, _, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
+                xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
                 xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
                 if finished[-1]:
                     break
@@ -60,7 +63,7 @@ class Trainer(BaseTrainer):
             kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)
 
         gen_tokens = pipeline.strip_thinking_tokens(torch.cat(generated))
-        return pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
+        return pipeline.processor.decode(gen_tokens, skip_special_tokens=True), gen_tokens
 
     def run(self):
         self.pipeline.model.eval()
@@ -75,23 +78,38 @@ class Trainer(BaseTrainer):
 
         codes = []
         rewards = []
+        token_ids = []
         for _ in range(self.N_local):
-            response = self.generate(prompt)
+            response, gen_tokens = self.generate(prompt)
             code = self.task.extract_code(response)
             rewards.append(self.task.evaluate_code(code))
             codes.append(code)
+            token_ids.append(gen_tokens.cpu())        # variable-length long tensor per sample
 
         rewards = torch.tensor(rewards, device=self.accelerator.device, dtype=torch.float32)
 
         gathered_codes = gather_object(codes)                 # variable-length strings -> object gather
+        gathered_token_ids = gather_object(token_ids)         # variable-length tensors -> object gather
         gathered_rewards = self.accelerator.gather(rewards)
         best_idx = gathered_rewards.argmax().item()
         if gathered_rewards[best_idx].item() > self.best[1]:
             self.best = (gathered_codes[best_idx], gathered_rewards[best_idx].item())
 
+        self.save_token_ids(epoch, gathered_token_ids, gathered_rewards)
+
         objective_evaluations = epoch * self.config.sample.total_samples
         self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/best-so-far": self.best[1]})
         self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_codes, stage="sampling")
+
+    def save_token_ids(self, epoch, token_ids, rewards):
+        # Persist every generated sample's token ids (long) with its reward (float). The full record
+        # list is re-saved each epoch so the file always holds the complete run.
+        if not self.accelerator.is_main_process:
+            return
+        for idx, (ids, reward) in enumerate(zip(token_ids, rewards)):
+            self.token_records.append({"epoch": epoch, "idx": idx, "token_ids": ids.cpu().long(), "reward": reward.item()})
+        wandb_dir = self.accelerator.get_tracker("wandb").run.dir.removesuffix("/files")
+        torch.save(self.token_records, os.path.join(wandb_dir, "generations.pt"))
 
 
 if __name__ == "__main__":
