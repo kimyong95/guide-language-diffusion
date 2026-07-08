@@ -44,12 +44,12 @@ class DiffusionGemmaScheduler:
 
 
 class DiffusionGemmaPipeline:
-    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, gen_length, device, device_map=None, max_memory=None):
+    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, canvas_length, device, device_map=None, max_memory=None):
         self.processor = AutoProcessor.from_pretrained(model_name)
 
-        # pin the decoder canvas length to gen_length (else it stays at the model default 256)
+        # pin the decoder canvas length to canvas_length (else it stays at the model default 256)
         config = AutoConfig.from_pretrained(model_name)
-        config.canvas_length = gen_length
+        config.canvas_length = canvas_length
 
         # device_map / max_memory pass straight through: the caller shards each process's full
         # model across its GPU stride (see test-gemma.py); we place all I/O on `device`.
@@ -59,7 +59,7 @@ class DiffusionGemmaPipeline:
         del self.model.model.encoder.vision_tower
         del self.model.model.encoder.embed_vision
 
-        self.gen_length = self.model.config.canvas_length
+        self.canvas_length = self.model.config.canvas_length
         self.vocab_size = self.model.config.text_config.vocab_size
         self.hidden_size = self.model.config.text_config.hidden_size
         self.device = device
@@ -101,7 +101,7 @@ class DiffusionGemmaPipeline:
         Equivalent to `sample_logits_to_tokens` on uniform logits (all positions renoised to
         Uniform(V)).
         """
-        return torch.randint(self.vocab_size, (self.gen_length,), device=self.device)  # (L,)
+        return torch.randint(self.vocab_size, (self.canvas_length,), device=self.device)  # (L,)
 
     @torch.no_grad()
     def build_prompt_tokens(self, prompt, enable_thinking=False):

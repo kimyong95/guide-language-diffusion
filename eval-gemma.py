@@ -3,7 +3,7 @@ lm-evaluation-harness adapter(s) for the DiffusionGemma block-diffusion model.
 
 Two sampling recipes are exposed as separate models sharing one base class; they differ only
 in the generation procedure (`generate_tokens`):
-  - "diffusion-gemma"         : block diffusion -- denoise a full gen_length canvas per block,
+  - "diffusion-gemma"         : block diffusion -- denoise a full canvas_length canvas per block,
                                 argmax-commit the whole block, grow the KV cache, repeat until
                                 EOS / max_blocks.
   - "diffusion-gemma-sliding" : sliding window -- per-position timesteps, commit only the
@@ -52,7 +52,7 @@ class DiffusionGemmaEvalHarness(LM):
     def __init__(
         self,
         model_name="google/diffusiongemma-26B-A4B-it",
-        gen_length=256,
+        canvas_length=256,
         num_inference_steps=48,
         entropy_bound=0.1,
         confidence_threshold=0.005,
@@ -64,7 +64,7 @@ class DiffusionGemmaEvalHarness(LM):
         '''
         Args:
             model_name: DiffusionGemma checkpoint (instruction-tuned).
-            gen_length: decoder canvas length, i.e. tokens produced per block / window.
+            canvas_length: decoder canvas length, i.e. tokens produced per block / window.
             num_inference_steps: diffusion denoising steps per position.
             entropy_bound / confidence_threshold / t_min / t_max: sampling schedule
                 parameters forwarded to DiffusionGemmaPipeline.
@@ -80,7 +80,7 @@ class DiffusionGemmaEvalHarness(LM):
         torch.cuda.set_device(self.accelerator.local_process_index)
 
         # lm-eval passes --model_args as strings; cast defensively.
-        gen_length = int(gen_length)
+        canvas_length = int(canvas_length)
         self.num_inference_steps = int(num_inference_steps)
         self.enable_thinking = enable_thinking
 
@@ -90,7 +90,7 @@ class DiffusionGemmaEvalHarness(LM):
             confidence_threshold=float(confidence_threshold),
             t_min=float(t_min),
             t_max=float(t_max),
-            gen_length=gen_length,
+            canvas_length=canvas_length,
             device_map="cuda",
         )
         self.pipeline.model.eval()
@@ -189,7 +189,7 @@ class DiffusionGemmaSliding(DiffusionGemmaEvalHarness):
         pipeline = self.pipeline
         prompt_tokens = pipeline.build_prompt_tokens(prompt, enable_thinking=self.enable_thinking)
         kv_cache = pipeline.build_kv_cache(prompt_tokens)
-        L, V, device = pipeline.gen_length, pipeline.vocab_size, self.device
+        L, V, device = pipeline.canvas_length, pipeline.vocab_size, self.device
         N = self.num_inference_steps
 
         timesteps = torch.full((L,), N, device=device, dtype=torch.long)  # per-position lives

@@ -16,7 +16,7 @@ def base():
     config.sample.total_samples = 8
     config.sample.num_inference_steps = 48
     config.sample.max_blocks = 1024
-    config.sample.gen_length = 256
+    config.sample.canvas_length = 256
     config.sample.entropy_bound = 0.1
     config.sample.t_min = 0.4
     config.sample.t_max = 0.8

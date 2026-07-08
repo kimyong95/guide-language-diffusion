@@ -13,11 +13,11 @@ FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/open-evolve.py", "Training configuration.")
 
 FEATURE_BINS = 10               # MAP-Elites grid resolution per axis (complexity, diversity)
-DIVERSITY_REFERENCE_SIZE = 20   # reference programs used to score the diversity feature
+DIVERSITY_REFERENCE_SIZE = 20   # reference codes used to score the diversity feature
 
 
 @dataclass
-class Program:
+class Data:
     code: str
     reward: float
     generation: int
@@ -40,20 +40,20 @@ class Trainer(BaseTrainer):
             num_inference_steps=self.config.sample.num_inference_steps, device=self.accelerator.device
         )
 
-        # Each island is its own MAP-Elites grid: {feature-cell -> elite Program}.
+        # Each island is its own MAP-Elites grid: {feature-cell -> elite Data}.
         self.islands = [dict() for _ in range(self.config.num_islands)]
         self.feature_range = {}      # feature -> [min, max] for min-max binning
         self.reference_codes = []    # first codes seen, reference set for the diversity feature
         self.best = None
 
-        # Seed island 0 with the initial program (deterministic, so identical across ranks).
-        code0 = self.task.initial_program()
-        self.add(Program(code0, self.task.evaluate_program(code0), generation=0, island=0), island=0)
+        # Seed island 0 with the initial code (deterministic, so identical across ranks).
+        init_code = self.task.initial_code()
+        self.add(Data(init_code, self.task.evaluate_code(init_code), generation=0, island=0), island=0)
 
     # --- MAP-Elites archive ---
 
-    def all_programs(self):
-        return [program for grid in self.islands for program in grid.values()]
+    def all_data(self):
+        return [data for grid in self.islands for data in grid.values()]
 
     def diversity(self, code):
         # Mean cheap code-distance to the reference set (0 until the set is seeded).
@@ -62,10 +62,10 @@ class Trainer(BaseTrainer):
             return 0.0
         return sum(abs(len(code) - len(r)) * 0.1 + len(set(code) ^ set(r)) * 0.5 for r in refs) / len(refs)
 
-    def cell(self, program):
+    def cell(self, data):
         # MAP-Elites feature cell: (complexity, diversity), each min-max scaled to a bin index.
         coords = []
-        for feature, value in (("complexity", len(program.code)), ("diversity", self.diversity(program.code))):
+        for feature, value in (("complexity", len(data.code)), ("diversity", self.diversity(data.code))):
             rng = self.feature_range.setdefault(feature, [value, value])
             rng[0], rng[1] = min(rng[0], value), max(rng[1], value)
             scaled = 0.0 if rng[1] == rng[0] else (value - rng[0]) / (rng[1] - rng[0])
@@ -87,16 +87,16 @@ class Trainer(BaseTrainer):
     # --- parent / inspiration selection ---
 
     def sample_parent(self, island):
-        programs = list(self.islands[island].values())
-        if not programs:
+        data = list(self.islands[island].values())
+        if not data:
             return self.best  # empty island -> bootstrap from the global best
         r = random.random()
         if r < self.config.exploration_ratio:
-            return random.choice(programs)  # explore: uniform within the island
+            return random.choice(data)  # explore: uniform within the island
         if r < self.config.exploration_ratio + self.config.exploitation_ratio:
-            elites = sorted(self.all_programs(), key=lambda p: p.reward, reverse=True)[: self.config.archive_size]
+            elites = sorted(self.all_data(), key=lambda p: p.reward, reverse=True)[: self.config.archive_size]
             return random.choice([p for p in elites if p.island == island] or elites)  # exploit: an elite
-        return random.choices(programs, weights=[max(p.reward, 1e-3) for p in programs], k=1)[0]  # weighted
+        return random.choices(data, weights=[max(p.reward, 1e-3) for p in data], k=1)[0]  # weighted
 
     def sample_inspirations(self, parent, island):
         others = [p for p in self.islands[island].values() if p is not parent]
@@ -115,7 +115,7 @@ class Trainer(BaseTrainer):
             elites = sorted(grid.values(), key=lambda p: p.reward, reverse=True)
             for migrant in elites[: max(1, int(len(elites) * self.config.migration_rate))]:
                 if migrant.migrant:
-                    continue  # migrate each program at most once (avoids duplication blow-up)
+                    continue  # migrate each data at most once (avoids duplication blow-up)
                 for target in ((i + 1) % n, (i - 1) % n):
                     if not any(p.code == migrant.code for p in self.islands[target].values()):
                         self.add(replace(migrant, island=target, migrant=True), island=target)
@@ -124,14 +124,14 @@ class Trainer(BaseTrainer):
 
     @torch.no_grad()
     def generate(self, prompt):
-        # Block diffusion: denoise the whole gen_length canvas per block, argmax-commit it, grow the
-        # kv_cache, repeat until EOS or the token budget is exhausted (max_tokens // gen_length blocks).
+        # Block diffusion: denoise the whole canvas_length canvas per block, argmax-commit it, grow the
+        # kv_cache, repeat until EOS or the token budget is exhausted (max_tokens // canvas_length blocks).
         pipeline = self.pipeline
         prompt_tokens = pipeline.build_prompt_tokens(prompt, enable_thinking=self.config.sample.enable_thinking)
         kv_cache = pipeline.build_kv_cache(prompt_tokens)
 
         generated = []
-        for _ in range(self.config.sample.max_tokens // self.config.sample.gen_length):
+        for _ in range(self.config.sample.max_tokens // self.config.sample.canvas_length):
             xt_logits = None
             xt_tokens = pipeline.sample_init_tokens()[None]
             for timestep in self.timesteps:
@@ -159,14 +159,14 @@ class Trainer(BaseTrainer):
     def evolve_step(self, iteration):
         island = (iteration - 1) % self.config.num_islands
         parent = self.sample_parent(island)
-        programs = [(parent.code, parent.reward)] + self.sample_inspirations(parent, island)
-        prompt = self.task.build_prompt(programs)
+        data = [(parent.code, parent.reward)] + self.sample_inspirations(parent, island)
+        prompt = self.task.build_prompt(data)
 
         response = self.generate(prompt)
-        code = self.task.extract_program(response)
-        reward = self.task.evaluate_program(code)
+        code = self.task.extract_code(response)
+        reward = self.task.evaluate_code(code)
 
-        child = Program(code, reward, generation=parent.generation + 1, island=island)
+        child = Data(code, reward, generation=parent.generation + 1, island=island)
         self.add(child, island)
         if iteration % self.config.migration_interval == 0:
             self.migrate()

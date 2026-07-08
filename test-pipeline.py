@@ -22,7 +22,7 @@ max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range
 
 pipeline = DiffusionGemmaPipeline(
     MODEL_ID,
-    gen_length=256,
+    canvas_length=256,
     entropy_bound=0.1,
     t_min=0.4,
     t_max=0.8,

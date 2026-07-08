@@ -14,8 +14,8 @@ config_flags.DEFINE_config_file("config", "config/best-of-n.py", "Training confi
 
 class Trainer(BaseTrainer):
     """Best-of-N baseline (no search): each epoch draws N independent samples, evaluates each, logs
-    the batch reward, and tracks the best program so far. Every sample is prompted with the current
-    best program plus the initial seed -- so the pool ratchets toward the best found, but there is no
+    the batch reward, and tracks the best code so far. Every sample is prompted with the current
+    best code plus the initial seed -- so the pool ratchets toward the best found, but there is no
     archive, no islands, no guidance. The epoch / N-per-epoch loop mirrors flow-guide; block-diffusion
     generation mirrors open-evolve."""
 
@@ -31,21 +31,21 @@ class Trainer(BaseTrainer):
             num_inference_steps=self.config.sample.num_inference_steps, device=self.accelerator.device
         )
 
-        # Seed the best-so-far with the initial program (evaluated once, deterministic across ranks).
-        code0 = self.task.initial_program()
-        self.initial = (code0, self.task.evaluate_program(code0))  # (code, reward), fixed
+        # Seed the best-so-far with the initial code (evaluated once, deterministic across ranks).
+        init_code = self.task.initial_code()
+        self.initial = (init_code, self.task.evaluate_code(init_code))  # (code, reward), fixed
         self.best = self.initial                                   # (code, reward), updated per epoch
 
     @torch.no_grad()
     def generate(self, prompt):
-        # Block diffusion: denoise the whole gen_length canvas per block, argmax-commit it, grow the
-        # kv_cache, repeat until EOS or the token budget is exhausted (max_tokens // gen_length blocks).
+        # Block diffusion: denoise the whole canvas_length canvas per block, argmax-commit it, grow the
+        # kv_cache, repeat until EOS or the token budget is exhausted (max_tokens // canvas_length blocks).
         pipeline = self.pipeline
         prompt_tokens = pipeline.build_prompt_tokens(prompt, enable_thinking=self.config.sample.enable_thinking)
         kv_cache = pipeline.build_kv_cache(prompt_tokens)
 
         generated = []
-        for _ in range(self.config.sample.max_tokens // self.config.sample.gen_length):
+        for _ in range(self.config.sample.max_tokens // self.config.sample.canvas_length):
             xt_logits = None
             xt_tokens = pipeline.sample_init_tokens()[None]
             for timestep in self.timesteps:
@@ -77,8 +77,8 @@ class Trainer(BaseTrainer):
         rewards = []
         for _ in range(self.N_local):
             response = self.generate(prompt)
-            code = self.task.extract_program(response)
-            rewards.append(self.task.evaluate_program(code))
+            code = self.task.extract_code(response)
+            rewards.append(self.task.evaluate_code(code))
             codes.append(code)
 
         rewards = torch.tensor(rewards, device=self.accelerator.device, dtype=torch.float32)

@@ -64,9 +64,9 @@ class Trainer(BaseTrainer):
             "rewards": torch.empty(0, device=self.accelerator.device),
         }
 
-        # Seed the best-so-far with the initial program (evaluated once, deterministic across ranks).
-        code0 = self.task.initial_program()
-        self.initial = (code0, self.task.evaluate_program(code0))  # (code, reward), fixed
+        # Seed the best-so-far with the initial code (evaluated once, deterministic across ranks).
+        init_code = self.task.initial_code()
+        self.initial = (init_code, self.task.evaluate_code(init_code))  # (code, reward), fixed
         self.best = self.initial                                   # (code, reward), updated per epoch
 
     def init_extention(self):
@@ -107,7 +107,7 @@ class Trainer(BaseTrainer):
             original_forward: the layer's unmodified forward.
         """
         x = hidden_states
-        if external_self.guide_enabled and self.layer_idx in external_self.config.guidance_layers:
+        if external_self.guide_enabled and self.layer_idx in external_self.config.guidance_layers and external_self.best[1] > 0.9:
             x_normed = rms_norm(x)
             g = external_self.nw_grad(x_normed, self.layer_idx).to(device=x.device, dtype=x.dtype)  # (n, L, D)
             external_self.info[f"g-norm-{self.layer_idx}"].append(g.float().norm(dim=(-2, -1)))  # (n,)
@@ -126,14 +126,14 @@ class Trainer(BaseTrainer):
     def generate(self, prompt_tokens, timesteps):
         """Semi-autoregressive (block-diffusion) sampling of one completion.
 
-        Denoise one canvas of `gen_length` tokens at a time; after each finished block, append it
+        Denoise one canvas of `canvas_length` tokens at a time; after each finished block, append it
         to the encoder KV cache and start the next block conditioned on it. Stops when a block
         contains an EOS token or after `max_blocks` blocks.
 
         Returns:
             text: the decoded completion string.
             x1_hs: (G, L_n, D) reference hidden states over the whole completion
-                (L_n = num_blocks * gen_length), rms-normed, guidance layers only, on CPU.
+                (L_n = num_blocks * canvas_length), rms-normed, guidance layers only, on CPU.
         """
         pipeline = self.pipeline
         kv_cache = pipeline.build_kv_cache(prompt_tokens)  # fresh cache per sample; grown per block
@@ -178,15 +178,15 @@ class Trainer(BaseTrainer):
         prompt = self.task.build_prompt([self.best, self.initial])  # current best + the initial seed
         prompt_tokens = self.pipeline.build_prompt_tokens(prompt, enable_thinking=self.config.sample.enable_thinking)
 
-        x1_codes = []          # one extracted program per sample
+        x1_codes = []          # one extracted code per sample
         x1_hidden_states = []  # one (G, L_n, D) reference-hidden-state tensor per sample
         rewards = []
         for _ in range(self.N_local):  # one sequence at a time
             text, x1_hs = self.generate(prompt_tokens, timesteps)
-            code = self.task.extract_program(text)
+            code = self.task.extract_code(text)
             x1_codes.append(code)
             x1_hidden_states.append(x1_hs)
-            rewards.append(self.task.evaluate_program(code))
+            rewards.append(self.task.evaluate_code(code))
         rewards = torch.tensor(rewards, device=self.accelerator.device, dtype=torch.float32)
 
         gathered_x1_hidden_states = gather_object(x1_hidden_states)  # variable length, CPU tensors -> object gather

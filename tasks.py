@@ -11,11 +11,11 @@ import torch
 from datasets import load_dataset
 
 class CirclePacking:
-    """OpenEvolve circle-packing task (n=26): the model evolves a constructor program that places 26
-    circles in the unit square to maximize the sum of radii. Seed program and evaluator are reused
+    """OpenEvolve circle-packing task (n=26): the model evolves constructor code that places 26
+    circles in the unit square to maximize the sum of radii. Seed code and evaluator are reused
     from the cloned openevolve repo / pip package. This base holds everything shared by the rewrite
     and edit variants; subclasses supply only the task instruction (TASK_MESSAGE) and how a response
-    turns into the next program (extract_program)."""
+    turns into the next code (extract_code)."""
 
     EXAMPLE = Path(__file__).resolve().parent / "openevolve" / "examples" / "circle_packing"
 
@@ -39,13 +39,13 @@ class CirclePacking:
 
     TASK_MESSAGE = inspect.cleandoc("""
         # Task
-        Rewrite the program to maximize the sum of the 26 circle radii (higher score is better).
-        Provide the complete new program code.
+        Rewrite the code to maximize the sum of the 26 circle radii (higher score is better).
+        Provide the complete new code.
 
-        IMPORTANT: Make sure your rewritten program maintains the same inputs and outputs as the original program, but with improved internal implementation.
-                                    
+        IMPORTANT: Make sure your rewritten code maintains the same inputs and outputs as the original code, but with improved internal implementation.
+
         ```python
-        # Your rewritten program here
+        # Your rewritten code here
         ```
     """)
 
@@ -59,32 +59,32 @@ class CirclePacking:
 
     @staticmethod
     @lru_cache(maxsize=1)
-    def initial_program() -> str:
+    def initial_code() -> str:
         code = (CirclePacking.EXAMPLE / "initial_program.py").read_text(encoding="utf-8")
         return code
 
-    def build_prompt(self, programs: list = None) -> str:
-        """Prompt from a list of (code, reward): programs[0] is the current program, the rest are
-        prior programs for reference. Renders only the reward score (never other metric floats), so
+    def build_prompt(self, data: list = None) -> str:
+        """Prompt from a list of (code, reward): data[0] is the current code, the rest are
+        prior codes for reference. Renders only the reward score (never other metric floats), so
         the prompt is a deterministic function of the archive."""
-        
-        if programs is None:
-            programs = [(self.initial_program(), 0.36423689449571406)]
+
+        if data is None:
+            data = [(self.initial_code(), 0.36423689449571406)]
 
         sections = [self.SYSTEM_MESSAGE]
-        for idx, (code, reward) in enumerate(programs):
-            header = "Current program" if idx == 0 else f"Prior program [{idx}]"
+        for idx, (code, reward) in enumerate(data):
+            header = "Current code" if idx == 0 else f"Prior code [{idx}]"
             sections.append(f"# {header} (score={reward:.4f})\n```python\n{code}\n```")
         sections.append(self.TASK_MESSAGE)
         return "\n\n".join(sections)
 
     @staticmethod
-    def extract_program(response: str) -> str:
+    def extract_code(response: str) -> str:
         from openevolve.utils.code_utils import parse_full_rewrite
         return parse_full_rewrite(response, "python")
 
-    def evaluate_program(self, code: str) -> float:
-        """Reward the program via the openevolve example evaluator (runs it in a subprocess with a
+    def evaluate_code(self, code: str) -> float:
+        """Reward the code via the openevolve example evaluator (runs it in a subprocess with a
         timeout and validates the packing); the combined score is sum_radii / 2.635 when valid."""
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
             f.write(code)

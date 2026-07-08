@@ -43,7 +43,7 @@ class BaseTrainer:
         
         self.pipeline = DiffusionGemmaPipeline(
             self.config.model,
-            gen_length=self.config.sample.gen_length,
+            canvas_length=self.config.sample.canvas_length,
             entropy_bound=self.config.sample.entropy_bound,
             t_min=self.config.sample.t_min,
             t_max=self.config.sample.t_max,
