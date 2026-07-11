@@ -44,7 +44,7 @@ class DiffusionGemmaScheduler:
 
 
 class DiffusionGemmaPipeline:
-    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, canvas_length, device, device_map=None, max_memory=None):
+    def __init__(self, model_name, entropy_bound=0.1, confidence_threshold=0.005, enable_early_stop=False, t_min=0.4, t_max=0.8, dtype=torch.bfloat16, *, canvas_length, device, device_map=None, max_memory=None):
         self.processor = AutoProcessor.from_pretrained(model_name)
 
         # pin the decoder canvas length to canvas_length (else it stays at the model default 256)
@@ -66,9 +66,10 @@ class DiffusionGemmaPipeline:
 
         self.entropy_bound = entropy_bound
         self.confidence_threshold = confidence_threshold
+        self.enable_early_stop = enable_early_stop
         self.scheduler = DiffusionGemmaScheduler(t_min=t_min, t_max=t_max)
 
-        self.eos_token_id = torch.tensor(self.model.generation_config.eos_token_id, device=self.device)
+        self.eos_token_ids = torch.tensor(self.model.generation_config.eos_token_id, device=self.device)
 
     def sample_logits_to_tokens(self, xt_logits):
         """Entropy-bound sample of the next renoised canvas from logits.
@@ -104,13 +105,16 @@ class DiffusionGemmaPipeline:
         return torch.randint(self.vocab_size, (self.canvas_length,), device=self.device)  # (L,)
 
     @torch.no_grad()
-    def build_prompt_tokens(self, prompt, enable_thinking=False):
-        """Tokenize `prompt` into a batch-1 (1, P) input_ids tensor via the chat template."""
-        input_ids = self.processor.apply_chat_template([{"role": "user", "content": prompt}],tokenize=True,add_generation_prompt=True,return_dict=True,return_tensors="pt",enable_thinking=enable_thinking,)["input_ids"].to(self.device)  # (1, P)
+    def build_prompt_tokens(self, user_prompt, system_prompt="You are a helpful assistant.", enable_thinking=False):
+        """Tokenize `user_prompt` into a batch-1 (1, P) input_ids tensor via the chat template,
+        prepending `system_prompt` as a system turn (pass a falsy `system_prompt` to omit it)."""
+        messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
+        messages.append({"role": "user", "content": user_prompt})
+        input_ids = self.processor.apply_chat_template(messages,tokenize=True,add_generation_prompt=True,return_dict=True,return_tensors="pt",enable_thinking=enable_thinking,)["input_ids"].to(self.device)  # (1, P)
         return input_ids
 
     @torch.no_grad()
-    def build_kv_cache(self, tokens, past_key_values=None):
+    def build_kv_cache(self, tokens=None, past_key_values=None, position_ids=None, inputs_embeds=None):
         """Encode `tokens` (1, T) into the encoder KV cache; returns the cache.
 
         With `past_key_values=None`, prefill a fresh cache from the prompt. Otherwise append
@@ -119,8 +123,15 @@ class DiffusionGemmaPipeline:
         tokens in the next T slots (`arange(T) + past_key_values.get_seq_length()`). Only the
         encoder ever writes the cache -- the decoder reads it -- so this is how the official
         `generate` grows the cache one canvas per block.
+
+        Pass `position_ids` (1, T) to place the tokens at explicit (possibly non-contiguous)
+        positions -- their RoPE is baked into the cached keys at those positions.
+
+        Pass `inputs_embeds` (1, T, D) instead of `tokens` to feed pre-computed embeddings
+        directly (the encoder wants exactly one of the two). These must be the *scaled*
+        embeddings, i.e. `self.model.model.encoder.get_input_embeddings()(tokens)`.
         """
-        out = self.model.model.encoder(input_ids=tokens, past_key_values=past_key_values)
+        out = self.model.model.encoder(input_ids=tokens, inputs_embeds=inputs_embeds, past_key_values=past_key_values, position_ids=position_ids)
         return out.past_key_values
 
     def early_stop(self, xt_logits, xt_logits_next):
@@ -135,9 +146,10 @@ class DiffusionGemmaPipeline:
             xt_logits: (L, V) previous step's temperature-processed logits, or None on step 0.
             xt_logits_next: (L, V) current step's temperature-processed logits.
         Returns:
-            finished: (L,) bool mask; the caller checks `.all()` to stop the diffusion.
+            finished: (L,) bool mask; the caller checks `.all()` to stop the diffusion. All-False
+                when `self.enable_early_stop` is off (default), so the diffusion runs every timestep.
         """
-        if xt_logits is None:
+        if not self.enable_early_stop or xt_logits is None:
             return torch.zeros(xt_logits_next.shape[0], device=xt_logits_next.device, dtype=torch.bool)  # (L,)
 
         stable = torch.argmax(xt_logits, dim=-1) == torch.argmax(xt_logits_next, dim=-1)  # (L,)

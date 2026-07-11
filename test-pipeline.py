@@ -32,34 +32,27 @@ pipeline = DiffusionGemmaPipeline(
 )
 pipeline.model.eval()
 
-start_time = time.perf_counter()
-
-for _ in range(5):
-
-    timesteps = pipeline.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=acc.device)
-    prompt_tokens = pipeline.build_prompt_tokens(PROMPT, enable_thinking=True)
-    kv_cache = pipeline.build_kv_cache(prompt_tokens)
-    generated = []
-    for block in range(MAX_BLOCKS):
-        xt_logits = None
-        xt_tokens = pipeline.sample_init_tokens()[None]
-        for timestep in timesteps:
-            xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
-            xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
-            if finished[-1]:
-                break
-
-        canvas = pipeline.argmax_logits_to_tokens(xt_logits)
-        generated.append(canvas)
-        if torch.isin(canvas, pipeline.eos_token_id).any():
+timesteps = pipeline.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=acc.device)
+prompt_tokens = pipeline.build_prompt_tokens(PROMPT, enable_thinking=True)
+kv_cache = pipeline.build_kv_cache(prompt_tokens)
+generated = []
+for block in range(MAX_BLOCKS):
+    xt_logits = None
+    xt_tokens = pipeline.sample_init_tokens()[None]
+    for timestep in timesteps:
+        xt_logits, finished = pipeline.model_predict(xt_tokens, xt_logits, timestep, kv_cache)
+        xt_tokens = pipeline.sample_logits_to_tokens(xt_logits)[None]
+        if finished[-1]:
             break
-        kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)
 
-    gen_tokens = pipeline.strip_thinking_tokens(torch.cat(generated))
-    text = pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
-    print(f"[{acc.process_index}]: {text}")
+    canvas = pipeline.argmax_logits_to_tokens(xt_logits)
+    generated.append(canvas)
+    kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)
+    if torch.isin(canvas, pipeline.eos_token_ids).any():
+        break
 
-execution_time = time.perf_counter() - start_time
-print(f"The line took {execution_time:.6f} seconds to execute.")
+gen_tokens = pipeline.strip_thinking_tokens(torch.cat(generated))
+text = pipeline.processor.decode(gen_tokens, skip_special_tokens=True)
 
-print(pipeline.model.hf_device_map)
+if acc.is_main_process:
+    print(text)

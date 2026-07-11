@@ -39,15 +39,17 @@ class CirclePacking:
 
     TASK_MESSAGE = inspect.cleandoc("""
         # Task
-        Rewrite the code to maximize the sum of the 26 circle radii (higher score is better).
-        Provide the complete new code.
-
-        IMPORTANT: Make sure your rewritten code maintains the same inputs and outputs as the original code, but with improved internal implementation.
+        Rewrite the following code to maximize the sum of the 26 circle radii (higher score is better).
 
         ```python
-        # Your rewritten code here
+        {ref_code}
         ```
+                                    
+        Rewrite the whole code, includes the main. Make sure your rewritten code maintains the same inputs and outputs as the original code, but with improved internal implementation, wraps in the python code block.
     """)
+
+    def __init__(self):
+        self.ref_code = self.initial_code()  # reference code to rewrite; ratcheted by the caller
 
     @staticmethod
     @lru_cache(maxsize=1)
@@ -63,20 +65,10 @@ class CirclePacking:
         code = (CirclePacking.EXAMPLE / "initial_program.py").read_text(encoding="utf-8")
         return code
 
-    def build_prompt(self, data: list = None) -> str:
-        """Prompt from a list of (code, reward): data[0] is the current code, the rest are
-        prior codes for reference. Renders only the reward score (never other metric floats), so
-        the prompt is a deterministic function of the archive."""
-
-        if data is None:
-            data = [(self.initial_code(), 0.36423689449571406)]
-
-        sections = [self.SYSTEM_MESSAGE]
-        for idx, (code, reward) in enumerate(data):
-            header = "Current code" if idx == 0 else f"Prior code [{idx}]"
-            sections.append(f"# {header} (score={reward:.4f})\n```python\n{code}\n```")
-        sections.append(self.TASK_MESSAGE)
-        return "\n\n".join(sections)
+    def prompt(self) -> tuple[str, str]:
+        """Return (system message, task message). The task message embeds the current ref_code as
+        the code to rewrite."""
+        return self.SYSTEM_MESSAGE, self.TASK_MESSAGE.format(ref_code=self.ref_code)
 
     @staticmethod
     def extract_code(response: str) -> str:
@@ -96,9 +88,36 @@ class CirclePacking:
         return float(metrics.get("combined_score", 0.0))
 
 
+class Dog:
+    """Quick smoke-test task: prompt the model to "tell a story" and reward the number of times the
+    word "dog" appears in the response. No reference code (ref_code is None) and extract_code is the
+    identity, so the raw generated text flows straight into evaluate_code."""
+
+    SYSTEM_MESSAGE = "You are a helpful assistant."
+    TASK_MESSAGE = "tell a story"
+
+    def __init__(self):
+        self.ref_code = None  # no reference code; kept for interface compatibility
+
+    @staticmethod
+    def initial_code() -> str:
+        return ""  # empty seed -> evaluate_code("") == 0.0
+
+    def prompt(self) -> tuple[str, str]:
+        return self.SYSTEM_MESSAGE, self.TASK_MESSAGE
+
+    @staticmethod
+    def extract_code(response: str) -> str:
+        return response  # identity: reward the raw generated text
+
+    def evaluate_code(self, code: str) -> float:
+        return float(code.count("dog"))
+
+
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 TASKS_CLS = {
     "circle-packing": CirclePacking,
+    "dog": Dog,
 }
 
 def get_reward_fn(key: str):

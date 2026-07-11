@@ -40,11 +40,11 @@ class Trainer(BaseTrainer):
         self.token_records = []  # accumulated {epoch, idx, token_ids (long), reward (float)}, saved each epoch
 
     @torch.no_grad()
-    def generate(self, prompt):
+    def generate(self, system_prompt, user_prompt):
         # Block diffusion: denoise the whole canvas_length canvas per block, argmax-commit it, grow the
         # kv_cache, repeat until EOS or the token budget is exhausted (max_tokens // canvas_length blocks).
         pipeline = self.pipeline
-        prompt_tokens = pipeline.build_prompt_tokens(prompt, enable_thinking=self.config.sample.enable_thinking)
+        prompt_tokens = pipeline.build_prompt_tokens(user_prompt, system_prompt=system_prompt, enable_thinking=self.config.sample.enable_thinking)
         kv_cache = pipeline.build_kv_cache(prompt_tokens)
 
         generated = []
@@ -58,7 +58,7 @@ class Trainer(BaseTrainer):
                     break
             canvas = pipeline.argmax_logits_to_tokens(xt_logits)
             generated.append(canvas)
-            if torch.isin(canvas, pipeline.eos_token_id).any():
+            if torch.isin(canvas, pipeline.eos_token_ids).any():
                 break
             kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)
 
@@ -74,13 +74,14 @@ class Trainer(BaseTrainer):
 
     @torch.no_grad()
     def sampling_step(self, epoch):
-        prompt = self.task.build_prompt([self.best, self.initial])  # current best + the initial seed
+        self.task.ref_code = self.best[0]              # ratchet reference to best code so far
+        system_prompt, user_prompt = self.task.prompt()
 
         codes = []
         rewards = []
         token_ids = []
         for _ in range(self.N_local):
-            response, gen_tokens = self.generate(prompt)
+            response, gen_tokens = self.generate(system_prompt, user_prompt)
             code = self.task.extract_code(response)
             rewards.append(self.task.evaluate_code(code))
             codes.append(code)

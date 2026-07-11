@@ -165,7 +165,7 @@ class DiffusionGemmaBlock(DiffusionGemmaEvalHarness):
 
             canvas = pipeline.argmax_logits_to_tokens(xt_logits)
             generated.append(canvas)
-            if torch.isin(canvas, pipeline.eos_token_id).any():
+            if torch.isin(canvas, pipeline.eos_token_ids).any():
                 break
             kv_cache = pipeline.build_kv_cache(canvas[None], kv_cache)
 
@@ -209,7 +209,7 @@ class DiffusionGemmaSliding(DiffusionGemmaEvalHarness):
                 commit = pipeline.argmax_logits_to_tokens(xt_logits[:k])  # (k,) clean tokens
                 committed.append(commit)
                 n_committed += k
-                if torch.isin(commit, pipeline.eos_token_id).any():
+                if torch.isin(commit, pipeline.eos_token_ids).any():
                     break                                    # EOS reached: stop before caching this commit
                 kv_cache = pipeline.build_kv_cache(commit[None], kv_cache)  # grow cache by k -> decoder positions auto-slide
 
