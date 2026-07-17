@@ -33,7 +33,7 @@ class Trainer(BaseTrainer):
     def generate(self, system_prompt, user_prompt):
         # Greedy AR decode of the whole response in one model.generate call.
         prompt_tokens = self.build_prompt_tokens(user_prompt, system_prompt=system_prompt, enable_thinking=self.config.sample.enable_thinking)
-        out = self.model.generate(prompt_tokens, max_new_tokens=self.config.sample.max_new_tokens, do_sample=False)
+        out = self.model.generate(prompt_tokens, max_new_tokens=self.config.sample.max_new_tokens, do_sample=True)
         gen_tokens = out[0, prompt_tokens.shape[1]:]  # strip the echoed prompt
         return self.tokenizer.decode(gen_tokens, skip_special_tokens=True), gen_tokens
 
