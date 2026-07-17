@@ -1,10 +1,11 @@
+import math
 import os
 import sys
 import torch
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from pipeline import DiffusionGemmaPipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import tasks
 
 
@@ -22,6 +23,7 @@ class BaseTrainer:
                 log_mode="INCREMENTAL",
             ),
         }
+        self.best_reward = {}  # stage -> best reward logged so far, maintained by log_rewards
 
     def setup_accelerator(self):
         self.accelerator = Accelerator(log_with="wandb")
@@ -37,21 +39,21 @@ class BaseTrainer:
         self.task = tasks.get_reward_fn(self.config.task)
 
     def setup_model(self):
-        # Shard this process's full model across its GPU stride (see test-gemma.py); each rank
+        # Shard this process's full model across its GPU stride (see test-qwen-noise.py); each rank
         # keeps a disjoint set of GPUs, one full model replica per data-parallel process.
         max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(self.accelerator.process_index, torch.cuda.device_count(), self.accelerator.num_processes)}
-        
-        self.pipeline = DiffusionGemmaPipeline(
-            self.config.model,
-            canvas_length=self.config.sample.canvas_length,
-            entropy_bound=self.config.sample.entropy_bound,
-            t_min=self.config.sample.t_min,
-            t_max=self.config.sample.t_max,
-            device=self.accelerator.device,
-            device_map="auto",
-            max_memory=max_memory,
-        )
-        self.pipeline.model.requires_grad_(False)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model)
+        self.model = AutoModelForCausalLM.from_pretrained(self.config.model, torch_dtype="auto", device_map="auto", max_memory=max_memory)
+        self.model.requires_grad_(False)
+        self.model.eval()
+
+    @torch.no_grad()
+    def build_prompt_tokens(self, user_prompt, system_prompt="You are a helpful assistant.", enable_thinking=True):
+        """Tokenize `user_prompt` into a batch-1 (1, P) input_ids tensor via the chat template,
+        prepending `system_prompt` as a system turn (pass a falsy `system_prompt` to omit it)."""
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        return self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt", enable_thinking=enable_thinking).to(self.model.device).input_ids  # (1, P)
 
     def log_code(self):
         if not self.accelerator.is_main_process:
@@ -69,10 +71,13 @@ class BaseTrainer:
         self.accelerator.get_tracker("wandb").run.log_code(".", include_fn=lambda path: path in imported_py_files)
 
     def log_rewards(self, objective_evaluations, rewards, stage, extra={}):
+        # `rewards` is already gathered across ranks, so best-so-far ratchets identically everywhere.
+        self.best_reward[stage] = max(self.best_reward.get(stage, -math.inf), rewards.max().item())
         log_dict = {
             "objective-evaluations": objective_evaluations,
             f"{stage}/rewards": rewards.mean().item(),
             f"{stage}/rewards-best": rewards.max().item(),
+            f"{stage}/best-so-far": self.best_reward[stage],
             **extra,
         }
         self.accelerator.log(log_dict)

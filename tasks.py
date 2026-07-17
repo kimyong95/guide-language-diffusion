@@ -2,20 +2,21 @@ import inspect
 import importlib.util
 import io
 import contextlib
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
 import re
 import tempfile
 import torch
+from accelerate.utils import gather_object
 from datasets import load_dataset
 
 class CirclePacking:
     """OpenEvolve circle-packing task (n=26): the model evolves constructor code that places 26
     circles in the unit square to maximize the sum of radii. Seed code and evaluator are reused
-    from the cloned openevolve repo / pip package. This base holds everything shared by the rewrite
-    and edit variants; subclasses supply only the task instruction (TASK_MESSAGE) and how a response
-    turns into the next code (extract_code)."""
+    from the cloned openevolve repo / pip package. Every prompt asks the model to rewrite the best
+    code found so far, which evaluate ratchets."""
 
     EXAMPLE = Path(__file__).resolve().parent / "openevolve" / "examples" / "circle_packing"
 
@@ -44,12 +45,16 @@ class CirclePacking:
         ```python
         {ref_code}
         ```
-                                    
+
         Rewrite the whole code, includes the main. Make sure your rewritten code maintains the same inputs and outputs as the original code, but with improved internal implementation, wraps in the python code block.
     """)
 
     def __init__(self):
-        self.ref_code = self.initial_code()  # reference code to rewrite; ratcheted by the caller
+        # Best code so far -- what every prompt asks the model to rewrite. Seeded with the openevolve
+        # initial program, scored through evaluate like any response: raw code carries no ``` fence,
+        # so the extraction below passes it straight to the evaluator.
+        self.ref_code, self.best_reward = self.initial_code(), -math.inf
+        self.evaluate(self.ref_code)
 
     @staticmethod
     @lru_cache(maxsize=1)
@@ -66,18 +71,17 @@ class CirclePacking:
         return code
 
     def prompt(self) -> tuple[str, str]:
-        """Return (system message, task message). The task message embeds the current ref_code as
-        the code to rewrite."""
+        """Return (system message, task message). The task message embeds the best code so far as the
+        code to rewrite."""
         return self.SYSTEM_MESSAGE, self.TASK_MESSAGE.format(ref_code=self.ref_code)
 
-    @staticmethod
-    def extract_code(response: str) -> str:
+    def evaluate(self, response: str) -> float:
+        """Reward `response`: pull the rewritten code out of it and score that code with the openevolve
+        example evaluator (runs it in a subprocess with a timeout and validates the packing; the
+        combined score is sum_radii / 2.635 when valid). Also ratchets the best code so far."""
         from openevolve.utils.code_utils import parse_full_rewrite
-        return parse_full_rewrite(response, "python")
+        code = parse_full_rewrite(response, "python")
 
-    def evaluate_code(self, code: str) -> float:
-        """Reward the code via the openevolve example evaluator (runs it in a subprocess with a
-        timeout and validates the packing); the combined score is sum_radii / 2.635 when valid."""
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
             f.write(code)
             path = f.name
@@ -85,39 +89,38 @@ class CirclePacking:
             metrics = self.example_evaluator().evaluate(path)
         finally:
             os.unlink(path)
-        return float(metrics.get("combined_score", 0.0))
+        reward = float(metrics.get("combined_score", 0.0))
+
+        self.update_best(code, reward)
+        return reward
+
+    def update_best(self, code: str, reward: float) -> None:
+        """Ratchet ref_code / best_reward against every process's newest (code, reward). Each rank
+        calls evaluate the same number of times per epoch, so this gather is balanced; ranks scan the
+        gathered pairs in the same order, so they all settle on the same best."""
+        for gathered_code, gathered_reward in gather_object([(code, reward)]):
+            if gathered_reward > self.best_reward:
+                self.ref_code, self.best_reward = gathered_code, gathered_reward
 
 
-class Dog:
-    """Quick smoke-test task: prompt the model to "tell a story" and reward the number of times the
-    word "dog" appears in the response. No reference code (ref_code is None) and extract_code is the
-    identity, so the raw generated text flows straight into evaluate_code."""
+class Long:
+    """Quick smoke-test task: prompt the model to "tell a story" and reward the response length (number
+    of characters). Nothing to extract or ratchet -- evaluate scores the raw generated text."""
 
     SYSTEM_MESSAGE = "You are a helpful assistant."
     TASK_MESSAGE = "tell a story"
 
-    def __init__(self):
-        self.ref_code = None  # no reference code; kept for interface compatibility
-
-    @staticmethod
-    def initial_code() -> str:
-        return ""  # empty seed -> evaluate_code("") == 0.0
-
     def prompt(self) -> tuple[str, str]:
         return self.SYSTEM_MESSAGE, self.TASK_MESSAGE
 
-    @staticmethod
-    def extract_code(response: str) -> str:
-        return response  # identity: reward the raw generated text
-
-    def evaluate_code(self, code: str) -> float:
-        return float(code.count("dog"))
+    def evaluate(self, response: str) -> float:
+        return float(len(response))
 
 
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 TASKS_CLS = {
     "circle-packing": CirclePacking,
-    "dog": Dog,
+    "long": Long,
 }
 
 def get_reward_fn(key: str):
