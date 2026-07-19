@@ -45,6 +45,7 @@ class Trainer(BaseTrainer, LoraMixin):
         self.train_dataset = DistributedSubsampleDataset(
             all_data=self.task.data,
             B=config.sample.total_samples,
+            G=self.accelerator.num_processes,
             m=config.sample.m,
             b_max=config.sample.max_batch_size_per_device,
             base_seed=config.seed,
@@ -84,13 +85,11 @@ class Trainer(BaseTrainer, LoraMixin):
         self.train_dataset.subsample(epoch)
         training_data = []      # one dict per b-sized batch; merged with concat() below
         for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
-            items = self.train_dataset.indices_to_data(data_ids)
-
             # apply_chat_template tokenizes AND left-pads the whole batch in one call, so every prompt
             # shares a single prompt_length P (their right edges align).
             prompt_texts = [
-                [{"role": "system", "content": s}, {"role": "user", "content": u}]
-                for s, u in (self.task.prompt(item) for item in items)
+                [{"role": "system", "content": self.task.SYSTEM_PROMPT}, {"role": "user", "content": self.task.prompt(int(data_id))}]
+                for data_id in data_ids
             ]
             prompt_tokens_data = self.tokenizer.apply_chat_template(
                 prompt_texts, tokenize=True, padding=True, add_generation_prompt=True,
@@ -103,6 +102,7 @@ class Trainer(BaseTrainer, LoraMixin):
                 prompt_tokens,
                 attention_mask=prompt_attention,
                 do_sample=True,
+                temperature=cfg.temperature,
                 max_new_tokens=cfg.max_new_tokens,
                 use_cache=True,
                 pad_token_id=self.tokenizer.pad_token_id,
@@ -127,14 +127,17 @@ class Trainer(BaseTrainer, LoraMixin):
         training_data = {key: concat([batch[key] for batch in training_data]) for key in training_data[0]}
 
         # Advantages on the gathered global batch, then scattered back to this rank's rollouts.
-        gathered_data_ids = self.accelerator.gather(training_data["data_ids"])
+        gathered_data_ids = self.accelerator.gather(training_data["data_ids"]).tolist()
         gathered_rewards = self.accelerator.gather(training_data["rewards"])
         gathered_texts = gather_object(training_data["generated_texts"])
-        gathered_advantages = self.compute_advantages(gathered_data_ids.tolist(), gathered_rewards)
+        gathered_advantages = self.compute_advantages(gathered_data_ids, gathered_rewards)
         training_data["advantages"] = einops.rearrange(gathered_advantages, "(process batch) -> process batch", process=self.accelerator.num_processes)[self.accelerator.process_index]
 
+        # Average std within each group, near 0 means no learning signal
+        group_reward_std = torch.stack([gathered_rewards[[i for i, x in enumerate(gathered_data_ids) if x == data_id]].std() for data_id in set(gathered_data_ids)]).mean()
+
         objective_evaluations = epoch * self.config.sample.total_samples
-        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling")
+        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/reward-group-std": group_reward_std.item()})
         self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_texts, stage="sampling")
 
         return training_data

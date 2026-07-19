@@ -21,7 +21,7 @@ class DistributedSubsampleDataset(Dataset):
     item list directly so the task can own the data (e.g. GSM8K (Q, A) dicts).
     """
 
-    def __init__(self, all_data, B, m, b_max, base_seed=0):
+    def __init__(self, all_data, B, G, m, b_max, base_seed=0):
         # N      : total number of items
         # B      : total samples per epoch (across all GPUs)
         # m      : number of unique items sampled per epoch    (m == -1 → m = B; capped at N)
@@ -37,7 +37,7 @@ class DistributedSubsampleDataset(Dataset):
         self.base_seed = base_seed
         self.B = B if B != -1 else self.N
         self.m = min(m if m != -1 else self.B, self.N)  # can't sample more unique items than exist
-        self.G = torch.cuda.device_count()
+        self.G = G
         self.k = self.B // self.m
         self.B_i = self.B // self.G
         self.b = min(b_max, self.B_i)

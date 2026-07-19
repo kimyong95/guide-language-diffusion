@@ -11,6 +11,7 @@ import tempfile
 import torch
 from accelerate.utils import gather_object
 from datasets import load_dataset
+from math_verify import parse, verify, ExprExtractionConfig
 
 class CirclePacking:
     """OpenEvolve circle-packing task (n=26): the model evolves constructor code that places 26
@@ -20,7 +21,7 @@ class CirclePacking:
 
     EXAMPLE = Path(__file__).resolve().parent / "openevolve" / "examples" / "circle_packing"
 
-    SYSTEM_MESSAGE = inspect.cleandoc("""
+    SYSTEM_PROMPT = inspect.cleandoc("""
         You are an expert mathematician specializing in circle packing problems and computational
         geometry. Your task is to improve a constructor function that directly produces a specific
         arrangement of 26 circles in a unit square, maximizing the sum of their radii. The AlphaEvolve
@@ -38,7 +39,7 @@ class CirclePacking:
         rather than an iterative search algorithm.
     """)
 
-    TASK_MESSAGE = inspect.cleandoc("""
+    TASK_PROMPT = inspect.cleandoc("""
         # Task
         Rewrite the following code to maximize the sum of the 26 circle radii (higher score is better).
 
@@ -71,10 +72,10 @@ class CirclePacking:
         code = (CirclePacking.EXAMPLE / "initial_program.py").read_text(encoding="utf-8")
         return code
 
-    def prompt(self, _) -> tuple[str, str]:
-        """Return (system message, task message). The task message embeds the best code so far as the
-        code to rewrite."""
-        return self.SYSTEM_MESSAGE, self.TASK_MESSAGE.format(ref_code=self.ref_code)
+    def prompt(self, _) -> str:
+        """Return the task prompt: embeds the best code so far as the code to rewrite (the system prompt
+        is read separately from SYSTEM_PROMPT)."""
+        return self.TASK_PROMPT.format(ref_code=self.ref_code)
 
     def evaluate(self, _, response: str) -> float:
         """Reward `response`: pull the rewritten code out of it and score that code with the openevolve
@@ -108,61 +109,47 @@ class Short:
     """Quick smoke-test task: prompt the model to "tell a story" and reward the response length (number
     of characters). Nothing to extract or ratchet -- evaluate scores the raw generated text."""
 
-    SYSTEM_MESSAGE = "You are a helpful assistant."
+    SYSTEM_PROMPT = "You are a helpful assistant."
     data = ["tell a story"]  # one fixed prompt -> a single item; GRPO must run with m=1 (one group)
 
-    def prompt(self, item) -> tuple[str, str]:
-        return self.SYSTEM_MESSAGE, item
+    def prompt(self, data_id) -> str:
+        return self.data[data_id]
 
     def evaluate(self, _, response: str) -> float:
         return 1-float(len(response))
 
 
 class GSM8K:
-    """GSM8K math-reasoning task for GRPO (simple_GRPO's grpo_vllm_one.py). Unlike the single-prompt tasks
-    above, this one owns a dataset of (Q, A) items: the trainer draws grouped prompts from `self.data`,
-    and both prompt building and reward are keyed by data id. `evaluate(data_id, response)` scores a
-    completion against that item's ground-truth answer -- correctness (+1/-1) plus format (+1/-1)."""
+    """GSM-Hard math-reasoning task for GRPO (kept under the GSM8K name / "gsm8k" key). A dataset of
+    (Q, A) items with numeric answers -- the hard-numbers variant of GSM8K. The trainer draws grouped
+    prompts from `self.data`, keyed by data id; `evaluate(data_id, response)` pulls the number inside the
+    response's <answer> </answer> tags and scores +1/-1 by numeric match against the ground truth."""
 
-    SYSTEM_MESSAGE = inspect.cleandoc("""
-        You are a helpful assistant. A conversation between User and Assistant. The user asks a question,
-        and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind
-        and then provides the user with the answer. The reasoning process and answer are enclosed within
-        <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here
-        </think><answer> answer here </answer>.
+    
+
+    SYSTEM_PROMPT = inspect.cleandoc("""
+        You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
     """)
 
     def __init__(self):
-        # Ground-truth answer is the text after the "####" marker in the GSM8K answer field.
-        dataset = load_dataset("openai/gsm8k", "main", split="train")
-        self.data = [{"Q": q, "A": a.split("####")[-1].strip()} for q, a in zip(dataset["question"], dataset["answer"])]
+        # GSM-Hard: `input` is the question, `target` is the numeric ground-truth answer (a float).
+        dataset = load_dataset("reasoning-machines/gsm-hard", split="train")
+        self.data = [{"Q": q, "A": str(t)} for q, t in zip(dataset["input"], dataset["target"])]
 
-    def prompt(self, item) -> tuple[str, str]:
-        """Return (system message, user message) for a single (Q, A) item; the raw question is the user
-        turn, exactly as in simple_GRPO."""
-        return self.SYSTEM_MESSAGE, item["Q"]
+    def prompt(self, data_id) -> str:
+        """Return the user question for the (Q, A) item at data_id (the system prompt is read separately
+        from SYSTEM_PROMPT)."""
+        return self.data[data_id]["Q"]
 
     def evaluate(self, data_id, response: str) -> float:
-        item = self.data[data_id]
-        return self.reward_correct(item, response) + self.reward_format(item, response)
-
-    @staticmethod
-    def reward_correct(item, answer):
-        from math_verify import parse, verify, ExprExtractionConfig
-        pattern = r'\d+\.\d+|\d+/\d+|\d+'
-        nums = re.findall(pattern, answer)
+        # Score the number inside the <answer> </answer> tags against the ground truth.
+        match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+        if match is None: return -1.0
+        nums = re.findall(r'\d+\.\d+|\d+/\d+|\d+', match.group(1))
         if len(nums) == 0: return -1.0
-        lastnum = nums[-1]
-        ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
-        ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
-        return 1 if verify(ans, ground_truth) else -1
-
-    @staticmethod
-    def reward_format(item, answer):
-        pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"
-        think_count = answer.count("<think>") + answer.count("</think>")
-        answer_count = answer.count("<answer>") + answer.count("</answer>")
-        return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count==2 and answer_count==2 else -1
+        answer = parse(nums[-1], extraction_config=[ExprExtractionConfig()])
+        ground_truth = parse(self.data[data_id]["A"], extraction_config=[ExprExtractionConfig()])
+        return 1 if verify(answer, ground_truth) else -1
 
 
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git

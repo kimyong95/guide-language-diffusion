@@ -6,9 +6,9 @@ def get_config():
     config.seed = 0
     config.run_name = "grpo"
 
-    config.max_epochs = 100
+    config.max_epochs = 1000
 
-    config.model = "Qwen/Qwen3-14B"
+    config.model = "Qwen/Qwen3-8B"
     config.task = "gsm8k"
 
     # total objective evaluations: 1000*40=40000 (max_epochs * sample.total_samples)
@@ -18,6 +18,7 @@ def get_config():
     config.sample.max_batch_size_per_device = 16
     config.sample.max_new_tokens = 4096
     config.sample.enable_thinking = False
+    config.sample.temperature = 1.0
 
     config.train = ml_collections.ConfigDict()
     config.train.learning_rate = 1e-5
