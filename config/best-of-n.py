@@ -1,6 +1,6 @@
 import ml_collections
 
-def base():
+def get_config():
     config = ml_collections.ConfigDict()
 
     config.seed = 0
@@ -15,9 +15,6 @@ def base():
     config.sample = ml_collections.ConfigDict()
     config.sample.total_samples = 8
     config.sample.max_new_tokens = 8192
-    config.sample.enable_thinking = True
+    config.sample.enable_thinking = False
 
     return config
-
-def get_config(name):
-    return globals()[name]()

@@ -54,7 +54,8 @@ class CirclePacking:
         # initial program, scored through evaluate like any response: raw code carries no ``` fence,
         # so the extraction below passes it straight to the evaluator.
         self.ref_code, self.best_reward = self.initial_code(), -math.inf
-        self.evaluate(self.ref_code)
+        self.data = [None]  # one dynamic prompt (rewrite the ratcheted best code); the item is unused
+        self.evaluate(None, self.ref_code)
 
     @staticmethod
     @lru_cache(maxsize=1)
@@ -70,12 +71,12 @@ class CirclePacking:
         code = (CirclePacking.EXAMPLE / "initial_program.py").read_text(encoding="utf-8")
         return code
 
-    def prompt(self) -> tuple[str, str]:
+    def prompt(self, _) -> tuple[str, str]:
         """Return (system message, task message). The task message embeds the best code so far as the
         code to rewrite."""
         return self.SYSTEM_MESSAGE, self.TASK_MESSAGE.format(ref_code=self.ref_code)
 
-    def evaluate(self, response: str) -> float:
+    def evaluate(self, _, response: str) -> float:
         """Reward `response`: pull the rewritten code out of it and score that code with the openevolve
         example evaluator (runs it in a subprocess with a timeout and validates the packing; the
         combined score is sum_radii / 2.635 when valid). Also ratchets the best code so far."""
@@ -103,24 +104,72 @@ class CirclePacking:
                 self.ref_code, self.best_reward = gathered_code, gathered_reward
 
 
-class Long:
+class Short:
     """Quick smoke-test task: prompt the model to "tell a story" and reward the response length (number
     of characters). Nothing to extract or ratchet -- evaluate scores the raw generated text."""
 
     SYSTEM_MESSAGE = "You are a helpful assistant."
-    TASK_MESSAGE = "tell a story"
+    data = ["tell a story"]  # one fixed prompt -> a single item; GRPO must run with m=1 (one group)
 
-    def prompt(self) -> tuple[str, str]:
-        return self.SYSTEM_MESSAGE, self.TASK_MESSAGE
+    def prompt(self, item) -> tuple[str, str]:
+        return self.SYSTEM_MESSAGE, item
 
-    def evaluate(self, response: str) -> float:
-        return float(len(response))
+    def evaluate(self, _, response: str) -> float:
+        return 1-float(len(response))
+
+
+class GSM8K:
+    """GSM8K math-reasoning task for GRPO (simple_GRPO's grpo_vllm_one.py). Unlike the single-prompt tasks
+    above, this one owns a dataset of (Q, A) items: the trainer draws grouped prompts from `self.data`,
+    and both prompt building and reward are keyed by data id. `evaluate(data_id, response)` scores a
+    completion against that item's ground-truth answer -- correctness (+1/-1) plus format (+1/-1)."""
+
+    SYSTEM_MESSAGE = inspect.cleandoc("""
+        You are a helpful assistant. A conversation between User and Assistant. The user asks a question,
+        and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind
+        and then provides the user with the answer. The reasoning process and answer are enclosed within
+        <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here
+        </think><answer> answer here </answer>.
+    """)
+
+    def __init__(self):
+        # Ground-truth answer is the text after the "####" marker in the GSM8K answer field.
+        dataset = load_dataset("openai/gsm8k", "main", split="train")
+        self.data = [{"Q": q, "A": a.split("####")[-1].strip()} for q, a in zip(dataset["question"], dataset["answer"])]
+
+    def prompt(self, item) -> tuple[str, str]:
+        """Return (system message, user message) for a single (Q, A) item; the raw question is the user
+        turn, exactly as in simple_GRPO."""
+        return self.SYSTEM_MESSAGE, item["Q"]
+
+    def evaluate(self, data_id, response: str) -> float:
+        item = self.data[data_id]
+        return self.reward_correct(item, response) + self.reward_format(item, response)
+
+    @staticmethod
+    def reward_correct(item, answer):
+        from math_verify import parse, verify, ExprExtractionConfig
+        pattern = r'\d+\.\d+|\d+/\d+|\d+'
+        nums = re.findall(pattern, answer)
+        if len(nums) == 0: return -1.0
+        lastnum = nums[-1]
+        ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
+        ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
+        return 1 if verify(ans, ground_truth) else -1
+
+    @staticmethod
+    def reward_format(item, answer):
+        pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"
+        think_count = answer.count("<think>") + answer.count("</think>")
+        answer_count = answer.count("<answer>") + answer.count("</answer>")
+        return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count==2 and answer_count==2 else -1
 
 
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 TASKS_CLS = {
     "circle-packing": CirclePacking,
-    "long": Long,
+    "short": Short,
+    "gsm8k": GSM8K,
 }
 
 def get_reward_fn(key: str):

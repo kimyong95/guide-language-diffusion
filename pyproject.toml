@@ -1,3 +1,7 @@
+# conda create -n cu129 cuda-toolkit=12.9.2 "gxx<14" "gcc<14"
+# conda activate cu129
+# MAX_JOBS=4 uv sync
+
 [project]
 name = "guide-language-diffusion"
 version = "0.1.0"
@@ -20,13 +24,18 @@ dependencies = [
     "openevolve",
     "vllm==0.24.0",
     "lm_eval[api,hf,vllm]==0.4.12",
+    "peft==0.19.*",
+    "math-verify==0.9.*",
+    "flash-attn==2.8.*"
 ]
-
-# conda create -n cu129 cuda-toolkit=12.9.2
 
 [tool.uv]
 python-preference = "only-managed"
 environments = ["sys_platform == 'linux'"]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu129" }]

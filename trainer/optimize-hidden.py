@@ -18,7 +18,7 @@ config_flags.DEFINE_config_file("config", "config/optimize-hidden.py", "Training
 def project_to_sphere(x):
     """Rescale every (layer, token) hidden vector to the radius-sqrt(D) sphere. rms(x) then equals 1,
     so each layer's input_layernorm becomes the identity (modulo its weight) -- functionally a no-op
-    for the KV injection, but it keeps x on a fixed scale so the SGD step size stays interpretable."""
+    for the KV injection, but it keeps x on a fixed scale so the step size stays interpretable."""
     return x / torch.linalg.vector_norm(x, dim=-1, keepdim=True) * math.sqrt(x.shape[-1])
 
 
@@ -27,7 +27,7 @@ class Trainer(BaseTrainer):
     L hidden-state vectors injected into every transformer layer's KV cache -- become a single
     differentiable parameter x, trained by policy gradient (GRPO, reduced to plain PPO with one fixed
     prompt) to maximize the task reward. Each epoch samples N stochastic rollouts on top of prompt +
-    noise KV, evaluates each, then takes one SGD step on x that raises the log-likelihood of the
+    noise KV, evaluates each, then takes one Adam step on x that raises the log-likelihood of the
     sampled tokens weighted by their advantage. The epoch / N-per-epoch loop mirrors best-of-n; the
     KV injection mirrors optimize-noise, but x is optimized by gradient rather than an ES update."""
 
@@ -49,7 +49,7 @@ class Trainer(BaseTrainer):
         x = project_to_sphere(torch.randn(H, L, D, generator=gen))
         self.x = x.to(self.accelerator.device, torch.float32).requires_grad_(True)  # fp32 master copy
 
-        self.optimizer = torch.optim.SGD([self.x], lr=self.config.train.learning_rate)
+        self.optimizer = torch.optim.Adam([self.x], lr=self.config.train.learning_rate)
 
         # Fixed prompt, encoded once so x optimizes against a stationary objective (cf. optimize-noise):
         # task.evaluate still ratchets its own best code, but that never feeds back into the prompt.
@@ -148,12 +148,11 @@ class Trainer(BaseTrainer):
     def training_step(self, epoch, training_data):
         response_tokens = training_data["response_tokens"]
         advantages = training_data["advantages"]
-        adv_clip_max = self.config.train.adv_clip_max
 
-        # One SGD step per epoch, on-policy. The gradient is accumulated over this rank's tokens and
+        # One Adam step per epoch, on-policy. The gradient is accumulated over this rank's tokens and
         # samples, then averaged across ranks -- never accumulated across epochs. With a single
         # gradient step the PPO ratio is identically 1, so the surrogate is just -advantage * log_prob;
-        # no ratio, no clipping, no KL.
+        # no ratio, no PPO clipping, no KL.
         self.optimizer.zero_grad()
         losses = []
         for tokens, advantage in zip(response_tokens, advantages):
@@ -164,18 +163,27 @@ class Trainer(BaseTrainer):
             # and cannot attend to the noise, so its gradient w.r.t. x is exactly zero.
             log_probs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
             token_log_probs = log_probs.gather(-1, tokens[None, 1:, None]).squeeze(-1).squeeze(0)  # (T-1,)
-            advantage = advantage.clamp(-adv_clip_max, adv_clip_max)
             loss = -(advantage * token_log_probs.mean())
             self.accelerator.backward(loss / self.N_local)  # accumulate; graph freed after each backward
             losses.append(loss.detach())
 
         # Average the accumulated gradient across ranks (x is a bare tensor, so nothing syncs it for us).
         self.x.grad = self.accelerator.reduce(self.x.grad, reduction="mean")
-        grad_norm = torch.nn.utils.clip_grad_norm_([self.x], self.config.train.max_grad_norm)
+        grad_norm = self.x.grad.norm(dim=-1).mean()  # L2 over D, averaged over the H*L vectors
         self.optimizer.step()
         with torch.no_grad():
             self.x.copy_(project_to_sphere(self.x))
         self.x.data = broadcast(self.x.data)  # keep x bit-identical across ranks
+
+        with torch.no_grad():
+            # Mean inner product between distinct noise rows of a layer, averaged over layers: a
+            # collapse probe. Lives in [-D, D] -- ~0 while the rows stay mutually orthogonal, ~D once
+            # they have folded onto one direction. The diagonal is exactly D (x is on the sphere), so
+            # subtracting it leaves the n*(n-1) ordered off-diagonal pairs.
+            gram = self.x @ self.x.mT  # (H, L, L)
+            n = gram.shape[-1]
+            diag = torch.diagonal(gram, dim1=-2, dim2=-1)  # (H, L)
+            pairwise_inner_product = ((gram.sum(dim=(-2, -1)) - diag.sum(-1)) / (n * (n - 1))).mean()
 
         loss_value = torch.stack(losses).mean()
         gathered_loss = self.accelerator.gather(loss_value.reshape(1)).mean().item()
@@ -184,7 +192,7 @@ class Trainer(BaseTrainer):
             "objective-evaluations": objective_evaluations,
             "training/loss": gathered_loss,
             "training/grad-norm": grad_norm.item(),
-            "training/x-l2-norm": self.x.norm(dim=-1).mean().item(),
+            "training/x-concentration": pairwise_inner_product.item(),
         })
 
 

@@ -1,3 +1,19 @@
+from typing import List, Union
+
+import torch
+
+
+def concat(data: Union[List[torch.Tensor], List[List]]):
+    """Merge a list of per-batch values into one: cat tensors along dim 0, flatten lists
+    (finetune-stable-diffusion/utils.py)."""
+    if isinstance(data[0], torch.Tensor):
+        return torch.cat(data, dim=0)
+    elif isinstance(data[0], list):
+        return sum(data, [])
+    else:
+        raise ValueError(f"Unsupported data type: {type(data[0])}")
+
+
 def batch_slices(total, max_batch_size):
     """Partition ``range(total)`` into contiguous chunks of at most ``max_batch_size``.
 

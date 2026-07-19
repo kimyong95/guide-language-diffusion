@@ -129,14 +129,13 @@ class Trainer(BaseTrainer):
 
         self.accelerator.end_training()
 
-    @torch.no_grad()
-    def generate_noisy_kv(self, x_noise):  # x_noise: (H, L, D) sphere-projected noise for one sample
+    def build_noisy_cache(self, x_noise):  # x_noise: (H, L, D) sphere-projected noise for one sample
         # Build the clean prompt KV cache, then inject L "random" KV rows into every layer -- each row
         # produced by pushing this sample's Gaussian hidden state through that layer's real K/V
         # pipeline (input_layernorm -> k/v_proj -> k_norm -> RoPE), landing the keys/values on the
-        # model's true K/V manifold (cf. test-qwen-noise.py Stage 2). Then greedy-decode on top.
+        # model's true K/V manifold (cf. test-qwen-noise.py Stage 2). Returns (cache, prompt_logits, P).
         L = self.config.sample.noise_length
-        out = self.model(input_ids=self.prompt_tokens, use_cache=True)
+        out = self.model(input_ids=self.prompt_tokens, use_cache=True, logits_to_keep=1)  # only the last row is read
         cache = out.past_key_values
         P = cache.get_seq_length()
         pos = torch.arange(P, P + L, device=self.model.device).unsqueeze(0)  # positions P .. P+L-1
@@ -144,33 +143,40 @@ class Trainer(BaseTrainer):
         for i, layer in enumerate(self.model.model.layers):
             attn = layer.self_attn
             dev = attn.k_proj.weight.device
-            Hkv, Dh = attn.config.num_key_value_heads, attn.head_dim
+            Dh = attn.head_dim
             x = x_noise[i][None].to(dev, attn.k_proj.weight.dtype)  # (1, L, D)
             xln = layer.input_layernorm(x)  # RMSNorm washes x's scale (magnitude is irrelevant here)
-            k = attn.k_norm(attn.k_proj(xln).view(1, L, Hkv, Dh)).transpose(1, 2)  # (1, Hkv, L, Dh)
-            v = attn.v_proj(xln).view(1, L, Hkv, Dh).transpose(1, 2)               # (1, Hkv, L, Dh)
+            k = attn.k_norm(einops.rearrange(attn.k_proj(xln), "b l (h d) -> b l h d", d=Dh))  # k_norm over head_dim
+            k = einops.rearrange(k, "b l h d -> b h l d")               # (1, Hkv, L, Dh)
+            v = einops.rearrange(attn.v_proj(xln), "b l (h d) -> b h l d", d=Dh)  # (1, Hkv, L, Dh)
             cos, sin = rotary(v, pos.to(dev))
             k, _ = apply_rotary_pos_emb(k, k, cos.to(dev), sin.to(dev))  # RoPE at positions P .. P+L-1
             cl = cache.layers[i]
             cl.keys = torch.cat([cl.keys, k.to(cl.keys.device)], dim=2)
             cl.values = torch.cat([cl.values, v.to(cl.values.device)], dim=2)
+        return cache, out.logits, P
 
-        # Greedy decode. The first token is seeded from the prompt-only logits (it does not attend to
-        # the noise: causality forbids position P-1 from seeing rows at >=P); every later token is
-        # generated at position >= P+L and does attend over the random KV.
-        eos_ids = torch.as_tensor(self.model.generation_config.eos_token_id).flatten().to(self.model.device)
-        generated, cur = [], P + L
-        next_token = out.logits[:, -1, :].argmax(-1)
-        for _ in range(self.config.sample.max_new_tokens):
-            generated.append(next_token)
-            if torch.isin(next_token, eos_ids).any():
-                break
-            cache_position = torch.tensor([cur], device=self.model.device)
-            step = self.model(input_ids=next_token[:, None], past_key_values=cache, use_cache=True, cache_position=cache_position, position_ids=cache_position.unsqueeze(0))
-            next_token = step.logits[:, -1, :].argmax(-1)
-            cur += 1
-
-        return self.tokenizer.decode(torch.cat(generated), skip_special_tokens=True)
+    def generate(self, x_noise):
+        # Greedy AR decode over prompt + this sample's noise KV -- deterministic given the noise, so the
+        # noise is the only source of rollout variation. The first token is seeded from the prompt-only
+        # logits (it does not attend to the noise: causality forbids position P-1 from seeing rows at
+        # >=P); every later token is generated at position >= P+L and does attend over the random KV.
+        # Padding the input to P+L+1 makes `generate` feed only first_token (at position P+L) and take
+        # over -- the L placeholders stand in for the injected KV rows and are never embedded.
+        L = self.config.sample.noise_length
+        cache, prompt_logits, P = self.build_noisy_cache(x_noise)
+        first_token = prompt_logits[:, -1:, :].argmax(-1)  # (1, 1)
+        placeholders = self.prompt_tokens.new_full((1, L), self.tokenizer.pad_token_id)
+        input_ids = torch.cat([self.prompt_tokens, placeholders, first_token], dim=1)  # (1, P + L + 1)
+        attention_mask = torch.ones_like(input_ids)  # all-ones: the placeholders must not read as padding
+        out = self.model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            past_key_values=cache,
+            max_new_tokens=self.config.sample.max_new_tokens,
+            do_sample=False,
+        )
+        return self.tokenizer.decode(out[0, P + L:], skip_special_tokens=True)
 
     @torch.no_grad()
     def sampling_step(self, epoch):
@@ -179,9 +185,7 @@ class Trainer(BaseTrainer):
         responses = []
         rewards = []
         for b in range(self.N_local):
-            # Greedy AR decode over prompt + this sample's per-layer noise KV; deterministic given the
-            # noise (cf. test-qwen-noise.py Stage 2).
-            response = self.generate_noisy_kv(projected_noise[b])  # (H, L, D)
+            response = self.generate(projected_noise[b])  # (H, L, D)
             rewards.append(self.task.evaluate(response))
             responses.append(response)
 
