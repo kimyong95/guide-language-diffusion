@@ -55,10 +55,9 @@ class Trainer(BaseTrainer):
         self.train_dataset = DistributedSubsampleDataset(
             all_data=self.task.data,
             B=config.sample.total_samples,
-            G=self.accelerator.num_processes,
+            G=G,
             m=config.sample.m,
             b_max=config.sample.total_samples,  # unused: we batch by group size k, not b
-            G=G,
             base_seed=config.seed,
         )
         assert self.train_dataset.m % G == 0, "m must be divisible by num_processes (whole groups per rank)"
