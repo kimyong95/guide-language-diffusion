@@ -57,7 +57,7 @@ class Trainer(BaseTrainer):
             B=config.sample.total_samples,
             G=G,
             m=config.sample.m,
-            b_max=config.sample.total_samples,  # unused: we batch by group size k, not b
+            b_max=config.sample.total_samples,
             base_seed=config.seed,
         )
         assert self.train_dataset.m % G == 0, "m must be divisible by num_processes (whole groups per rank)"

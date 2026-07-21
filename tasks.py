@@ -13,11 +13,8 @@ from accelerate.utils import gather_object
 from datasets import load_dataset
 from math_verify import parse, verify, ExprExtractionConfig
 
+# git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 class CirclePacking:
-    """OpenEvolve circle-packing task (n=26): the model evolves constructor code that places 26
-    circles in the unit square to maximize the sum of radii. Seed code and evaluator are reused
-    from the cloned openevolve repo / pip package. Every prompt asks the model to rewrite the best
-    code found so far, which evaluate ratchets."""
 
     EXAMPLE = Path(__file__).resolve().parent / "openevolve" / "examples" / "circle_packing"
 
@@ -51,11 +48,8 @@ class CirclePacking:
     """)
 
     def __init__(self):
-        # Best code so far -- what every prompt asks the model to rewrite. Seeded with the openevolve
-        # initial program, scored through evaluate like any response: raw code carries no ``` fence,
-        # so the extraction below passes it straight to the evaluator.
         self.ref_code, self.best_reward = self.initial_code(), -math.inf
-        self.data = [None]  # one dynamic prompt (rewrite the ratcheted best code); the item is unused
+        self.data = [None]
         self.evaluate(None, self.ref_code)
 
     @staticmethod
@@ -73,14 +67,12 @@ class CirclePacking:
         return code
 
     def prompt(self, _) -> str:
-        """Return the task prompt: embeds the best code so far as the code to rewrite (the system prompt
-        is read separately from SYSTEM_PROMPT)."""
+        """Return the task prompt: embeds the best code so far as the code to rewrite."""
         return self.TASK_PROMPT.format(ref_code=self.ref_code)
 
     def evaluate(self, _, response: str) -> float:
         """Reward `response`: pull the rewritten code out of it and score that code with the openevolve
-        example evaluator (runs it in a subprocess with a timeout and validates the packing; the
-        combined score is sum_radii / 2.635 when valid). Also ratchets the best code so far."""
+        example evaluator. Also ratchets the best code so far."""
         from openevolve.utils.code_utils import parse_full_rewrite
         code = parse_full_rewrite(response, "python")
 
@@ -97,20 +89,16 @@ class CirclePacking:
         return reward
 
     def update_best(self, code: str, reward: float) -> None:
-        """Ratchet ref_code / best_reward against every process's newest (code, reward). Each rank
-        calls evaluate the same number of times per epoch, so this gather is balanced; ranks scan the
-        gathered pairs in the same order, so they all settle on the same best."""
+        """Ratchet ref_code / best_reward against every process's newest (code, reward)."""
         for gathered_code, gathered_reward in gather_object([(code, reward)]):
             if gathered_reward > self.best_reward:
                 self.ref_code, self.best_reward = gathered_code, gathered_reward
 
 
 class Short:
-    """Quick smoke-test task: prompt the model to "tell a story" and reward the response length (number
-    of characters). Nothing to extract or ratchet -- evaluate scores the raw generated text."""
 
     SYSTEM_PROMPT = "You are a helpful assistant."
-    data = ["tell a story"]  # one fixed prompt -> a single item; GRPO must run with m=1 (one group)
+    data = ["tell a story"]
 
     def prompt(self, data_id) -> str:
         return self.data[data_id]
@@ -120,39 +108,27 @@ class Short:
 
 
 class GSM8K:
-    """GSM-Hard math-reasoning task for GRPO (kept under the GSM8K name / "gsm8k" key). A dataset of
-    (Q, A) items with numeric answers -- the hard-numbers variant of GSM8K. The trainer draws grouped
-    prompts from `self.data`, keyed by data id; `evaluate(data_id, response)` pulls the number inside the
-    response's <answer> </answer> tags and scores +1/-1 by numeric match against the ground truth."""
-
-    
 
     SYSTEM_PROMPT = inspect.cleandoc("""
         You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
     """)
 
     def __init__(self):
-        # GSM-Hard: `input` is the question, `target` is the numeric ground-truth answer (a float).
-        dataset = load_dataset("reasoning-machines/gsm-hard", split="train")
-        self.data = [{"Q": q, "A": str(t)} for q, t in zip(dataset["input"], dataset["target"])]
+        dataset = load_dataset("openai/gsm8k", "main", split="train")
+        self.data = [{'question':x, 'answer':y.split('####')[-1].strip()} for x,y in zip(dataset['question'], dataset['answer'])]
 
     def prompt(self, data_id) -> str:
-        """Return the user question for the (Q, A) item at data_id (the system prompt is read separately
-        from SYSTEM_PROMPT)."""
-        return self.data[data_id]["Q"]
+        """Return the user question for the item at data_id."""
+        return self.data[data_id]["question"]
 
     def evaluate(self, data_id, response: str) -> float:
-        # Score the number inside the <answer> </answer> tags against the ground truth.
         match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
-        if match is None: return -1.0
-        nums = re.findall(r'\d+\.\d+|\d+/\d+|\d+', match.group(1))
-        if len(nums) == 0: return -1.0
-        answer = parse(nums[-1], extraction_config=[ExprExtractionConfig()])
-        ground_truth = parse(self.data[data_id]["A"], extraction_config=[ExprExtractionConfig()])
-        return 1 if verify(answer, ground_truth) else -1
+        if match is None: return 0
+        answer = parse(match.group(1), extraction_config=[ExprExtractionConfig()])
+        ground_truth = parse(self.data[data_id]["answer"], extraction_config=[ExprExtractionConfig()])
+        return 1 if verify(answer, ground_truth) else 0
 
 
-# git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 TASKS_CLS = {
     "circle-packing": CirclePacking,
     "short": Short,

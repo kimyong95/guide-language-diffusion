@@ -23,7 +23,7 @@ class BaseTrainer:
                 log_mode="INCREMENTAL",
             ),
         }
-        self.best_reward = {}  # stage -> best reward logged so far, maintained by log_rewards
+        self.best_reward = {}
 
     def setup_accelerator(self):
         self.accelerator = Accelerator(log_with="wandb")
@@ -33,15 +33,11 @@ class BaseTrainer:
             init_kwargs={"wandb": {"name": self.config.run_name, "config": self.config.to_dict()}}
         )
         set_seed(self.config.seed, device_specific=True)
-        # assert torch.cuda.device_count() == self.accelerator.num_processes, f"Number of avaliable GPUs does not match the number of processes ({self.accelerator.num_processes})"
 
     def setup_task(self):
         self.task = tasks.get_reward_fn(self.config.task)
 
     def setup_model(self):
-        # Shard this process's model across its GPU stride (device_map="auto"); each rank keeps a disjoint
-        # set of GPUs. The base is frozen (LoRA adds the trainable adapter in LoraMixin) and in eval (no
-        # dropout). bf16 + FlashAttention-2; left padding batches prompts of different lengths for generation.
         max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(self.accelerator.process_index, torch.cuda.device_count(), self.accelerator.num_processes)}
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.model, padding_side="left")
@@ -52,7 +48,7 @@ class BaseTrainer:
     @torch.no_grad()
     def build_prompt_tokens(self, user_prompt, system_prompt="You are a helpful assistant.", enable_thinking=True):
         """Tokenize `user_prompt` into a batch-1 (1, P) input_ids tensor via the chat template,
-        prepending `system_prompt` as a system turn (pass a falsy `system_prompt` to omit it)."""
+        prepending `system_prompt` as a system turn."""
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         return self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt", enable_thinking=enable_thinking).to(self.model.device).input_ids  # (1, P)
 
@@ -62,11 +58,13 @@ class BaseTrainer:
         return [tokens[tokens != self.tokenizer.pad_token_id] for tokens in tokens_list]
 
     def strip_eos(self, tokens_list):
-        """Truncate each entry of `tokens_list` after its first eos (dropping whatever follows, e.g.
-        generation's right-pad); entries without an eos are kept whole -> list of 1-D token rows."""
+        """Truncate each entry of `tokens_list` after its first eos; entries without an eos are kept
+        whole -> list of 1-D token rows."""
+        eos_token_ids = torch.tensor(self.model.generation_config.eos_token_id, device=self.model.device)
+
         stripped = []
         for tokens in tokens_list:
-            eos_positions = (tokens == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            eos_positions = torch.isin(tokens, eos_token_ids).nonzero(as_tuple=True)[0]
             end = eos_positions[0].item() + 1 if eos_positions.numel() > 0 else tokens.shape[0]
             stripped.append(tokens[:end])
         return stripped
@@ -87,7 +85,6 @@ class BaseTrainer:
         self.accelerator.get_tracker("wandb").run.log_code(".", include_fn=lambda path: path in imported_py_files)
 
     def log_rewards(self, objective_evaluations, rewards, stage, extra={}):
-        # `rewards` is already gathered across ranks, so best-so-far ratchets identically everywhere.
         self.best_reward[stage] = max(self.best_reward.get(stage, -math.inf), rewards.max().item())
         log_dict = {
             "objective-evaluations": objective_evaluations,
