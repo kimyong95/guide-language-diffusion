@@ -19,7 +19,7 @@ config_flags.DEFINE_config_file("config", "config/grpo.py", "Training configurat
 def completion_log_probs(model, context_tokens, generated_tokens):
     """Per-token log-probs of `generated_tokens` continued from `context_tokens`, under `model`.
 
-    Both are 1-D unpadded token rows -> (T,) log-probs over the generated tokens only."""
+    Both are 1-D unpadded token rows -> (Lg,) log-probs over the generated tokens only."""
     input_tokens = torch.cat([context_tokens, generated_tokens])         # (L,)
     logits = model(input_tokens.unsqueeze(0)).logits[0, :-1, :]           # (L-1, V)
     log_probs = logits.float().log_softmax(dim=-1)
@@ -35,17 +35,17 @@ class Trainer(BaseTrainer, LoraMixin):
 
         self.train_dataset = DistributedSubsampleDataset(
             all_data=self.task.data,
-            B=config.sample.total_samples,
+            N=config.sample.total_samples,
             G=self.accelerator.num_processes,
             m=config.sample.m,
-            b_max=config.sample.max_batch_size_per_device,
+            N_batch_max=config.sample.max_batch_size_per_device,
             base_seed=config.seed,
         )
-        training_dataloader = DataLoader(self.train_dataset, batch_size=self.train_dataset.b, shuffle=True)
+        training_dataloader = DataLoader(self.train_dataset, batch_size=self.train_dataset.N_local_batch, shuffle=False)
         self.training_dataloader = self.accelerator.prepare(training_dataloader)
 
-        assert self.train_dataset.B_i % config.train.gradient_updates_per_epoch == 0, f"per-rank rollouts B_i ({self.train_dataset.B_i}) must be divisible by gradient_updates_per_epoch ({config.train.gradient_updates_per_epoch})"
-        self.accelerator.gradient_accumulation_steps = self.train_dataset.B_i // config.train.gradient_updates_per_epoch
+        assert self.train_dataset.N_local % config.train.gradient_updates_per_epoch == 0, f"per-rank rollouts N_local ({self.train_dataset.N_local}) must be divisible by gradient_updates_per_epoch ({config.train.gradient_updates_per_epoch})"
+        self.accelerator.gradient_accumulation_steps = self.train_dataset.N_local // config.train.gradient_updates_per_epoch
 
     @staticmethod
     def compute_advantages(data_ids, rewards):
@@ -81,7 +81,7 @@ class Trainer(BaseTrainer, LoraMixin):
                 prompt_texts, tokenize=True, padding=True, add_generation_prompt=True,
                 return_dict=True, return_tensors="pt", enable_thinking=cfg.enable_thinking,
             ).to(self.accelerator.device)
-            prompt_tokens, prompt_attention = prompt_tokens_data.input_ids, prompt_tokens_data.attention_mask  # (b, P), left-padded
+            prompt_tokens, prompt_attention = prompt_tokens_data.input_ids, prompt_tokens_data.attention_mask  # (N_local_batch, Lp), left-padded
             prompt_length = prompt_tokens.shape[1]
 
             generated_tokens = self.model.generate(
@@ -93,19 +93,19 @@ class Trainer(BaseTrainer, LoraMixin):
                 max_new_tokens=cfg.max_new_tokens,
                 use_cache=True,
                 pad_token_id=self.tokenizer.pad_token_id,
-            )  # (b, P + T), completions right-padded with pad_token_id
+            )  # (N_local_batch, Lp + Lg), completions right-padded with pad_token_id
 
-            prompt_tokens = self.strip_pads(prompt_tokens)                          # b x (P_i,)
-            generated_tokens = self.strip_eos(generated_tokens[:, prompt_length:])  # b x (T_i,)
+            prompt_tokens = self.strip_pads(prompt_tokens)                          # N_local_batch x (Lp_i,)
+            generated_tokens = self.strip_eos(generated_tokens[:, prompt_length:])  # N_local_batch x (Lg_i,)
             generated_texts = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
             rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
 
             training_data.append({
-                "data_ids": data_ids,                 # (b,)
-                "prompt_tokens": prompt_tokens,       # b x (P_i,)
-                "generated_tokens": generated_tokens, # b x (T_i,)
-                "generated_texts": generated_texts,   # b x str
-                "rewards": rewards,                   # (b,)
+                "data_ids": data_ids,                 # (N_local_batch,)
+                "prompt_tokens": prompt_tokens,       # N_local_batch x (Lp_i,)
+                "generated_tokens": generated_tokens, # N_local_batch x (Lg_i,)
+                "generated_texts": generated_texts,   # N_local_batch x str
+                "rewards": rewards,                   # (N_local_batch,)
             })
 
         training_data = {key: concat([batch[key] for batch in training_data]) for key in training_data[0]}

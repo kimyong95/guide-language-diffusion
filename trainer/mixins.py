@@ -7,40 +7,40 @@ from torch.utils.data import Dataset
 
 class DistributedSubsampleDataset(Dataset):
 
-    def __init__(self, all_data, B, G, m, b_max, base_seed=0):
-        # N      : total number of items
-        # B      : total samples per epoch (across all GPUs)
-        # m      : number of unique items sampled per epoch    (m == -1 → m = B; capped at N)
-        # k      : repetitions per item per epoch              (B = m*k)
-        # G      : number of GPUs (processes)
-        # B_i    : total samples per epoch per GPU             (B_i = B/G)
-        # b_max  : max batch size per GPU
-        # b      : actual batch size per GPU                   (b = min(b_max, B/G))
-        # K      : number of batches per epoch per GPU         (K = B_i//b)
+    def __init__(self, all_data, N, G, m, N_batch_max, base_seed=0):
+        # N_all         : total number of items
+        # N             : total samples per epoch (across all GPUs)
+        # m             : number of unique items sampled per epoch    (m == -1 → m = N; capped at N_all)
+        # k             : repetitions per item per epoch              (N = m*k)
+        # G             : number of GPUs (processes)
+        # N_local       : total samples per epoch per GPU             (N_local = N/G)
+        # N_batch_max   : max batch size per GPU
+        # N_local_batch : actual batch size per GPU                   (N_local_batch = min(N_batch_max, N/G))
+        # K             : number of batches per epoch per GPU         (K = N_local//N_local_batch)
 
         self.all_data = all_data
-        self.N = len(self.all_data)
+        self.N_all = len(self.all_data)
         self.base_seed = base_seed
-        self.B = B if B != -1 else self.N
-        self.m = min(m if m != -1 else self.B, self.N)
+        self.N = N if N != -1 else self.N_all
+        self.m = min(m if m != -1 else self.N, self.N_all)
         self.G = G
-        self.k = self.B // self.m
-        self.B_i = self.B // self.G
-        self.b = min(b_max, self.B_i)
-        self.K = -(-self.B_i // self.b)
+        self.k = self.N // self.m
+        self.N_local = self.N // self.G
+        self.N_local_batch = min(N_batch_max, self.N_local)
+        self.K = -(-self.N_local // self.N_local_batch)
 
-        assert self.B % self.m == 0, f"B ({self.B}) must be divisible by m ({self.m})"
-        assert self.B % self.G == 0, f"B ({self.B}) must be divisible by number of GPUs ({self.G})"
+        assert self.N % self.m == 0, f"N ({self.N}) must be divisible by m ({self.m})"
+        assert self.N % self.G == 0, f"N ({self.N}) must be divisible by number of GPUs ({self.G})"
 
         self.subsample(0)
 
     def subsample(self, epoch: int):
         rng = random.Random(self.base_seed + epoch)
-        chosen = sorted(rng.sample(range(self.N), self.m))
+        chosen = sorted(rng.sample(range(self.N_all), self.m))
         repeated = [i for idx in chosen for i in [idx]*self.k]
         self.subsample_indices = repeated
 
-    def __len__(self): return self.B
+    def __len__(self): return self.N
     def __getitem__(self, i): return self.subsample_indices[i]
     def indices_to_data(self, indices): return [self.all_data[i] for i in indices]
 

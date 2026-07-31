@@ -1,28 +1,24 @@
-"""Varlen KV-cache pipeline over Qwen3, with optional position-less guidance rows.
+"""Varlen KV-cache pipeline over Qwen3, with an optional per-layer intervention.
 
-We register custom *varlen* attention kernels via `AttentionInterface.register`, then run Qwen3's
-OWN forward stack (Qwen3ForCausalLM/Model/DecoderLayer/Attention) as black boxes. The registered fn
-is the only custom compute: it appends each row's new k/v into a ragged per-row KV cache and attends
-the whole batch in one `flash_attn_varlen_func` call -- no padding.
+A custom attention kernel registered via `AttentionInterface.register` keeps one ragged KV cache per
+sample and attends the whole batch in a single `flash_attn_varlen_func` call -- no padding. Qwen3's
+own forward stack runs untouched around it, with our varlen state riding in as a `varlen=(...)`
+kwarg; `use_cache=False` because we own the cache, and a custom attn-impl name builds no attention
+mask, so the kernel owns causality and sample isolation via cu_seqlens + causal=True.
 
-How the plumbing works (all verified against transformers source):
-  - custom kwargs (`varlen=(...)`) thread through every forward via **kwargs down to our fn;
-  - `use_cache=False` keeps the model's own (rectangular) cache update from running -- we own the
-    cache and pass it in the `varlen` kwarg instead;
-  - a *custom* attn-impl name isn't in the mask registry, so the model builds NO attention mask
-    (our fn owns causality + row isolation via cu_seqlens + causal=True).
+`texts_to_tokens(prompts, n_intervene=Lx)` appends `<|vision_start|><|image_pad|>*Lx<|vision_end|>`
+to the user content, and `intervene` overwrites those slots' hidden state with a per-layer x
+(H, Lx, D) at every decoder layer's input. They stay ordinary prompt positions with ordinary RoPE,
+so x is written once at prefill and its k/v then serves every decode step. `x=None` is a plain
+forward, so one Pipeline scores and generates both with and without an intervention.
 
-Guidance (mirrors the old extend_transformers, no dependency): `varlen_attention_guidance`
-FRONT-prepends a few *position-less* KV rows -- built from a per-layer hidden state `x` by
-`hidden_states_to_kv_caches` (the model's own K/V pipeline minus RoPE) -- so every query attends
-them. `guidance=None` falls back to the plain path, so one guided Pipeline can score/generate both
-unguided and guided (needed by the optimize loop). The impl is fixed at load; pick the guided kernel
-with `Pipeline(model_id, "varlen_attention_guidance")`.
-
-Full attention only (a sliding window would slide the front rows out of view); relies on flash's
-bottom-right causal alignment, so guidance rows must be front-placed.
+Shape symbols -- L* is a length in tokens, N* a number of samples: H = layers, L = a sample's token
+length (L_i sample i's, Lk_i its cached length), NL = the packed axis (sum_i L_i over N samples),
+Lp = prompt length, Lg = generated length, Lx = intervention slots, N = samples. Model dims:
+heads_q/heads_kv = attn/kv heads, Dh = head dim, D = hidden size, V = vocab.
 """
 
+import contextlib
 import itertools
 
 import einops
@@ -33,157 +29,205 @@ from flash_attn import flash_attn_varlen_func
 
 # ===================== our attention kernels (the only custom compute) =======
 def assemble_kv(kv_caches, key, value, cu_q, li):
-    """Append each row's new k/v into its own cache; return per-row full k/v as (len_i, Hkv, D) lists.
-    The shared 'grow the ragged cache' step behind both kernels below."""
+    """
+    Args:
+        kv_caches: 1D list (N) of DynamicCache, updated in place.
+        key: (1, heads_kv, NL, Dh)
+        value: (1, heads_kv, NL, Dh)
+        cu_q: (N+1,) int32
+        li: int layer index.
+
+    Returns:
+        (k_full, v_full), each a 1D list (N) of (Lk_i, heads_kv, Dh).
+    """
     k_full, v_full = [], []
-    for i, kv in enumerate(kv_caches):                             # per row (varlen: batch is a python list)
+    for i, kv in enumerate(kv_caches):                             # per sample (varlen: batch is a python list)
         ki, vi = kv.update(key[:, :, cu_q[i]:cu_q[i + 1]], value[:, :, cu_q[i]:cu_q[i + 1]], li)
-        k_full.append(ki[0].transpose(0, 1))                       # (len_i, Hkv, D)
+        k_full.append(ki[0].transpose(0, 1))                       # (Lk_i, heads_kv, Dh)
         v_full.append(vi[0].transpose(0, 1))
     return k_full, v_full
 
 
-def varlen_attn_kernel(module, query, k_full, v_full, cu_q, cu_k):
-    """One varlen kernel over the packed batch. GQA native (no repeat_kv); causal aligns for q_len<k_len.
-    max_q/max_k are derived from cu_q/cu_k (a small host sync) so the bundle need only carry cu_q/cu_k."""
+def varlen_attention(module, query, key, value, attention_mask, **kwargs):
+    """Called by Qwen3Attention through the AttentionInterface registry, never by us directly.
+
+    Args:
+        module: Qwen3Attention
+        query: (1, heads_q, NL, Dh)
+        key: (1, heads_kv, NL, Dh)
+        value: (1, heads_kv, NL, Dh)
+        attention_mask: Always None.
+        **kwargs: varlen=(kv_caches: 1D list (N) of DynamicCache, cu_q: (N+1,) int32,
+            cu_k: (N+1,) int32), bundled by Pipeline.predict_logits.
+
+    Returns:
+        ((NL, heads_q, Dh), None) -- the (attn_output, attn_weights) pair Qwen3Attention expects.
+    """
+    kv_caches, cu_q, cu_k = kwargs["varlen"]                        # our one bundled kwarg
+    k_full, v_full = assemble_kv(kv_caches, key, value, cu_q, module.layer_idx)
     max_q = (cu_q[1:] - cu_q[:-1]).max().item()
     max_k = (cu_k[1:] - cu_k[:-1]).max().item()
     out = flash_attn_varlen_func(
-        query[0].transpose(0, 1).contiguous(),                     # (total_q, Hq, D)
-        torch.cat(k_full), torch.cat(v_full),                      # (total_k, Hkv, D)
+        query[0].transpose(0, 1).contiguous(),                     # (NL, heads_q, Dh)
+        torch.cat(k_full), torch.cat(v_full),                      # (sum Lk_i, heads_kv, Dh)
         cu_q, cu_k, max_q, max_k,
-        softmax_scale=module.scaling, causal=True)                 # (total_q, Hq, D)
-    return out, None       # Qwen3Attention.forward reshapes (total_q, Hq, D) -> (1, total_q, Hq*D)
-
-
-def varlen_attention(module, query, key, value, attention_mask, **kwargs):
-    """HF attention interface: q/k/v are (1, H, total_q, D), already projected + q/k-norm + RoPE
-    by Qwen3Attention. Append to per-row ragged caches, then one varlen kernel over the batch."""
-    kv_caches, cu_q, cu_k = kwargs["varlen"]                        # our one bundled kwarg
-    k_full, v_full = assemble_kv(kv_caches, key, value, cu_q, module.layer_idx)
-    return varlen_attn_kernel(module, query, k_full, v_full, cu_q, cu_k)
-
-
-def varlen_attention_guidance(module, query, key, value, attention_mask, **kwargs):
-    """Like varlen_attention, but FRONT-prepends this layer's position-less guidance rows to every
-    row's k/v (so every query attends them) and widens each row's key span by L. Front + causal lets
-    query j see all L rows + its causal prefix. `guidance is None` -> plain path (unguided). The rows
-    are never stored in kv_caches -- they ride in fresh each forward, built by hidden_states_to_kv_caches."""
-    kv_caches, cu_q, cu_k, guidance = kwargs["varlen"]             # guidance added to the bundle (may be None)
-    k_full, v_full = assemble_kv(kv_caches, key, value, cu_q, module.layer_idx)
-    if guidance is not None:
-        g = guidance.layers[module.layer_idx]                      # this layer's rows, (1, Hkv, L, Dh)
-        gk, gv = g.keys[0].transpose(0, 1), g.values[0].transpose(0, 1)       # (L, Hkv, D)
-        k_full = [torch.cat([gk, k]) for k in k_full]              # front placement: guidance ahead of prefix
-        v_full = [torch.cat([gv, v]) for v in v_full]
-        L = gk.shape[0]
-        cu_k = cu_k + torch.arange(len(kv_caches) + 1, device=cu_k.device, dtype=torch.int32) * L   # +L keys/row
-    return varlen_attn_kernel(module, query, k_full, v_full, cu_q, cu_k)   # max_k re-derived from cu_k
+        softmax_scale=module.scaling, causal=True)                 # (NL, heads_q, Dh)
+    return out, None       # Qwen3Attention.forward reshapes (NL, heads_q, Dh) -> (1, NL, heads_q*Dh)
 
 
 AttentionInterface.register("varlen_attention", varlen_attention)
-AttentionInterface.register("varlen_attention_guidance", varlen_attention_guidance)
 
 
 # ===================== the loop's view: pack ragged tokens, get logits =======
 class Pipeline:
-    """ragged tokens + per-row ragged caches (+ optional guidance) -> logits, generation, scoring (varlen)."""
+    """ragged tokens + per-sample ragged caches (+ optional intervention) -> logits, generation, scoring (varlen)."""
 
-    def __init__(self, model_id, attn_implementation="varlen_attention"):
-        self.tok = AutoTokenizer.from_pretrained(model_id)
+    INTERVENE_TOKEN = "<|image_pad|>"     # the prompt slot whose hidden state the caller optimizes
+
+    def __init__(self, model_id):
+        """
+        Args:
+            model_id: str HF repo id or local path.
+        """
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())}
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation=attn_implementation, device_map="auto", max_memory=max_memory,).eval()
-        self.model.requires_grad_(False)                 # only a guidance x ever needs grad, never the weights
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation="varlen_attention", device_map="auto", max_memory=max_memory,).eval()
+        self.model.requires_grad_(False)                 # only an intervention x ever needs grad, never the weights
         self.device = self.model.device
-        self.guided = "guidance" in attn_implementation  # whether the loaded kernel expects a guidance slot
+        self.intervene_token_id = self.tokenizer.convert_tokens_to_ids(self.INTERVENE_TOKEN)
 
-    def hidden_states_to_kv_caches(self, x):
-        """Per-layer hidden state x (H, L, D) -> a DynamicCache of L position-less guidance rows.
-        Runs each layer's OWN K/V pipeline -- input_layernorm -> k_proj -> k_norm, v_proj -- exactly
-        as Qwen3Attention does (modeling_qwen3.py:264-265), but SKIPS RoPE (:268): the rows carry no
-        position, so every query attends them identically. Each layer's rows sit on that layer's
-        device (device_map='auto' safe). Differentiable in x (the optimize loop backprops through here)."""
-        kv_cache = DynamicCache()
-        for layer in self.model.model.layers:
-            attn = layer.self_attn
-            xln = layer.input_layernorm(x[attn.layer_idx][None].to(attn.k_proj.weight.device, attn.k_proj.weight.dtype))
-            k = attn.k_norm(einops.rearrange(attn.k_proj(xln), "b l (h d) -> b l h d", d=attn.head_dim))  # norm over head_dim
-            k = einops.rearrange(k, "b l h d -> b h l d")
-            v = einops.rearrange(attn.v_proj(xln), "b l (h d) -> b h l d", d=attn.head_dim)
-            kv_cache.update(k, v, attn.layer_idx)                     # (1, Hkv, L, Dh) per layer; no RoPE
-        return kv_cache
+    @contextlib.contextmanager
+    def intervene(self, x, positions):
+        """Overwrites the hidden state at `positions` with x at every decoder layer's input.
 
-    def texts_to_tokens(self, prompts):
-        """prompts -> ragged list[list[int]] (each its own length, no padding)."""
-        return [self.tok(self.tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False,add_generation_prompt=True, enable_thinking=False)).input_ids for p in prompts]
+        Layer 0's input is the embedding itself, so one pre-hook per layer covers all H rows of x;
+        Qwen3 then computes those positions' k/v (with RoPE) from x as it would for any token. The
+        caller locates the slots -- this knows nothing about tokenization, packing or the kernel.
 
-    def logits_forward(self, kv_caches, new_tokens, kv_caches_guidance=None):
-        """Packed varlen forward -> per-row logits: a list of (q_len_i, vocab), one per row; advances
-        kv_caches. Grad flows unless the caller is under torch.no_grad -- generation is no_grad, the
-        optimize loop is not."""
+        Args:
+            x: (H, Lx, D) | None; row h replaces layer h's input. None registers no hooks.
+            positions: (N*Lx,) int64 indices along the sequence axis -- x's Lx slots tile over them,
+                one copy per sample, so the count must be a multiple of Lx.
+
+        Yields:
+            None; the hooks are live inside the block and removed on exit. Differentiable in x.
+        """
+        if x is None:
+            yield
+            return
+        N = positions.numel() // x.shape[1]                          # samples sharing this one x
+
+        def pre_hook(layer, args):
+            h = args[0]                                              # (N, L, D) residual stream -- (1, NL, D) when packed
+            src = einops.repeat(x[layer.self_attn.layer_idx], "lx d -> b (n lx) d", b=h.shape[0], n=N)
+            return (h.index_copy(1, positions.to(h.device), src.to(h)),)  # new tensor: no in-place on the graph
+
+        handles = [layer.register_forward_pre_hook(pre_hook) for layer in self.model.model.layers]
+        try:
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def texts_to_tokens(self, prompts, n_intervene=0):
+        """
+        Args:
+            prompts: 1D list (N) of str
+            n_intervene: int, INTERVENE_TOKEN slots appended to every prompt's user content.
+
+        Returns:
+            2D list (N, L), ragged (no padding)
+        """
+        marker = f"<|vision_start|>{self.INTERVENE_TOKEN * n_intervene}<|vision_end|>" if n_intervene else ""
+        return [self.tokenizer(self.tokenizer.apply_chat_template([{"role": "user", "content": p + marker}], tokenize=False,add_generation_prompt=True, enable_thinking=False)).input_ids for p in prompts]
+
+    def predict_logits(self, kv_caches, input_tokens, x=None):
+        """
+        Args:
+            kv_caches: list (N) of DynamicCache, will be updated inplace.
+            input_tokens: 2D list (N, L), ragged; appended per sample.
+            x: (H, Lx, D) | None, written to the INTERVENE_TOKEN positions of input_tokens.
+
+        Returns:
+            (N, L, V) logits for each input_tokens.
+        """
         dev = self.device
-        past = [kv.get_seq_length() for kv in kv_caches]    # per-row length BEFORE append
-        q_lens = [len(t) for t in new_tokens]
-        input_ids = torch.tensor([list(itertools.chain.from_iterable(new_tokens))], device=dev)
-        position_ids = torch.tensor([[p for pa, q in zip(past, q_lens) for p in range(pa, pa + q)]], device=dev)  # (1, tot_q)
+        past = [kv.get_seq_length() for kv in kv_caches]    # per-sample length BEFORE append
+        q_lens = [len(t) for t in input_tokens]
+        input_ids = torch.tensor([list(itertools.chain.from_iterable(input_tokens))], device=dev)
+        position_ids = torch.tensor([[p for pa, q in zip(past, q_lens) for p in range(pa, pa + q)]], device=dev)  # (1, NL)
         cu_q = torch.tensor(list(itertools.accumulate(q_lens, initial=0)), dtype=torch.int32, device=dev)  # query offsets
         cu_k = torch.tensor(list(itertools.accumulate((pa + q for pa, q in zip(past, q_lens)), initial=0)), dtype=torch.int32, device=dev)
 
         # official black-box forward; our varlen state rides in as a kwarg, cache stays ours (use_cache=False)
         bundle = (kv_caches, cu_q, cu_k)
-        if self.guided:
-            bundle += (kv_caches_guidance,)             # guided kernel always gets the slot (may be None)
-        out = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=False, varlen=bundle)
-        return list(out.logits[0].split(q_lens))            # [ (q_len_i, vocab) ] per row
+        slots = (input_ids[0] == self.intervene_token_id).nonzero()[:, 0]   # (N*Lx,) into the packed axis
+        with self.intervene(x, slots):                      # no-op when x is None
+            out = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=False, varlen=bundle)
+        return list(out.logits[0].split(q_lens))            # [ (L_i, V) ] per sample
 
-    @torch.no_grad()
-    def predict_logits(self, kv_caches, input_tokens, kv_caches_guidance=None):
-        """last-token logits per row -> (batch, vocab), for sampling. Packs all rows into one varlen
-        sequence (no padding); advances caches."""
-        logits = self.logits_forward(kv_caches, input_tokens, kv_caches_guidance)
-        return torch.stack([lg[-1] for lg in logits])       # each row's last token -> (batch, vocab)
+    def log_probs(self, prompt_tokens, input_tokens, x=None):
+        """Scores input_tokens teacher-forced after prompt_tokens, on a fresh cache.
 
-    def log_probs(self, prompt_tokens, input_tokens, kv_caches_guidance=None):
-        """log P_theta(input_tokens | prompt_tokens, guidance): the summed next-token log-probability
-        of input_tokens teacher-forced after prompt_tokens (one packed row, fresh cache). A scalar,
-        differentiable -- backprop reaches a guidance x through hidden_states_to_kv_caches, so this is
-        a training signal, not for sampling. Sum (not mean) = the sequence log-prob; `.sum()` over the
-        per-token log-probs kept just before it if you want them per-token instead."""
-        P = len(prompt_tokens)
-        logits = self.logits_forward([DynamicCache()], [prompt_tokens + input_tokens], kv_caches_guidance)[0]
-        logits = logits[P - 1:-1].float()                   # (T, vocab): next-token logits over each input pos
+        Args:
+            prompt_tokens: 1D list (Lp)
+            input_tokens: 1D list (Lg)
+            x: (H, Lx, D) | None
+
+        Returns:
+            scalar: log P(input_tokens | prompt_tokens, x)
+        """
+        Lp = len(prompt_tokens)
+        logits = self.predict_logits([DynamicCache()], [prompt_tokens + input_tokens], x)[0]
+        logits = logits[Lp - 1:-1].float()                  # (Lg, V): next-token logits over each input pos
         ids = torch.tensor(input_tokens, device=self.device)
         return logits.log_softmax(dim=-1).gather(1, ids[:, None])[:, 0].sum()   # scalar: log P(input | prompt)
 
-    def tokens_to_caches(self, token_lists, kv_caches_guidance=None):
-        """ragged prompts -> (next-token logits, one fresh KV cache per row the caller owns)."""
-        kv_caches = [DynamicCache() for _ in token_lists]
-        logits = self.predict_logits(kv_caches, token_lists, kv_caches_guidance)
-        return logits, kv_caches                     # (batch, vocab), list[DynamicCache]
-
     def logits_to_tokens(self, logits, temperature):
-        """next-token logits (batch, vocab) -> sampled tokens (batch, 1)."""
+        """
+        Args:
+            logits: (N, V)
+            temperature: float, 0.0 = greedy.
+
+        Returns:
+            (N, 1) int64
+        """
         if temperature == 0.0:
             return logits.argmax(-1, keepdim=True)             # greedy
         probs = torch.softmax(logits / temperature, dim=-1)
-        return torch.multinomial(probs, num_samples=1)         # (batch, 1)
+        return torch.multinomial(probs, num_samples=1)         # (N, 1)
 
     def tokens_to_texts(self, token_lists):
-        """ragged list[list[int]] -> list[str] (decoded, special tokens stripped)."""
-        return [self.tok.decode(t, skip_special_tokens=True) for t in token_lists]
+        """
+        Args:
+            token_lists: 2D list (N, L), ragged
 
-    def generate(self, token_lists, kv_caches_guidance=None, max_new_tokens=128, temperature=0.7):
-        """ragged prompts -> ragged generated tokens per row. Owns the sampling loop: prefill, then
-        varlen decode a token per row until each hits eos or max_new_tokens. If kv_caches_guidance is
-        given, those position-less rows are injected on every forward (prefill + each step)."""
-        batch = len(token_lists)
-        logits, kv_caches = self.tokens_to_caches(token_lists, kv_caches_guidance)
-        tokens = self.logits_to_tokens(logits, temperature)
-        generated_tokens = [[t.item()] for t in tokens]           # seed: first sampled token per row
-        while max(len(g) for g in generated_tokens) < max_new_tokens and not all(g[-1] == self.tok.eos_token_id for g in generated_tokens):
-            logits = self.predict_logits(kv_caches, [[g[-1]] for g in generated_tokens], kv_caches_guidance)
-            tokens = self.logits_to_tokens(logits, temperature)
-            for i in range(batch):                                # append until (incl.) eos; eos = row's stop marker
-                if generated_tokens[i][-1] != self.tok.eos_token_id:
+        Returns:
+            1D list (N) of str, special tokens stripped.
+        """
+        return [self.tokenizer.decode(t, skip_special_tokens=True) for t in token_lists]
+
+    @torch.no_grad()
+    def generate(self, token_lists, x=None, max_new_tokens=128, temperature=0.7):
+        """
+        Args:
+            token_lists: 2D list (N, L).
+            x: (H, Lx, D) | None, intervention.
+            max_new_tokens: int cap per sample.
+            temperature: float, 0.0 = greedy.
+
+        Returns:
+            2D list (N, Lg) generated-only ids, ragged; each ends at eos or the cap.
+        """
+        N = len(token_lists)
+        kv_caches = [DynamicCache() for _ in token_lists]         # fresh per call; the prefill fills them
+        logits = self.predict_logits(kv_caches, token_lists, x)   # x rides in here only -- its k/v then lives in the cache
+        tokens = self.logits_to_tokens(torch.stack([lg[-1] for lg in logits]), temperature)
+        generated_tokens = [[t.item()] for t in tokens]           # seed: first sampled token per sample
+        while max(len(g) for g in generated_tokens) < max_new_tokens and not all(g[-1] == self.tokenizer.eos_token_id for g in generated_tokens):
+            logits = self.predict_logits(kv_caches, [[g[-1]] for g in generated_tokens])   # x already in the cache
+            tokens = self.logits_to_tokens(torch.stack([lg[-1] for lg in logits]), temperature)   # one query/sample
+            for i in range(N):                                    # append until (incl.) eos; eos = sample's stop marker
+                if generated_tokens[i][-1] != self.tokenizer.eos_token_id:
                     generated_tokens[i].append(tokens[i, 0].item())
         return generated_tokens

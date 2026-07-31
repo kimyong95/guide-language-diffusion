@@ -47,13 +47,13 @@ class BaseTrainer:
 
     @torch.no_grad()
     def build_prompt_tokens(self, user_prompt, system_prompt="You are a helpful assistant.", enable_thinking=True):
-        """Tokenize `user_prompt` into a batch-1 (1, P) input_ids tensor via the chat template,
+        """Tokenize `user_prompt` into a batch-1 (1, Lp) input_ids tensor via the chat template,
         prepending `system_prompt` as a system turn."""
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        return self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt", enable_thinking=enable_thinking).to(self.model.device).input_ids  # (1, P)
+        return self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt", enable_thinking=enable_thinking).to(self.model.device).input_ids  # (1, Lp)
 
     def strip_pads(self, tokens_list):
-        """Drop the pad tokens from each entry of `tokens_list` (a (B, L) batch or list of rows) ->
+        """Drop the pad tokens from each entry of `tokens_list` (a (N, L) batch or list of rows) ->
         list of unpadded 1-D token rows."""
         return [tokens[tokens != self.tokenizer.pad_token_id] for tokens in tokens_list]
 
