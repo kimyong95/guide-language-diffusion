@@ -16,17 +16,6 @@ FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/grpo.py", "Training configuration.")
 
 
-def completion_log_probs(model, context_tokens, generated_tokens):
-    """Per-token log-probs of `generated_tokens` continued from `context_tokens`, under `model`.
-
-    Both are 1-D unpadded token rows -> (Lg,) log-probs over the generated tokens only."""
-    input_tokens = torch.cat([context_tokens, generated_tokens])         # (L,)
-    logits = model(input_tokens.unsqueeze(0)).logits[0, :-1, :]           # (L-1, V)
-    log_probs = logits.float().log_softmax(dim=-1)
-    token_log_probs = log_probs.gather(1, input_tokens[1:, None]).squeeze(1)   # (L-1,)
-    return token_log_probs[context_tokens.shape[0] - 1:]                  # generated tokens only
-
-
 class Trainer(BaseTrainer, LoraMixin):
 
     def __init__(self, config):
@@ -67,43 +56,22 @@ class Trainer(BaseTrainer, LoraMixin):
 
     @torch.no_grad()
     def sampling_step(self, epoch):
-        self.model.eval()
+        self.pipeline.model.eval()
         cfg = self.config.sample
 
         self.train_dataset.subsample(epoch)
         training_data = []
         for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
-            prompt_texts = [
-                [{"role": "system", "content": self.task.SYSTEM_PROMPT}, {"role": "user", "content": self.task.prompt(int(data_id))}]
-                for data_id in data_ids
-            ]
-            prompt_tokens_data = self.tokenizer.apply_chat_template(
-                prompt_texts, tokenize=True, padding=True, add_generation_prompt=True,
-                return_dict=True, return_tensors="pt", enable_thinking=cfg.enable_thinking,
-            ).to(self.accelerator.device)
-            prompt_tokens, prompt_attention = prompt_tokens_data.input_ids, prompt_tokens_data.attention_mask  # (N_local_batch, Lp), left-padded
-            prompt_length = prompt_tokens.shape[1]
-
-            generated_tokens = self.model.generate(
-                prompt_tokens,
-                attention_mask=prompt_attention,
-                do_sample=True,
-                temperature=cfg.temperature,
-                top_k=0, top_p=1.0,
-                max_new_tokens=cfg.max_new_tokens,
-                use_cache=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )  # (N_local_batch, Lp + Lg), completions right-padded with pad_token_id
-
-            prompt_tokens = self.strip_pads(prompt_tokens)                          # N_local_batch x (Lp_i,)
-            generated_tokens = self.strip_eos(generated_tokens[:, prompt_length:])  # N_local_batch x (Lg_i,)
-            generated_texts = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            prompts = [self.task.prompt(int(data_id)) for data_id in data_ids]
+            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)  # 2D list (N_local_batch, Lp)
+            generated_tokens = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)            # 2D list (N_local_batch, Lg)
+            generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
             rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
 
             training_data.append({
                 "data_ids": data_ids,                 # (N_local_batch,)
-                "prompt_tokens": prompt_tokens,       # N_local_batch x (Lp_i,)
-                "generated_tokens": generated_tokens, # N_local_batch x (Lg_i,)
+                "prompt_tokens": prompt_tokens,       # 2D list (N_local_batch, Lp), ragged
+                "generated_tokens": generated_tokens, # 2D list (N_local_batch, Lg), ragged
                 "generated_texts": generated_texts,   # N_local_batch x str
                 "rewards": rewards,                   # (N_local_batch,)
             })
@@ -125,7 +93,7 @@ class Trainer(BaseTrainer, LoraMixin):
         return training_data
 
     def training_step(self, epoch, training_data):
-        self.model.train()
+        self.pipeline.model.train()
         cfg = self.config.train
         beta, clip_range = cfg.beta, cfg.clip_range
 
@@ -133,14 +101,14 @@ class Trainer(BaseTrainer, LoraMixin):
         advantages = training_data["advantages"]
 
         with torch.no_grad():
-            old_log_probs_list = [completion_log_probs(self.model, prompt_tokens, generated_tokens) for prompt_tokens, generated_tokens in zip(prompt_tokens_list, generated_tokens_list)]
+            old_log_probs_list = [self.pipeline.log_probs(prompt_tokens, generated_tokens) for prompt_tokens, generated_tokens in zip(prompt_tokens_list, generated_tokens_list)]
 
         losses, kls, grad_norm = [], [], torch.tensor(0.0)
         for prompt_tokens, generated_tokens, old_log_probs, advantage in zip(prompt_tokens_list, generated_tokens_list, old_log_probs_list, advantages):
-            with self.accelerator.accumulate(self.model_ddp):
-                log_probs = completion_log_probs(self.model_ddp, prompt_tokens, generated_tokens)
-                with self.model.disable_adapter(), torch.no_grad():
-                    ref_log_probs = completion_log_probs(self.model, prompt_tokens, generated_tokens)
+            with self.accelerator.accumulate(self.pipeline.model):
+                log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # (Lg,), through the adapter
+                with self.accelerator.unwrap_model(self.pipeline.model).disable_adapter(), torch.no_grad():
+                    ref_log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # same weights, adapter off
 
                 ref_log_ratio = torch.clamp(ref_log_probs - log_probs, min=-20, max=20)
                 kl = torch.clamp(torch.exp(ref_log_ratio) - ref_log_ratio - 1, min=-10, max=10)
@@ -152,7 +120,7 @@ class Trainer(BaseTrainer, LoraMixin):
 
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model_ddp.parameters(), cfg.max_grad_norm)
+                    grad_norm = self.accelerator.clip_grad_norm_(self.pipeline.model.parameters(), cfg.max_grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 

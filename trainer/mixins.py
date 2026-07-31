@@ -53,14 +53,12 @@ class LoraMixin:
             lora_alpha=self.config.lora.lora_alpha,
             target_modules=self.config.lora.target_modules,
         )
-        self.model = get_peft_model(self.model, self.lora_config)
+        self.pipeline.model = get_peft_model(self.pipeline.model, self.lora_config)
 
         if self.config.train.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            self.model.enable_input_require_grads()
+            self.pipeline.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            self.pipeline.model.enable_input_require_grads()
 
-        self.trainable_parameters = list(filter(lambda p: p.requires_grad, self.model.parameters()))
+        self.trainable_parameters = list(filter(lambda p: p.requires_grad, self.pipeline.model.parameters()))
         self.optimizer = torch.optim.AdamW(self.trainable_parameters, lr=self.config.train.learning_rate)
-
-        # Use self.model_ddp to sync gradients across processes
-        self.model_ddp, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self.pipeline.model, self.optimizer = self.accelerator.prepare(self.pipeline.model, self.optimizer)

@@ -5,8 +5,8 @@ import torch
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import tasks
+from pipeline import Pipeline
 
 
 class BaseTrainer:
@@ -15,7 +15,7 @@ class BaseTrainer:
         self.config = config
         self.setup_accelerator()
         self.setup_task()
-        self.setup_model()
+        self.setup_pipeline()
         self.log_code()
         self.text_table = {
             "sampling": wandb.Table(
@@ -37,37 +37,10 @@ class BaseTrainer:
     def setup_task(self):
         self.task = tasks.get_reward_fn(self.config.task)
 
-    def setup_model(self):
+    def setup_pipeline(self):
+        """Give each rank its own slice of the visible GPUs, so G ranks never contend for one device."""
         max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(self.accelerator.process_index, torch.cuda.device_count(), self.accelerator.num_processes)}
-
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model, padding_side="left")
-        self.model = AutoModelForCausalLM.from_pretrained(self.config.model, dtype=torch.bfloat16, attn_implementation="flash_attention_2",device_map="auto", max_memory=max_memory)
-        self.model.requires_grad_(False)
-        self.model.eval()
-
-    @torch.no_grad()
-    def build_prompt_tokens(self, user_prompt, system_prompt="You are a helpful assistant.", enable_thinking=True):
-        """Tokenize `user_prompt` into a batch-1 (1, Lp) input_ids tensor via the chat template,
-        prepending `system_prompt` as a system turn."""
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        return self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt", enable_thinking=enable_thinking).to(self.model.device).input_ids  # (1, Lp)
-
-    def strip_pads(self, tokens_list):
-        """Drop the pad tokens from each entry of `tokens_list` (a (N, L) batch or list of rows) ->
-        list of unpadded 1-D token rows."""
-        return [tokens[tokens != self.tokenizer.pad_token_id] for tokens in tokens_list]
-
-    def strip_eos(self, tokens_list):
-        """Truncate each entry of `tokens_list` after its first eos; entries without an eos are kept
-        whole -> list of 1-D token rows."""
-        eos_token_ids = torch.tensor(self.model.generation_config.eos_token_id, device=self.model.device)
-
-        stripped = []
-        for tokens in tokens_list:
-            eos_positions = torch.isin(tokens, eos_token_ids).nonzero(as_tuple=True)[0]
-            end = eos_positions[0].item() + 1 if eos_positions.numel() > 0 else tokens.shape[0]
-            stripped.append(tokens[:end])
-        return stripped
+        self.pipeline = Pipeline(self.config.model, max_memory=max_memory)
 
     def log_code(self):
         if not self.accelerator.is_main_process:
