@@ -11,15 +11,14 @@ def get_config():
     config.model = "Qwen/Qwen3-8B"
     config.task = "gsm8k"
 
-    # total objective evaluations: 100*16=1600 (max_epochs * sample.total_samples)
     config.sample = ml_collections.ConfigDict()
     config.sample.total_samples = 320     # N: total rollouts per epoch across all GPUs
-    config.sample.m = 64                  # unique questions per epoch; group size (generation batch) k = N/m = 8
-    config.sample.max_new_tokens = 4096  # bounds the teacher-forced backward pass -- no gradient checkpointing with an injected KV cache
+    config.sample.m = 64                  # unique questions per epoch; group size k = N/m = 5
+    config.sample.max_batch_size_per_device = 16
+    config.sample.max_new_tokens = 4096
     config.sample.enable_thinking = False
-    config.sample.noise_length = 8   # per-layer count Lx of injected KV rows; total optimized dims H*Lx*D
-    config.sample.temperature = 1.0  # rollouts must be stochastic: x is one deterministic parameter, so greedy
-    config.sample.top_p = 1.0        # decoding would give N identical samples and zero advantage spread
+    config.sample.n_intervene = 8 
+    config.sample.temperature = 1.0
 
     config.train = ml_collections.ConfigDict()
     config.train.learning_rate = 0.03

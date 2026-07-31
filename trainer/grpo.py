@@ -38,8 +38,6 @@ class Trainer(BaseTrainer, LoraMixin):
 
     @staticmethod
     def compute_advantages(data_ids, rewards):
-        """Group-normalized advantages: within each question's group, z-score the reward with
-        (reward - mean) / (std + 1e-6)."""
         advantages = torch.zeros_like(rewards)
         for data_id in set(data_ids):
             indices = [i for i, x in enumerate(data_ids) if x == data_id]
