@@ -7,10 +7,10 @@ kwarg; `use_cache=False` because we own the cache, and a custom attn-impl name b
 mask, so the kernel owns causality and sample isolation via cu_seqlens + causal=True.
 
 `texts_to_tokens(prompts, n_intervene=Lx)` appends `<|vision_start|><|image_pad|>*Lx<|vision_end|>`
-to the user content, and `intervene` overwrites those slots' hidden state with a per-layer x
-(H, Lx, D) at every decoder layer's input. They stay ordinary prompt positions with ordinary RoPE,
-so x is written once at prefill and its k/v then serves every decode step. `x=None` is a plain
-forward, so one Pipeline scores and generates both with and without an intervention.
+to the user content, and `intervene` overwrites those slots' hidden state with a per-sample,
+per-layer x (N, H, Lx, D) at every decoder layer's input. They stay ordinary prompt positions with
+ordinary RoPE, so x is written once at prefill and its k/v then serves every decode step. `x=None` is
+a plain forward, so one Pipeline scores and generates both with and without an intervention.
 
 Shape symbols -- L* is a length in tokens, N* a number of samples: H = layers, L = a sample's token
 length (L_i sample i's, Lk_i its cached length), NL = the packed axis (sum_i L_i over N samples),
@@ -114,9 +114,9 @@ class Pipeline:
         caller locates the slots -- this knows nothing about tokenization, packing or the kernel.
 
         Args:
-            x: (H, Lx, D) | None; row h replaces layer h's input. None registers no hooks.
-            positions: (N*Lx,) int64 indices along the sequence axis -- x's Lx slots tile over them,
-                one copy per sample, so the count must be a multiple of Lx.
+            x: (N, H, Lx, D) | None; row (i, h) replaces layer h's input at sample i's Lx slots. None
+                registers no hooks.
+            positions: (N*Lx,) int64 indices along the sequence axis, in sample order.
 
         Yields:
             None; the hooks are live inside the block and removed on exit. Differentiable in x.
@@ -124,11 +124,11 @@ class Pipeline:
         if x is None:
             yield
             return
-        N = positions.numel() // x.shape[1]                          # samples sharing this one x
+        assert positions.numel() == x.shape[0] * x.shape[2], f"{positions.numel()} slots for x (N={x.shape[0]}, Lx={x.shape[2]})"
 
         def pre_hook(layer, args):
             h = args[0]                                              # (N, L, D) residual stream -- (1, NL, D) when packed
-            src = einops.repeat(x[layer.self_attn.layer_idx], "lx d -> b (n lx) d", b=h.shape[0], n=N)
+            src = einops.repeat(x[:, layer.self_attn.layer_idx], "n lx d -> b (n lx) d", b=h.shape[0])
             return (h.index_copy(1, positions.to(h.device), src.to(h)),)  # new tensor: no in-place on the graph
 
         handles = [layer.register_forward_pre_hook(pre_hook) for layer in self.layers]
@@ -161,7 +161,7 @@ class Pipeline:
         Args:
             kv_caches: list (N) of DynamicCache | None, updated in place.
             input_tokens: 2D list (N, L), ragged; appended per sample.
-            x: (H, Lx, D) | None, written to the INTERVENE_TOKEN positions of input_tokens.
+            x: (N, H, Lx, D) | None, row i written to sample i's INTERVENE_TOKEN positions.
 
         Returns:
             (N, L, V) logits for each input_tokens.
@@ -187,16 +187,36 @@ class Pipeline:
         Args:
             prompt_tokens: list (Lp)
             input_tokens: list (Lg)
-            x: (H, Lx, D) | None
+            x: (1, H, Lx, D) | None -- one sample is scored, so N = 1
 
         Returns:
-            (Lg,) log P(input_tokens[j] | prompt_tokens, input_tokens[:j], x); sum for the sequence.
+            (Lg,) log P(input_tokens[l] | prompt_tokens, input_tokens[:l], x) for l in Lg
         """
         Lp = len(prompt_tokens)
         logits = self.predict_logits(None, [prompt_tokens + input_tokens], x)[0]
         logits = logits[Lp - 1:-1].float()                  # (Lg, V): next-token logits over each input pos
         ids = torch.tensor(input_tokens, device=logits.device)
         return logits.log_softmax(dim=-1).gather(1, ids[:, None])[:, 0]         # (Lg,)
+
+    def entropy(self, prompt_tokens, input_tokens, x=None):
+        """The next-token distribution's entropy along input_tokens, in one cache-free forward.
+
+        Mirrors log_probs' forward, but reads the whole distribution instead of the taken token: the
+        spread of what the model would have said at each position, not how it scored what it did say.
+
+        Args:
+            prompt_tokens: list (Lp)
+            input_tokens: list (Lg)
+            x: (1, H, Lx, D) | None -- one sample is scored, so N = 1
+
+        Returns:
+            (Lg,) H[P(. | prompt_tokens, input_tokens[:l], x)] in nats, for l in Lg
+        """
+        Lp = len(prompt_tokens)
+        logits = self.predict_logits(None, [prompt_tokens + input_tokens], x)[0]
+        logits = logits[Lp - 1:-1].float()                  # (Lg, V): next-token logits over each input pos
+        log_probs = logits.log_softmax(dim=-1)              # (Lg, V)
+        return -(log_probs.exp() * log_probs).sum(dim=-1)   # (Lg,)
 
     def logits_to_tokens(self, logits, temperature):
         """
@@ -227,7 +247,7 @@ class Pipeline:
         """
         Args:
             token_lists: 2D list (N, L).
-            x: (H, Lx, D) | None, intervention.
+            x: (N, H, Lx, D) | None, one intervention per sample.
             max_new_tokens: int cap per sample.
             temperature: float, 0.0 = greedy.
 

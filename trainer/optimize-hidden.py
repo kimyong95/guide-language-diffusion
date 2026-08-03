@@ -70,9 +70,11 @@ class Trainer(BaseTrainer):
         for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
             prompts = [self.task.prompt(int(data_id)) for data_id in data_ids]
             prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking, n_intervene=cfg.n_intervene)  # 2D list (N_local_batch, Lp)
-            generated_tokens = self.pipeline.generate(prompt_tokens, self.x, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)                                 # 2D list (N_local_batch, Lg)
+            x = einops.repeat(self.x, "h lx d -> n h lx d", n=len(prompt_tokens))                                                                                           # (N_local_batch, H, Lx, D)
+            generated_tokens = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)                                     # 2D list (N_local_batch, Lg)
             generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
             rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
+            entropies = torch.tensor([self.pipeline.entropy(prompt, generated, self.x[None]).mean().item() for prompt, generated in zip(prompt_tokens, generated_tokens)], device=self.accelerator.device, dtype=torch.float32)  # nats/token: mean over Lg
 
             training_data.append({
                 "data_ids": data_ids,                 # (N_local_batch,)
@@ -80,18 +82,20 @@ class Trainer(BaseTrainer):
                 "generated_tokens": generated_tokens, # 2D list (N_local_batch, Lg), ragged
                 "generated_texts": generated_texts,   # N_local_batch x str
                 "rewards": rewards,                   # (N_local_batch,)
+                "entropies": entropies,               # (N_local_batch,)
             })
 
         training_data = {key: concat([batch[key] for batch in training_data]) for key in training_data[0]}
 
         gathered_data_ids = self.accelerator.gather(training_data["data_ids"]).tolist()
         gathered_rewards = self.accelerator.gather(training_data["rewards"])
+        gathered_entropy = self.accelerator.gather(training_data["entropies"]).mean()
         gathered_texts = gather_object(training_data["generated_texts"])
         gathered_advantages = self.compute_advantages(gathered_data_ids, gathered_rewards)
         training_data["advantages"] = einops.rearrange(gathered_advantages, "(process batch) -> process batch", process=self.accelerator.num_processes)[self.accelerator.process_index]
 
         objective_evaluations = epoch * self.config.sample.total_samples
-        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling")
+        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/entropy": gathered_entropy.item()})
         self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_texts, stage="sampling")
 
         return training_data
@@ -104,7 +108,7 @@ class Trainer(BaseTrainer):
         self.optimizer.zero_grad()
         losses = []
         for prompt_tokens, generated_tokens, advantage in zip(prompt_tokens_list, generated_tokens_list, advantages):
-            log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens, self.x)  # (Lg,)
+            log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens, self.x[None])  # (Lg,)
             loss = -(advantage * log_probs.mean())                                        # length-normalized
             self.accelerator.backward(loss / N_local)  # accumulate; graph freed after each backward
             losses.append(loss.detach())

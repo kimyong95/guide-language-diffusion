@@ -65,6 +65,7 @@ class Trainer(BaseTrainer, LoraMixin):
             generated_tokens = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)            # 2D list (N_local_batch, Lg)
             generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
             rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
+            entropies = torch.tensor([self.pipeline.entropy(prompt, generated).mean().item() for prompt, generated in zip(prompt_tokens, generated_tokens)], device=self.accelerator.device, dtype=torch.float32)  # nats/token: mean over Lg
 
             training_data.append({
                 "data_ids": data_ids,                 # (N_local_batch,)
@@ -72,12 +73,14 @@ class Trainer(BaseTrainer, LoraMixin):
                 "generated_tokens": generated_tokens, # 2D list (N_local_batch, Lg), ragged
                 "generated_texts": generated_texts,   # N_local_batch x str
                 "rewards": rewards,                   # (N_local_batch,)
+                "entropies": entropies,               # (N_local_batch,)
             })
 
         training_data = {key: concat([batch[key] for batch in training_data]) for key in training_data[0]}
 
         gathered_data_ids = self.accelerator.gather(training_data["data_ids"]).tolist()
         gathered_rewards = self.accelerator.gather(training_data["rewards"])
+        gathered_entropy = self.accelerator.gather(training_data["entropies"]).mean()
         gathered_texts = gather_object(training_data["generated_texts"])
         gathered_advantages = self.compute_advantages(gathered_data_ids, gathered_rewards)
         training_data["advantages"] = einops.rearrange(gathered_advantages, "(process batch) -> process batch", process=self.accelerator.num_processes)[self.accelerator.process_index]
@@ -85,7 +88,7 @@ class Trainer(BaseTrainer, LoraMixin):
         group_reward_std = torch.stack([gathered_rewards[[i for i, x in enumerate(gathered_data_ids) if x == data_id]].std() for data_id in set(gathered_data_ids)]).mean()
 
         objective_evaluations = epoch * self.config.sample.total_samples
-        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/reward-group-std": group_reward_std.item()})
+        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/reward-group-std": group_reward_std.item(), "sampling/entropy": gathered_entropy.item()})
         self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_texts, stage="sampling")
 
         return training_data

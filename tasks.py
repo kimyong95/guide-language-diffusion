@@ -9,48 +9,42 @@ from pathlib import Path
 import re
 import tempfile
 import torch
+import yaml
 from accelerate.utils import gather_object
 from datasets import load_dataset
 from math_verify import parse, verify, ExprExtractionConfig
 
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git
+from openevolve.utils.code_utils import parse_full_rewrite
 class CirclePacking:
 
     EXAMPLE = Path(__file__).resolve().parent / "openevolve" / "examples" / "circle_packing"
+    CONFIG = EXAMPLE / "config_phase_1.yaml"
 
-    SYSTEM_PROMPT = inspect.cleandoc("""
-        You are an expert mathematician specializing in circle packing problems and computational
-        geometry. Your task is to improve a constructor function that directly produces a specific
-        arrangement of 26 circles in a unit square, maximizing the sum of their radii. The AlphaEvolve
-        paper achieved a sum of 2.635 for n=26.
+    SYSTEM_PROMPT = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))["prompt"]["system_message"].strip()
 
-        Key geometric insights:
-        - Circle packings often follow hexagonal patterns in the densest regions
-        - Maximum density for infinite circle packing is pi/(2*sqrt(3)) ~ 0.9069
-        - Edge effects make square container packing harder than infinite packing
-        - Circles can be placed in layers or shells when confined to a square
-        - Similar radius circles often form regular patterns, while varied radii allow better space use
-        - Perfect symmetry may not yield the optimal packing due to edge effects
-
-        Focus on designing an explicit constructor that places each circle in a specific position,
-        rather than an iterative search algorithm.
-    """)
-
+    # from openevolve/openevolve/prompts/defaults/full_rewrite_user.txt
     TASK_PROMPT = inspect.cleandoc("""
-        # Task
-        Rewrite the following code to maximize the sum of the 26 circle radii (higher score is better).
-
-        ```python
+        # Current Program
+        ```{language}
         {ref_code}
         ```
 
-        Rewrite the whole code, includes the main. Make sure your rewritten code maintains the same inputs and outputs as the original code, but with improved internal implementation, wraps in the python code block.
+        # Task
+        Rewrite the program to improve its sum_radii.
+        Provide the complete new program code.
+
+        IMPORTANT: Make sure your rewritten program maintains the same inputs and outputs
+        as the original program, but with improved internal implementation.
+
+        ```{language}
+        # Your rewritten program here
+        ```
     """)
 
     def __init__(self):
-        self.ref_code, self.best_reward = self.initial_code(), -math.inf
-        self.data = [None]
-        self.evaluate(None, self.ref_code)
+        self.ref_code = self.initial_code()
+        self.data = [self.TASK_PROMPT]
 
     @staticmethod
     @lru_cache(maxsize=1)
@@ -66,14 +60,17 @@ class CirclePacking:
         code = (CirclePacking.EXAMPLE / "initial_program.py").read_text(encoding="utf-8")
         return code
 
-    def prompt(self, _) -> str:
-        """Return the task prompt: embeds the best code so far as the code to rewrite."""
-        return self.TASK_PROMPT.format(ref_code=self.ref_code)
+    def prompt(self, data_id: int, ref_data = None) -> str:
 
-    def evaluate(self, _, response: str) -> float:
-        """Reward `response`: pull the rewritten code out of it and score that code with the openevolve
-        example evaluator. Also ratchets the best code so far."""
-        from openevolve.utils.code_utils import parse_full_rewrite
+        if ref_data is not None:
+            ref_code = parse_full_rewrite(ref_data, "python")
+        else:
+            ref_code = self.ref_code
+
+        return self.data[data_id].format(ref_code=ref_code, language="python")
+
+    def evaluate(self, data_id: int, response: str) -> float:
+        
         code = parse_full_rewrite(response, "python")
 
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
@@ -85,26 +82,7 @@ class CirclePacking:
             os.unlink(path)
         reward = float(metrics.get("combined_score", 0.0))
 
-        self.update_best(code, reward)
         return reward
-
-    def update_best(self, code: str, reward: float) -> None:
-        """Ratchet ref_code / best_reward against every process's newest (code, reward)."""
-        for gathered_code, gathered_reward in gather_object([(code, reward)]):
-            if gathered_reward > self.best_reward:
-                self.ref_code, self.best_reward = gathered_code, gathered_reward
-
-
-class Short:
-
-    SYSTEM_PROMPT = "You are a helpful assistant."
-    data = ["tell a story"]
-
-    def prompt(self, data_id) -> str:
-        return self.data[data_id]
-
-    def evaluate(self, _, response: str) -> float:
-        return 1-float(len(response))
 
 
 class GSM8K:
@@ -117,11 +95,11 @@ class GSM8K:
         dataset = load_dataset("openai/gsm8k", "main", split="train")
         self.data = [{'question':x, 'answer':y.split('####')[-1].strip()} for x,y in zip(dataset['question'], dataset['answer'])]
 
-    def prompt(self, data_id) -> str:
+    def prompt(self, data_id: int) -> str:
         """Return the user question for the item at data_id."""
         return self.data[data_id]["question"]
 
-    def evaluate(self, data_id, response: str) -> float:
+    def evaluate(self, data_id: int, response: str) -> float:
         match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
         if match is None: return 0
         answer = parse(match.group(1), extraction_config=[ExprExtractionConfig()])
@@ -131,7 +109,6 @@ class GSM8K:
 
 TASKS_CLS = {
     "circle-packing": CirclePacking,
-    "short": Short,
     "gsm8k": GSM8K,
 }
 
