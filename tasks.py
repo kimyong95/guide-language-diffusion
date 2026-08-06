@@ -12,7 +12,7 @@ import torch
 import yaml
 from accelerate.utils import gather_object
 from datasets import load_dataset
-from math_verify import parse, verify, ExprExtractionConfig
+from math_verify import parse, verify, ExprExtractionConfig, LatexExtractionConfig
 
 # git clone https://github.com/algorithmicsuperintelligence/openevolve.git
 from openevolve.utils.code_utils import parse_full_rewrite
@@ -91,6 +91,8 @@ class GSM8K:
         You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
     """)
 
+    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
+
     def __init__(self):
         dataset = load_dataset("openai/gsm8k", "main", split="train")
         self.data = [{'question':x, 'answer':y.split('####')[-1].strip()} for x,y in zip(dataset['question'], dataset['answer'])]
@@ -102,14 +104,64 @@ class GSM8K:
     def evaluate(self, data_id: int, response: str) -> float:
         match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
         if match is None: return 0
-        answer = parse(match.group(1), extraction_config=[ExprExtractionConfig()])
-        ground_truth = parse(self.data[data_id]["answer"], extraction_config=[ExprExtractionConfig()])
+        answer = parse(f"${match.group(1)}$", extraction_config=self.EXTRACTION_CONFIG)
+        ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
+        return 1 if verify(answer, ground_truth) else 0
+
+
+class AIME2024:
+
+    SYSTEM_PROMPT = inspect.cleandoc("""
+        You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
+    """)
+
+    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
+
+    def __init__(self):
+        dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
+        self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['problem'], dataset['answer'])]
+
+    def prompt(self, data_id: int) -> str:
+        """Return the user question for the item at data_id."""
+        return self.data[data_id]["question"]
+
+    def evaluate(self, data_id: int, response: str) -> float:
+        match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+        if match is None: return 0
+        answer = parse(f"${match.group(1)}$", extraction_config=self.EXTRACTION_CONFIG)
+        ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
+        return 1 if verify(answer, ground_truth) else 0
+
+
+class MATH500:
+
+    SYSTEM_PROMPT = inspect.cleandoc("""
+        You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
+    """)
+
+    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
+
+    def __init__(self):
+        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['problem'], dataset['answer'])]
+
+    def prompt(self, data_id: int) -> str:
+        """Return the user question for the item at data_id."""
+        return self.data[data_id]["question"]
+
+    def evaluate(self, data_id: int, response: str) -> float:
+        match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+        if match is None: return 0
+        answer = parse(f"${match.group(1)}$", extraction_config=self.EXTRACTION_CONFIG)
+        ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
         return 1 if verify(answer, ground_truth) else 0
 
 
 TASKS_CLS = {
     "circle-packing": CirclePacking,
     "gsm8k": GSM8K,
+    "aime-2024": AIME2024,
+    "math-500": MATH500,
 }
 
 def get_reward_fn(key: str):

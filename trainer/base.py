@@ -1,10 +1,11 @@
 import math
 import os
 import sys
+from datetime import timedelta
 import torch
 import wandb
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import InitProcessGroupKwargs, set_seed
 import tasks
 from pipeline import Pipeline
 
@@ -26,7 +27,10 @@ class BaseTrainer:
         self.best_reward = {}
 
     def setup_accelerator(self):
-        self.accelerator = Accelerator(log_with="wandb")
+        self.accelerator = Accelerator(
+            log_with="wandb",
+            kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=30))],  # ranks skew by a whole sampling batch
+        )
         self.accelerator.init_trackers(
             project_name="guide-language-diffusion",
             config=self.config,
