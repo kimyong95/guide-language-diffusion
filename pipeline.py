@@ -1,4 +1,4 @@
-"""Varlen KV-cache pipeline over Qwen3, with an optional per-layer intervention.
+"""Varlen KV-cache pipeline over Qwen3, with an optional hidden-state intervention.
 
 A custom attention kernel registered via `AttentionInterface.register` keeps one ragged KV cache per
 sample and attends the whole batch in a single `flash_attn_varlen_func` call -- no padding. Qwen3's
@@ -7,8 +7,8 @@ kwarg; `use_cache=False` because we own the cache, and a custom attn-impl name b
 mask, so the kernel owns causality and sample isolation via cu_seqlens + causal=True.
 
 `texts_to_tokens(prompts, n_intervene=Lx)` appends `<|vision_start|><|image_pad|>*Lx<|vision_end|>`
-to the user content, and `intervene` overwrites those slots' hidden state with a per-sample,
-per-layer x (N, H, Lx, D) at every decoder layer's input. They stay ordinary prompt positions with
+to the user content, and `intervene` overwrites those slots' hidden state with a per-sample
+x (N, Lx, D) -- the same x at all H decoder layers' input. They stay ordinary prompt positions with
 ordinary RoPE, so x is written once at prefill and its k/v then serves every decode step. `x=None` is
 a plain forward, so one Pipeline scores and generates both with and without an intervention.
 
@@ -109,12 +109,13 @@ class Pipeline:
     def intervene(self, x, positions):
         """Overwrites the hidden state at `positions` with x at every decoder layer's input.
 
-        Layer 0's input is the embedding itself, so one pre-hook per layer covers all H rows of x;
-        Qwen3 then computes those positions' k/v (with RoPE) from x as it would for any token. The
-        caller locates the slots -- this knows nothing about tokenization, packing or the kernel.
+        One pre-hook per layer re-writes the same x at all H layers, so the slots never carry a
+        layer's own output forward; Qwen3 computes each layer's k/v (with RoPE) from x as it would
+        for any token. The caller locates the slots -- this knows nothing about tokenization,
+        packing or the kernel.
 
         Args:
-            x: (N, H, Lx, D) | None; row (i, h) replaces layer h's input at sample i's Lx slots. None
+            x: (N, Lx, D) | None; row i replaces every layer's input at sample i's Lx slots. None
                 registers no hooks.
             positions: (N*Lx,) int64 indices along the sequence axis, in sample order.
 
@@ -124,11 +125,11 @@ class Pipeline:
         if x is None:
             yield
             return
-        assert positions.numel() == x.shape[0] * x.shape[2], f"{positions.numel()} slots for x (N={x.shape[0]}, Lx={x.shape[2]})"
+        assert positions.numel() == x.shape[0] * x.shape[1], f"{positions.numel()} slots for x (N={x.shape[0]}, Lx={x.shape[1]})"
 
         def pre_hook(layer, args):
             h = args[0]                                              # (N, L, D) residual stream -- (1, NL, D) when packed
-            src = einops.repeat(x[:, layer.self_attn.layer_idx], "n lx d -> b (n lx) d", b=h.shape[0])
+            src = einops.repeat(x, "n lx d -> b (n lx) d", b=h.shape[0])
             return (h.index_copy(1, positions.to(h.device), src.to(h)),)  # new tensor: no in-place on the graph
 
         handles = [layer.register_forward_pre_hook(pre_hook) for layer in self.layers]
@@ -161,7 +162,7 @@ class Pipeline:
         Args:
             kv_caches: list (N) of DynamicCache | None, updated in place.
             input_tokens: 2D list (N, L), ragged; appended per sample.
-            x: (N, H, Lx, D) | None, row i written to sample i's INTERVENE_TOKEN positions.
+            x: (N, Lx, D) | None, row i written to sample i's INTERVENE_TOKEN positions.
 
         Returns:
             (N, L, V) logits for each input_tokens.
@@ -187,7 +188,7 @@ class Pipeline:
         Args:
             prompt_tokens: list (Lp)
             input_tokens: list (Lg)
-            x: (1, H, Lx, D) | None -- one sample is scored, so N = 1
+            x: (1, Lx, D) | None -- one sample is scored, so N = 1
 
         Returns:
             (Lg,) log P(input_tokens[l] | prompt_tokens, input_tokens[:l], x) for l in Lg
@@ -207,7 +208,7 @@ class Pipeline:
         Args:
             prompt_tokens: list (Lp)
             input_tokens: list (Lg)
-            x: (1, H, Lx, D) | None -- one sample is scored, so N = 1
+            x: (1, Lx, D) | None -- one sample is scored, so N = 1
 
         Returns:
             (Lg,) H[P(. | prompt_tokens, input_tokens[:l], x)] in nats, for l in Lg
@@ -247,7 +248,7 @@ class Pipeline:
         """
         Args:
             token_lists: 2D list (N, L).
-            x: (N, H, Lx, D) | None, one intervention per sample.
+            x: (N, Lx, D) | None, one intervention per sample.
             max_new_tokens: int cap per sample.
             temperature: float, 0.0 = greedy.
 

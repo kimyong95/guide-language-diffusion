@@ -24,9 +24,9 @@ class Trainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
 
-        H, D = self.pipeline.config.num_hidden_layers, self.pipeline.config.hidden_size
+        D = self.pipeline.config.hidden_size
         gen = torch.Generator().manual_seed(config.seed)
-        x = self.project_to_sphere(torch.randn(H, config.sample.n_intervene, D, generator=gen))
+        x = self.project_to_sphere(torch.randn(config.sample.n_intervene, D, generator=gen))
         self.x = x.to(self.accelerator.device, torch.float32).requires_grad_(True)  # fp32 master copy
         self.optimizer = torch.optim.Adam([self.x], lr=config.train.learning_rate)
 
@@ -70,7 +70,7 @@ class Trainer(BaseTrainer):
         for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
             prompts = [self.task.prompt(int(data_id)) for data_id in data_ids]
             prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking, n_intervene=cfg.n_intervene)  # 2D list (N_local_batch, Lp)
-            x = einops.repeat(self.x, "h lx d -> n h lx d", n=len(prompt_tokens))                                                                                           # (N_local_batch, H, Lx, D)
+            x = einops.repeat(self.x, "lx d -> n lx d", n=len(prompt_tokens))                                                                                               # (N_local_batch, Lx, D)
             generated_tokens = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)                                     # 2D list (N_local_batch, Lg)
             generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
             rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
@@ -121,10 +121,10 @@ class Trainer(BaseTrainer):
         self.x.data = broadcast(self.x.data)  # keep x bit-identical across ranks
 
         with torch.no_grad():
-            gram = self.x @ self.x.mT / self.x.shape[-1]  # (H, Lx, Lx) cosines: the rows are on the sqrt(D) sphere
+            gram = self.x @ self.x.mT / self.x.shape[-1]  # (Lx, Lx) cosines: the rows are on the sqrt(D) sphere
             Lx = gram.shape[-1]
-            mean_cosine = (gram.sum(dim=(-2, -1)) - Lx) / (Lx * (Lx - 1))  # (H,), the diagonal is exactly 1
-            diversity = ((1 - mean_cosine) * (Lx - 1) / Lx).mean()
+            mean_cosine = (gram.sum() - Lx) / (Lx * (Lx - 1))  # the diagonal is exactly 1
+            diversity = (1 - mean_cosine) * (Lx - 1) / Lx
 
         loss_value = torch.stack(losses).mean()
         gathered_loss = self.accelerator.gather(loss_value.reshape(1)).mean().item()
