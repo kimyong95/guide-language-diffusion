@@ -1,6 +1,5 @@
 import sys
 
-import einops
 import torch
 from absl import flags
 from accelerate.utils import gather_object
@@ -83,7 +82,7 @@ class Trainer(BaseTrainer, LoraMixin):
         gathered_entropy = self.accelerator.gather(training_data["entropies"]).mean()
         gathered_texts = gather_object(training_data["generated_texts"])
         gathered_advantages = self.compute_advantages(gathered_data_ids, gathered_rewards)
-        training_data["advantages"] = einops.rearrange(gathered_advantages, "(process batch) -> process batch", process=self.accelerator.num_processes)[self.accelerator.process_index]
+        training_data["advantages"] = self.ungather(gathered_advantages)   # (N_local,)
 
         group_reward_std = torch.stack([gathered_rewards[[i for i, x in enumerate(gathered_data_ids) if x == data_id]].std() for data_id in set(gathered_data_ids)]).mean()
 

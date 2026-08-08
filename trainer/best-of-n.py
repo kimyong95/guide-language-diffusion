@@ -1,15 +1,3 @@
-"""Best-of-N baseline -- one greedy chain, no search and no model update.
-
-    for each epoch:
-        resps = [generate(prompt(ref_data=data.ref_data)) for _ in range(N)]
-        if max(evaluate(resps)) > data.reward: data = argmax(resps)
-
-The buffer is a single (ref_data, reward): the best among every sample ever drawn, so each epoch
-re-prompts N times with that one winner. The ratchet runs on the gathered pairs, which are
-identical on every rank, so all ranks agree on it without extra communication. m = 1, so the
-dataloader hands out the same single task item every time and sampling_step never re-subsamples.
-"""
-
 import math
 import sys
 
@@ -17,12 +5,11 @@ import torch
 from absl import flags
 from accelerate.utils import gather_object
 from ml_collections import config_flags
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+import problems
 from base import BaseTrainer
-from mixins import DistributedSubsampleDataset
-from utils import concat
+from utils import batch_slices, concat
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/best-of-n.py", "Training configuration.")
@@ -33,18 +20,14 @@ class Trainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
 
-        self.train_dataset = DistributedSubsampleDataset(
-            all_data=self.task.data,
-            N=config.sample.total_samples,
-            G=self.accelerator.num_processes,
-            m=config.sample.m,
-            N_batch_max=config.sample.max_batch_size_per_device,
-            base_seed=config.seed,
-        )
-        training_dataloader = DataLoader(self.train_dataset, batch_size=self.train_dataset.N_local_batch, shuffle=False)
-        self.training_dataloader = self.accelerator.prepare(training_dataloader)
+        assert config.sample.total_samples % self.accelerator.num_processes == 0, f"total_samples ({config.sample.total_samples}) must be divisible by number of GPUs ({self.accelerator.num_processes})"
+
+        self.N_local = config.sample.total_samples // self.accelerator.num_processes
 
         self.data = {"ref_data": None, "reward": -math.inf}
+
+    def setup_task(self):
+        self.problem = problems.get_problem(self.config.problem)
 
     def run(self):
         for epoch in tqdm(range(1, self.config.max_epochs + 1), desc="Epochs", position=0, disable=not self.accelerator.is_main_process):
@@ -57,13 +40,13 @@ class Trainer(BaseTrainer):
         cfg = self.config.sample
 
         training_data = []
-        for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
-            prompts = [self.task.prompt(int(data_id), self.data["ref_data"]) for data_id in data_ids]
-            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)   # 2D list (N_local_batch, Lp)
+        for batch in tqdm(list(batch_slices(self.N_local, cfg.max_batch_size_per_device)), desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
+            prompts = [self.problem.prompt(self.data["ref_data"])] * (batch.stop - batch.start)
+            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.problem.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)   # 2D list (N_local_batch, Lp)
 
-            generated_tokens = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)             # 2D list (N_local_batch, Lg)
+            generated_tokens = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)                # 2D list (N_local_batch, Lg)
             generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
-            rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
+            rewards = torch.tensor([self.problem.evaluate(text) for text in generated_texts], device=self.accelerator.device, dtype=torch.float32)
 
             training_data.append({
                 "generated_texts": generated_texts,   # N_local_batch x str
