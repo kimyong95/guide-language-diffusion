@@ -61,10 +61,11 @@ class Trainer(BaseTrainer, LoraMixin):
         for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
             prompts = [self.task.prompt(int(data_id)) for data_id in data_ids]
             prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)  # 2D list (N_local_batch, Lp)
-            generated_tokens = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)            # 2D list (N_local_batch, Lg)
-            generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
+            generated_output = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)
+            generated_tokens = generated_output.tokens                                                                    # 2D list (N_local_batch, Lg)
+            generated_texts = generated_output.texts
             rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
-            entropies = torch.tensor([self.pipeline.entropy(prompt, generated).mean().item() for prompt, generated in zip(prompt_tokens, generated_tokens)], device=self.accelerator.device, dtype=torch.float32)  # nats/token: mean over Lg
+            entropies = generated_output.entropies   # (N_local_batch,) nats/token
 
             training_data.append({
                 "data_ids": data_ids,                 # (N_local_batch,)

@@ -44,8 +44,7 @@ class Trainer(BaseTrainer):
             prompts = [self.problem.prompt(self.data["ref_data"])] * (batch.stop - batch.start)
             prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.problem.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)   # 2D list (N_local_batch, Lp)
 
-            generated_tokens = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)                # 2D list (N_local_batch, Lg)
-            generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
+            generated_texts = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature).texts    # N_local_batch x str
             rewards = torch.tensor([self.problem.evaluate(text) for text in generated_texts], device=self.accelerator.device, dtype=torch.float32)
 
             training_data.append({

@@ -22,5 +22,6 @@ def get_config():
 
     config.train = ml_collections.ConfigDict()
     config.train.learning_rate = 0.03
+    config.train.gradient_checkpointing = True
 
     return config

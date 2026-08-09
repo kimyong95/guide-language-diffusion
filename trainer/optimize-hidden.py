@@ -24,6 +24,10 @@ class Trainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
 
+        if config.train.gradient_checkpointing:
+            # non-reentrant: x is written in by a layer hook, not passed in as a checkpointed input
+            self.pipeline.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
         D = self.pipeline.config.hidden_size
         gen = torch.Generator().manual_seed(config.seed)
         x = self.project_to_sphere(torch.randn(config.sample.n_intervene, D, generator=gen))
@@ -63,6 +67,7 @@ class Trainer(BaseTrainer):
 
     @torch.no_grad()
     def sampling_step(self, epoch):
+        self.pipeline.model.eval()   # checkpointing is gated on module.training: generate must not wrap all H layers on every decode step
         cfg = self.config.sample
 
         self.train_dataset.subsample(epoch)
@@ -71,10 +76,11 @@ class Trainer(BaseTrainer):
             prompts = [self.task.prompt(int(data_id)) for data_id in data_ids]
             prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking, n_intervene=cfg.n_intervene)  # 2D list (N_local_batch, Lp)
             x = einops.repeat(self.x, "lx d -> n lx d", n=len(prompt_tokens))                                                                                               # (N_local_batch, Lx, D)
-            generated_tokens = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)                                     # 2D list (N_local_batch, Lg)
-            generated_texts = self.pipeline.tokens_to_texts(generated_tokens)
+            generated_output = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)
+            generated_tokens = generated_output.tokens                                                                    # 2D list (N_local_batch, Lg)
+            generated_texts = generated_output.texts
             rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
-            entropies = torch.tensor([self.pipeline.entropy(prompt, generated, self.x[None]).mean().item() for prompt, generated in zip(prompt_tokens, generated_tokens)], device=self.accelerator.device, dtype=torch.float32)  # nats/token: mean over Lg
+            entropies = generated_output.entropies   # (N_local_batch,) nats/token
 
             training_data.append({
                 "data_ids": data_ids,                 # (N_local_batch,)
@@ -101,6 +107,7 @@ class Trainer(BaseTrainer):
         return training_data
 
     def training_step(self, epoch, training_data):
+        self.pipeline.model.train()   # arms gradient checkpointing; the base weights stay frozen and Qwen3 has no dropout
         prompt_tokens_list, generated_tokens_list = training_data["prompt_tokens"], training_data["generated_tokens"]
         advantages = training_data["advantages"]
         N_local = len(advantages)
@@ -108,9 +115,10 @@ class Trainer(BaseTrainer):
         self.optimizer.zero_grad()
         losses = []
         for prompt_tokens, generated_tokens, advantage in zip(prompt_tokens_list, generated_tokens_list, advantages):
-            log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens, self.x[None])  # (Lg,)
-            loss = -(advantage * log_probs.mean())                                        # length-normalized
-            self.accelerator.backward(loss / N_local)  # accumulate; graph freed after each backward
+            with self.pipeline.intervene([prompt_tokens + generated_tokens], self.x[None]):
+                log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)      # (Lg,)
+                loss = -(advantage * log_probs.mean())                                    # length-normalized
+                self.accelerator.backward(loss / N_local)  # accumulate; graph freed after each backward
             losses.append(loss.detach())
 
         self.x.grad = self.accelerator.reduce(self.x.grad, reduction="mean")
