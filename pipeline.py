@@ -2,7 +2,7 @@
 
 A custom attention kernel registered via `AttentionInterface.register` keeps one ragged KV cache per
 sample and attends the whole batch in a single `flash_attn_varlen_func` call -- no padding. Qwen3's
-own forward stack runs untouched around it, with our varlen state riding in as a `varlen=(...)`
+own forward stack runs untouched around it, with our varlen state riding in as a `varlen_kwargs={...}`
 kwarg; `use_cache=False` because we own the cache, and a custom attn-impl name builds no attention
 mask, so the kernel owns causality and sample isolation via cu_seqlens + causal=True.
 
@@ -50,7 +50,7 @@ def assemble_kv(kv_caches, key, value, cu_q, li):
     return torch.cat(k_full), torch.cat(v_full)
 
 
-def varlen_attention(module, query, key, value, attention_mask, **kwargs):
+def varlen_attention(module, query, key, value, attention_mask, varlen_kwargs, **kwargs):
     """Called by Qwen3Attention through the AttentionInterface registry, never by us directly.
 
     Args:
@@ -59,13 +59,13 @@ def varlen_attention(module, query, key, value, attention_mask, **kwargs):
         key: (1, heads_kv, NL, Dh)
         value: (1, heads_kv, NL, Dh)
         attention_mask: Always None.
-        **kwargs: varlen=(kv_caches: list (N) of DynamicCache | None, cu_q: (N+1,) int32,
-            cu_k: (N+1,) int32), bundled by Pipeline.predict_logits.
+        varlen_kwargs: {"kv_caches": list (N) of DynamicCache | None, "cu_q": (N+1,) int32,
+            "cu_k": (N+1,) int32}, bundled by Pipeline.predict_logits.
 
     Returns:
         ((NL, heads_q, Dh), None) -- the (attn_output, attn_weights) pair Qwen3Attention expects.
     """
-    kv_caches, cu_q, cu_k = kwargs["varlen"]                        # our one bundled kwarg
+    kv_caches, cu_q, cu_k = varlen_kwargs["kv_caches"], varlen_kwargs["cu_q"], varlen_kwargs["cu_k"]
     k, v = assemble_kv(kv_caches, key, value, cu_q, module.layer_idx)   # (sum Lk_i, heads_kv, Dh)
     max_q = (cu_q[1:] - cu_q[:-1]).max().item()
     max_k = (cu_k[1:] - cu_k[:-1]).max().item()
@@ -176,10 +176,10 @@ class Pipeline:
         cu_k = torch.tensor(list(itertools.accumulate((pa + q for pa, q in zip(past, q_lens)), initial=0)), dtype=torch.int32, device=dev)
 
         # official black-box forward; our varlen state rides in as a kwarg, cache stays ours (use_cache=False)
-        bundle = (kv_caches, cu_q, cu_k)
+        varlen_kwargs = dict(kv_caches=kv_caches, cu_q=cu_q, cu_k=cu_k)
         slots = (input_ids[0] == self.intervene_token_id).nonzero()[:, 0]   # (N*Lx,) into the packed axis
         with self.intervene(x, slots):                      # no-op when x is None
-            out = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=False, varlen=bundle)
+            out = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=False, varlen_kwargs=varlen_kwargs)
         return list(out.logits[0].split(q_lens))            # [ (L_i, V) ] per sample
 
     def log_probs(self, prompt_tokens, input_tokens, x=None):

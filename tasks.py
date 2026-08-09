@@ -3,6 +3,8 @@ import re
 from datasets import load_dataset
 from math_verify import parse, verify, ExprExtractionConfig, LatexExtractionConfig
 
+import problems
+
 
 class GSM8K:
 
@@ -76,10 +78,27 @@ class MATH500:
         return 1 if verify(answer, ground_truth) else 0
 
 
+class CirclePacking:
+    """problems.CirclePacking behind the task interface: one prompt, so the dataset is a single dummy item."""
+
+    SYSTEM_PROMPT = problems.CirclePacking.SYSTEM_PROMPT
+
+    def __init__(self):
+        self.problem = problems.CirclePacking()
+        self.data = [None]
+
+    def prompt(self, data_id: int) -> str:
+        return self.problem.prompt()
+
+    def evaluate(self, data_id: int, response: str) -> float:
+        return self.problem.evaluate(response)
+
+
 TASKS_CLS = {
     "gsm8k": GSM8K,
     "aime-2024": AIME2024,
     "math-500": MATH500,
+    "circle-packing": CirclePacking,
 }
 
 def get_reward_fn(key: str):
