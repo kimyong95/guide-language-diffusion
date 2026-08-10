@@ -86,18 +86,16 @@ class Trainer(BaseTrainer, LoraMixin):
 
         gathered_data_ids = self.accelerator.gather(training_data["data_ids"]).tolist()
         gathered_rewards = self.accelerator.gather(training_data["rewards"])
-        gathered_entropy = self.accelerator.gather(training_data["entropies"]).mean()
-        gathered_length = self.accelerator.gather(training_data["generated_lengths"]).mean()
+        gathered_entropy = self.accelerator.gather(training_data["entropies"])
+        gathered_length = self.accelerator.gather(training_data["generated_lengths"])
         gathered_texts = gather_object(training_data["generated_texts"])
         gathered_means, gathered_stds = self.compute_group_statistics(gathered_data_ids, gathered_rewards)
         training_data["reward_means"] = self.ungather(gathered_means)   # (N_local,)
         training_data["reward_stds"] = self.ungather(gathered_stds)     # (N_local,)
-        training_data["mean_generated_lengths"] = gathered_length.expand_as(training_data["rewards"])   # (N_local,), one batch-wide scalar broadcast so it rides through batches_dict
-
-        group_reward_std = gathered_stds.mean()   # every group has the same size k, so the sample mean equals the mean over groups
+        training_data["mean_generated_lengths"] = gathered_length.mean().expand_as(training_data["rewards"])
 
         objective_evaluations = epoch * self.config.sample.total_samples
-        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/reward-group-std": group_reward_std.item(), "sampling/entropy": gathered_entropy.item()})
+        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="sampling", extra={"sampling/entropy": gathered_entropy.mean().item()})
         self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_texts, stage="sampling")
 
         return training_data
