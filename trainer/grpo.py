@@ -107,16 +107,19 @@ class Trainer(BaseTrainer, LoraMixin):
         losses, kls, grad_norm = [], [], torch.tensor(0.0)
         for prompt_tokens, generated_tokens, old_log_probs, advantage in zip(prompt_tokens_list, generated_tokens_list, old_log_probs_list, advantages):
             with self.accelerator.accumulate(self.pipeline.model):
-                log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # (Lg,), through the adapter
+
+                cur_log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # (Lg,), through the adapter
+
+                ratio = torch.exp(cur_log_probs - old_log_probs)
+                clipped_ratio = torch.clamp(ratio, 1 - cfg.clip_ratio_low, 1 + cfg.clip_ratio_high)
+                clipped_ratio_advantage = torch.min(ratio * advantage, clipped_ratio * advantage)
+
                 with self.accelerator.unwrap_model(self.pipeline.model).disable_adapter(), torch.no_grad():
                     ref_log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # same weights, adapter off
+                ref_log_ratio = ref_log_probs - cur_log_probs
+                kl = torch.exp(ref_log_ratio) - ref_log_ratio - 1
 
-                ref_log_ratio = torch.clamp(ref_log_probs - log_probs, min=-20, max=20)
-                kl = torch.clamp(torch.exp(ref_log_ratio) - ref_log_ratio - 1, min=-10, max=10)
-                ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20, max=20))
-                clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                ppo_loss = torch.min(ratio * advantage, clipped_ratio * advantage)
-                ppo_loss = -(ppo_loss - beta * kl)
+                ppo_loss = - ( clipped_ratio_advantage - beta * kl )
                 loss = ppo_loss.mean()
 
                 self.accelerator.backward(loss)

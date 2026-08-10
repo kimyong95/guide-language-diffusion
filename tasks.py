@@ -6,76 +6,59 @@ from math_verify import parse, verify, ExprExtractionConfig, LatexExtractionConf
 import problems
 
 
-class GSM8K:
+class MathTask:
+    """DAPO's prompt format and Answer:-line grading; subclasses only supply self.data.
 
-    SYSTEM_PROMPT = inspect.cleandoc("""
-        You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
+    No system prompt: verl feeds the parquet's lone user turn straight to apply_chat_template,
+    leaving whatever system turn the model's own template injects (none, for Qwen3).
+    """
+
+    SYSTEM_PROMPT = None
+
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.
+
+        {question}
+
+        Remember to put your answer on its own line after "Answer:".
     """)
 
-    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
+    ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
 
-    def __init__(self):
-        dataset = load_dataset("openai/gsm8k", "main", split="train")
-        self.data = [{'question':x, 'answer':y.split('####')[-1].strip()} for x,y in zip(dataset['question'], dataset['answer'])]
+    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
 
     def prompt(self, data_id: int) -> str:
-        """Return the user question for the item at data_id."""
-        return self.data[data_id]["question"]
+        return self.PROMPT_TEMPLATE.format(question=self.data[data_id]["question"])
 
     def evaluate(self, data_id: int, response: str) -> float:
-        match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
-        if match is None: return 0
-        answer = parse(f"${match.group(1)}$", extraction_config=self.EXTRACTION_CONFIG)
+        matches = re.findall(self.ANSWER_PATTERN, response)
+        if not matches: return 0
+        answer = parse(f"${matches[-1].strip()}$", extraction_config=self.EXTRACTION_CONFIG)
         ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
-        return 1 if verify(answer, ground_truth) else 0
+        return 1 if verify(ground_truth, answer) else 0
 
 
-class AIME2024:
-
-    SYSTEM_PROMPT = inspect.cleandoc("""
-        You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
-    """)
-
-    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
+class DAPOMath17K(MathTask):
 
     def __init__(self):
-        dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
-        self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['problem'], dataset['answer'])]
-
-    def prompt(self, data_id: int) -> str:
-        """Return the user question for the item at data_id."""
-        return self.data[data_id]["question"]
-
-    def evaluate(self, data_id: int, response: str) -> float:
-        match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
-        if match is None: return 0
-        answer = parse(f"${match.group(1)}$", extraction_config=self.EXTRACTION_CONFIG)
-        ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
-        return 1 if verify(answer, ground_truth) else 0
+        dataset = load_dataset("open-r1/DAPO-Math-17k-Processed", "all", split="train")
+        self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['prompt'], dataset['solution'])]
 
 
-class MATH500:
+class AIME2024(MathTask):
+    """verl's DAPO validation file: 30 problems x 32 copies, deduplicated since repetition is the sampler's job."""
 
-    SYSTEM_PROMPT = inspect.cleandoc("""
-        You are a helpful assistant. Think and response the final answer, enclose the final answer by <answer> </answer> tags.
-    """)
+    def __init__(self):
+        dataset = load_dataset("BytedTsinghua-SIA/AIME-2024", split="train")
+        data = {x['index']: {'question':x['raw_problem'], 'answer':y['ground_truth'].strip()} for x,y in zip(dataset['extra_info'], dataset['reward_model'])}
+        self.data = list(data.values())
 
-    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
+
+class MATH500(MathTask):
 
     def __init__(self):
         dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
         self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['problem'], dataset['answer'])]
-
-    def prompt(self, data_id: int) -> str:
-        """Return the user question for the item at data_id."""
-        return self.data[data_id]["question"]
-
-    def evaluate(self, data_id: int, response: str) -> float:
-        match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
-        if match is None: return 0
-        answer = parse(f"${match.group(1)}$", extraction_config=self.EXTRACTION_CONFIG)
-        ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
-        return 1 if verify(answer, ground_truth) else 0
 
 
 class CirclePacking:
@@ -95,9 +78,9 @@ class CirclePacking:
 
 
 TASKS_CLS = {
-    "gsm8k": GSM8K,
     "aime-2024": AIME2024,
     "math-500": MATH500,
+    "dapo-math-17k": DAPOMath17K,
     "circle-packing": CirclePacking,
 }
 
