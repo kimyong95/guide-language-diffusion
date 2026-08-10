@@ -13,6 +13,15 @@ def concat(data: Union[List[torch.Tensor], List[List]]):
     else:
         raise ValueError(f"Unsupported data type: {type(data[0])}")
 
+def batches_dict(data, batch_size):
+    n = len(next(iter(data.values())))
+    for i in range(0, n, batch_size):
+        yield {k: v[i:i+batch_size] for k, v in data.items()}
+
+def iter_dict(data):
+    n = len(next(iter(data.values())))
+    for i in range(n):
+        yield {k: v[i] for k, v in data.items()}
 
 def batch_slices(total, max_batch_size):
     """Partition ``range(total)`` into contiguous chunks of at most ``max_batch_size``.
