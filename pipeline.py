@@ -1,25 +1,3 @@
-"""Varlen KV-cache pipeline over Qwen3, with an optional hidden-state intervention.
-
-A custom attention kernel registered via `AttentionInterface.register` keeps one ragged KV cache per
-sample and attends the whole batch in a single `flash_attn_varlen_func` call -- no padding. Qwen3's
-own forward stack runs untouched around it, with our varlen state riding in as a `varlen_kwargs={...}`
-kwarg; `use_cache=False` because we own the cache, and a custom attn-impl name builds no attention
-mask, so the kernel owns causality and sample isolation via cu_seqlens + causal=True.
-
-`texts_to_tokens(prompts, n_intervene=Lx)` appends `<|vision_start|><|image_pad|>*Lx<|vision_end|>`
-to the user content, and `intervene` overwrites those slots' hidden state with a per-sample
-x (N, Lx, D) -- the same x at all H decoder layers' input. They stay ordinary prompt positions with
-ordinary RoPE, so x is written once at prefill and its k/v then serves every decode step. `x=None` is
-a plain forward, so one Pipeline scores and generates both with and without an intervention. The
-caller holds the scope across the backward: gradient checkpointing re-runs a layer at backward time,
-through whatever hooks are live then.
-
-Shape symbols -- L* is a length in tokens, N* a number of samples: H = layers, L = a sample's token
-length (L_i sample i's, Lk_i its cached length), NL = the packed axis (sum_i L_i over N samples),
-Lp = prompt length, Lg = generated length, Lx = intervention slots, N = samples. Model dims:
-heads_q/heads_kv = attn/kv heads, Dh = head dim, D = hidden size, V = vocab.
-"""
-
 import contextlib
 import dataclasses
 import itertools
@@ -158,7 +136,7 @@ class Pipeline:
         Returns:
             2D list (N, L), ragged (no padding)
         """
-        intervention = f"<|vision_start|>{self.INTERVENE_TOKEN * n_intervene}<|vision_end|>" if n_intervene else ""
+        intervention = self.INTERVENE_TOKEN * n_intervene
         system = [{"role": "system", "content": system_prompt}] if system_prompt else []
         return [
             self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt + intervention}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
