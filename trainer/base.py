@@ -20,10 +20,11 @@ class BaseTrainer:
         self.setup_pipeline()
         self.log_code()
         self.text_table = {
-            "sampling": wandb.Table(
+            stage: wandb.Table(
                 columns=["objective-evaluations", "idx", "reward", "text"],
                 log_mode="INCREMENTAL",
-            ),
+            )
+            for stage in ("sampling", "validation")
         }
         self.best_reward = {}
 
@@ -40,12 +41,13 @@ class BaseTrainer:
         set_seed(self.config.seed, device_specific=True)
 
     def setup_task(self):
-        self.task = tasks.get_reward_fn(self.config.task)
+        self.sample_task = tasks.get_reward_fn(self.config.sample.task)
+        self.val_task = tasks.get_reward_fn(self.config.val.task)
 
     def setup_pipeline(self):
         """Give each rank its own slice of the visible GPUs, so G ranks never contend for one device."""
         max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(self.accelerator.process_index, torch.cuda.device_count(), self.accelerator.num_processes)}
-        self.pipeline = Pipeline(self.config.model, max_memory=max_memory)
+        self.pipeline = Pipeline(self.config.model.name, max_memory=max_memory)
 
     def log_code(self):
         if not self.accelerator.is_main_process:

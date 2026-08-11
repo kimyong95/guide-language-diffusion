@@ -9,16 +9,10 @@ from tqdm import tqdm
 
 from base import BaseTrainer
 from mixins import DistributedSubsampleDataset, LoraMixin
-from utils import concat, iter_dict
+from utils import clamp_preserve_grad, concat, iter_dict
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/rl-baseline.py:grpo", "Training configuration.")
-
-
-def clamp_preserve_grad(x, min_value):
-    """Clamp the forward value while keeping a non-zero gradient everywhere; a plain
-    torch.clamp would zero the gradient of exactly the tokens the clamp is protecting."""
-    return x + (x.clamp(min=min_value) - x).detach()
 
 
 class Trainer(BaseTrainer, LoraMixin):
@@ -27,16 +21,13 @@ class Trainer(BaseTrainer, LoraMixin):
         super().__init__(config)
         self.setup_lora_and_optimizer()
 
-        self.train_dataset = DistributedSubsampleDataset(
-            all_data=self.task.data,
-            N=config.sample.total_samples,
-            G=self.accelerator.num_processes,
-            m=config.sample.m,
-            N_batch_max=config.sample.max_batch_size_per_device,
-            base_seed=config.seed,
-        )
+        self.train_dataset = DistributedSubsampleDataset(all_data=self.sample_task.data,N=config.sample.total_samples,G=self.accelerator.num_processes,N_batch_max=config.model.max_batch_size_per_device,m=config.sample.m,base_seed=config.seed,)
         training_dataloader = DataLoader(self.train_dataset, batch_size=self.train_dataset.N_local_batch, shuffle=False)
         self.training_dataloader = self.accelerator.prepare(training_dataloader)
+
+        self.val_dataset = DistributedSubsampleDataset(all_data=self.val_task.data,N=-1,G=self.accelerator.num_processes,N_batch_max=config.model.max_batch_size_per_device,k=config.val.k,base_seed=config.seed,)
+        val_dataloader = DataLoader(self.val_dataset, batch_size=self.val_dataset.N_local_batch, shuffle=False)
+        self.val_dataloader = self.accelerator.prepare(val_dataloader)   # never re-subsampled, so every validation scores the same problems
 
         self.accelerator.gradient_accumulation_steps = self.train_dataset.N_local   # one update per epoch, so the update is strictly on-policy
 
@@ -49,26 +40,29 @@ class Trainer(BaseTrainer, LoraMixin):
         return means, stds
 
     def run(self):
+        self.validation_step(epoch=0)
         for epoch in tqdm(range(1, self.config.max_epochs + 1), desc="Epochs", position=0, disable=not self.accelerator.is_main_process):
             training_data = self.sampling_step(epoch)
             self.training_step(epoch=epoch, training_data=training_data)
+            if epoch % self.config.val.every_n_epochs == 0:
+                self.validation_step(epoch)
 
         self.accelerator.end_training()
 
     @torch.no_grad()
     def sampling_step(self, epoch):
         self.pipeline.model.eval()
-        cfg = self.config.sample
+        cfg = self.config.model
 
         self.train_dataset.subsample(epoch)
         training_data = []
         for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
-            prompts = [self.task.prompt(int(data_id)) for data_id in data_ids]
-            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)  # 2D list (N_local_batch, Lp)
+            prompts = [self.sample_task.prompt(int(data_id)) for data_id in data_ids]
+            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.sample_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)  # 2D list (N_local_batch, Lp)
             generated_output = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)
             generated_tokens = generated_output.tokens                                                                    # 2D list (N_local_batch, Lg)
             generated_texts = generated_output.texts
-            rewards = torch.tensor([self.task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
+            rewards = torch.tensor([self.sample_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
             entropies = generated_output.entropies   # (N_local_batch,) nats/token
             generated_lengths = torch.tensor([len(tokens) for tokens in generated_tokens], device=self.accelerator.device, dtype=torch.float32)
 
@@ -99,6 +93,39 @@ class Trainer(BaseTrainer, LoraMixin):
         self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_texts, stage="sampling")
 
         return training_data
+
+    @torch.no_grad()
+    def validation_step(self, epoch):
+        self.pipeline.model.eval()
+        cfg = self.config.model
+
+        val_data = []
+        for data_ids in tqdm(self.val_dataloader, desc="Validation", position=1, leave=False, disable=not self.accelerator.is_main_process):
+            prompts = [self.val_task.prompt(int(data_id)) for data_id in data_ids]
+            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.val_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)  # 2D list (N_local_batch, Lp)
+            generated_output = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)
+            generated_texts = generated_output.texts
+            rewards = torch.tensor([self.val_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
+            entropies = generated_output.entropies   # (N_local_batch,) nats/token
+
+            val_data.append({
+                "data_ids": data_ids,                 # (N_local_batch,)
+                "generated_texts": generated_texts,   # N_local_batch x str
+                "rewards": rewards,                   # (N_local_batch,)
+                "entropies": entropies,               # (N_local_batch,)
+            })
+
+        val_data = {key: concat([batch[key] for batch in val_data]) for key in val_data[0]}
+
+        gathered_data_ids = self.accelerator.gather(val_data["data_ids"]).tolist()
+        gathered_rewards = self.accelerator.gather(val_data["rewards"])
+        gathered_entropy = self.accelerator.gather(val_data["entropies"])
+        gathered_texts = gather_object(val_data["generated_texts"])
+        pass_at_k = torch.stack([gathered_rewards[[i for i, x in enumerate(gathered_data_ids) if x == data_id]].max() for data_id in set(gathered_data_ids)]).mean()
+
+        objective_evaluations = epoch * self.config.sample.total_samples
+        self.log_rewards(objective_evaluations=objective_evaluations, rewards=gathered_rewards, stage="validation", extra={"validation/pass-at-k": pass_at_k.item(), "validation/entropy": gathered_entropy.mean().item()})
+        self.log_texts(objective_evaluations=objective_evaluations, rewards=gathered_rewards, texts=gathered_texts, stage="validation")
 
     def training_step(self, epoch, training_data):
         self.pipeline.model.train()

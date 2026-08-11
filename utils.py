@@ -13,6 +13,11 @@ def concat(data: Union[List[torch.Tensor], List[List]]):
     else:
         raise ValueError(f"Unsupported data type: {type(data[0])}")
 
+def clamp_preserve_grad(input, min=None, max=None):
+    """Clamp the forward value while keeping a non-zero gradient everywhere; a plain
+    torch.clamp would zero the gradient of exactly the tokens the clamp is protecting."""
+    return input + (input.clamp(min=min, max=max) - input).detach()
+
 def batches_dict(data, batch_size):
     n = len(next(iter(data.values())))
     for i in range(0, n, batch_size):

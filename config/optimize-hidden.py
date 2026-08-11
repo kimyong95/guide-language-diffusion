@@ -8,20 +8,27 @@ def get_config():
 
     config.max_epochs = 1000
 
-    config.model = "Qwen/Qwen3-8B"
-    config.task = "gsm8k"
+    config.model = ml_collections.ConfigDict()
+    config.model.name = "Qwen/Qwen3-8B"
+    config.model.max_batch_size_per_device = 16
+    config.model.max_new_tokens = 20480
+    config.model.enable_thinking = False
+    config.model.temperature = 1.0
+    config.model.n_intervene = 8
 
     config.sample = ml_collections.ConfigDict()
-    config.sample.total_samples = 320     # N: total rollouts per epoch across all GPUs
-    config.sample.m = 64                  # unique questions per epoch; group size k = N/m = 5
-    config.sample.max_batch_size_per_device = 16
-    config.sample.max_new_tokens = 4096
-    config.sample.enable_thinking = False
-    config.sample.n_intervene = 8 
-    config.sample.temperature = 1.0
+    config.sample.task = "dapo-math-17k"
+    config.sample.total_samples = 512
+    config.sample.m = 32 # number of distinct prompts
+
+    config.val = ml_collections.ConfigDict()
+    config.val.task = "aime-2024"
+    config.val.every_n_epochs = 25
+    config.val.k = 32 # Pass@K
 
     config.train = ml_collections.ConfigDict()
-    config.train.learning_rate = 0.03
+    config.train.learning_rate = 0.1
+    config.train.epsilon = 1.0
     config.train.gradient_checkpointing = True
 
     return config

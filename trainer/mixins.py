@@ -7,29 +7,33 @@ from torch.utils.data import Dataset
 
 class DistributedSubsampleDataset(Dataset):
 
-    def __init__(self, all_data, N, G, m, N_batch_max, base_seed=0):
+    def __init__(self, all_data, N, G, N_batch_max, m=None, k=None, base_seed=0):
         # N_all         : total number of items
-        # N             : total samples per epoch (across all GPUs)
-        # m             : number of unique items sampled per epoch    (m == -1 → m = N; capped at N_all)
-        # k             : repetitions per item per epoch              (N = m*k)
+        # N             : total samples per epoch (across all GPUs)   (N == -1 → one pass over the dataset, N = N_all*k)
+        # m             : number of unique items sampled per epoch    (give exactly one of m, k; N = m*k fixes the other)
+        # k             : repetitions per item per epoch
         # G             : number of GPUs (processes)
         # N_local       : total samples per epoch per GPU             (N_local = N/G)
         # N_batch_max   : max batch size per GPU
         # N_local_batch : actual batch size per GPU                   (N_local_batch = min(N_batch_max, N/G))
         # K             : number of batches per epoch per GPU         (K = N_local//N_local_batch)
 
+        assert (m is None) != (k is None), "give exactly one of m and k; N = m*k fixes the other"
+        assert N != -1 or k is not None, "one pass over the dataset is sized by k, not m"
+
         self.all_data = all_data
         self.N_all = len(self.all_data)
         self.base_seed = base_seed
-        self.N = N if N != -1 else self.N_all
-        self.m = min(m if m != -1 else self.N, self.N_all)
+        self.N = N if N != -1 else self.N_all * k
+        self.m = m if m is not None else self.N // k
+        self.k = k if k is not None else self.N // self.m
         self.G = G
-        self.k = self.N // self.m
         self.N_local = self.N // self.G
         self.N_local_batch = min(N_batch_max, self.N_local)
         self.K = -(-self.N_local // self.N_local_batch)
 
-        assert self.N % self.m == 0, f"N ({self.N}) must be divisible by m ({self.m})"
+        assert self.m * self.k == self.N, f"N ({self.N}) must equal m ({self.m}) * k ({self.k})"
+        assert self.m <= self.N_all, f"m ({self.m}) must not exceed the dataset size ({self.N_all})"
         assert self.N % self.G == 0, f"N ({self.N}) must be divisible by number of GPUs ({self.G})"
 
         self.subsample(0)

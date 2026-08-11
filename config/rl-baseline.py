@@ -9,16 +9,22 @@ def get_config(algorithm="grpo"):
 
     config.max_epochs = 1000
 
-    config.model = "Qwen/Qwen3-8B"
-    config.task = "dapo-math-17k"
+    config.model = ml_collections.ConfigDict()
+    config.model.name = "Qwen/Qwen3-8B"
+    config.model.max_batch_size_per_device = 16
+    config.model.max_new_tokens = 20480
+    config.model.enable_thinking = True
+    config.model.temperature = 1.0
 
     config.sample = ml_collections.ConfigDict()
+    config.sample.task = "dapo-math-17k"
     config.sample.total_samples = 512
-    config.sample.m = 32
-    config.sample.max_batch_size_per_device = 16
-    config.sample.max_new_tokens = 20480
-    config.sample.enable_thinking = True
-    config.sample.temperature = 1.0
+    config.sample.m = 32 # number of distinct prompts
+
+    config.val = ml_collections.ConfigDict()
+    config.val.task = "aime-2024"
+    config.val.every_n_epochs = 25
+    config.val.k = 32 # Pass@K
 
     config.train = ml_collections.ConfigDict()
     config.train.learning_rate = 3e-6

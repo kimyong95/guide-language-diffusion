@@ -96,15 +96,15 @@ class Pipeline:
 
     INTERVENE_TOKEN = "<|image_pad|>"     # the prompt slot whose hidden state the caller optimizes
 
-    def __init__(self, model_id, max_memory=None):
+    def __init__(self, model_name, max_memory=None):
         """
         Args:
-            model_id: str HF repo id or local path.
+            model_name: str HF repo id or local path.
             max_memory: {device: bytes} | None, the devices to shard across; None = every visible GPU.
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         max_memory = max_memory or {i: torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())}
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation="varlen_attention", device_map="auto", max_memory=max_memory,).eval()
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, attn_implementation="varlen_attention", device_map="auto", max_memory=max_memory,).eval()
         self.model.requires_grad_(False)                 # only an intervention x or an adapter ever trains, never the base weights
         self.device = self.model.device
         self.intervene_token_id = self.tokenizer.convert_tokens_to_ids(self.INTERVENE_TOKEN)
