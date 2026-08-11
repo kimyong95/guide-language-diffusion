@@ -91,7 +91,8 @@ class Pipeline:
         # neither forwards these through. The decoder layers survive wrapping as the same objects.
         self.config = self.model.config
         self.layers = self.model.get_decoder().layers
-        self.eos_token_ids = self.model.generation_config.eos_token_id
+        eos = self.model.generation_config.eos_token_id      # int for a single stop token, list for several
+        self.eos_token_ids = eos if isinstance(eos, list) else [eos]
 
     @staticmethod
     def pack(input_tokens):

@@ -9,7 +9,7 @@ def get_config():
     config.max_epochs = 1000
 
     config.model = ml_collections.ConfigDict()
-    config.model.name = "Qwen3-1.7B-Base"
+    config.model.name = "Qwen/Qwen3-1.7B-Base"
     config.model.max_batch_size_per_device = 16
     config.model.max_new_tokens = 20480
     config.model.enable_thinking = False
