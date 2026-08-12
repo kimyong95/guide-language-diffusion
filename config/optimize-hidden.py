@@ -9,9 +9,9 @@ def get_config():
     config.max_epochs = 1000
 
     config.model = ml_collections.ConfigDict()
-    config.model.name = "Qwen/Qwen3-1.7B-Base"
+    config.model.name = "Qwen/Qwen3-1.7B"
     config.model.max_batch_size_per_device = 16
-    config.model.max_new_tokens = 20480
+    config.model.max_new_tokens = 4096
     config.model.enable_thinking = False
     config.model.temperature = 1.0
     config.model.n_intervene = 8
@@ -27,7 +27,7 @@ def get_config():
     config.val.k = 32 # Pass@K
 
     config.train = ml_collections.ConfigDict()
-    config.train.learning_rate = 0.1
+    config.train.learning_rate = 0.03
     config.train.epsilon = 1.0
     config.train.gradient_checkpointing = True
 
