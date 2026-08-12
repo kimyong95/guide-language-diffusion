@@ -32,7 +32,7 @@ class Trainer(BaseTrainer, LoraMixin):
         self.accelerator.gradient_accumulation_steps = self.train_dataset.N_local   # one update per epoch, so the update is strictly on-policy
 
     @staticmethod
-    def compute_group_statistics(data_ids, rewards):
+    def compute_reward_statistics(data_ids, rewards):
         means, stds = torch.zeros_like(rewards), torch.zeros_like(rewards)
         for data_id in set(data_ids):
             indices = [i for i, x in enumerate(data_ids) if x == data_id]
@@ -83,7 +83,7 @@ class Trainer(BaseTrainer, LoraMixin):
         gathered_entropy = self.accelerator.gather(training_data["entropies"])
         gathered_length = self.accelerator.gather(training_data["generated_lengths"])
         gathered_texts = gather_object(training_data["generated_texts"])
-        gathered_means, gathered_stds = self.compute_group_statistics(gathered_data_ids, gathered_rewards)
+        gathered_means, gathered_stds = self.compute_reward_statistics(gathered_data_ids, gathered_rewards)
         training_data["reward_means"] = self.ungather(gathered_means)   # (N_local,)
         training_data["reward_stds"] = self.ungather(gathered_stds)     # (N_local,)
         training_data["mean_generated_lengths"] = gathered_length.mean().expand_as(training_data["rewards"])
