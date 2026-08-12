@@ -207,7 +207,7 @@ class Pipeline:
         return [self.tokenizer.decode(t, skip_special_tokens=True) for t in token_lists]
 
     @torch.no_grad()
-    def generate(self, input_tokens, x=None, max_new_tokens=128, temperature=0.7):
+    def generate(self, input_tokens, x=None, max_new_tokens=128, temperature=1.0):
         """
         Args:
             input_tokens: 2D list (N, L), the prompts.
