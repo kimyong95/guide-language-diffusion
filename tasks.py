@@ -1,5 +1,7 @@
 import inspect
+import json
 import re
+from pathlib import Path
 from datasets import load_dataset
 from math_verify import parse, verify, ExprExtractionConfig, LatexExtractionConfig
 
@@ -60,7 +62,6 @@ class MATH500(MathTask):
         dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
         self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['problem'], dataset['answer'])]
 
-
 class CirclePacking:
     """problems.CirclePacking behind the task interface: one prompt, so the dataset is a single dummy item."""
 
@@ -84,7 +85,24 @@ TASKS_CLS = {
     "circle-packing": CirclePacking,
 }
 
-def get_reward_fn(key: str):
-    name, _, arg = key.partition(":")
-    cls = TASKS_CLS[name]
-    return cls(arg) if arg else cls()
+SLICE_STR_PATTERN = r"([^\[]+)(?:\[([-\d:]+)\])?"
+
+def slice_data(data, slice_str: str):
+    """
+    Args:
+        data: list
+        index: str, what stands inside the key's square bracket, e.g. ":10", "10:20", "0"
+    """
+    bounds = [int(b) if b else None for b in slice_str.split(":")]
+    return data[slice(*bounds)] if len(bounds) > 1 else [data[bounds[0]]]
+
+def get_reward_fn(task_name: str):
+    """
+    Args:
+        key: str, a TASKS_CLS name with an optional Python subscript, e.g. "math-500[:10]"
+    """
+    name, slide_str = re.fullmatch(SLICE_STR_PATTERN, task_name).groups()
+    task = TASKS_CLS[name]()
+    if slide_str is not None:
+        task.data = slice_data(task.data, slide_str)
+    return task
