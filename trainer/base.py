@@ -47,7 +47,7 @@ class BaseTrainer:
     def setup_pipeline(self):
         """Give each rank its own slice of the visible GPUs, so G ranks never contend for one device."""
         max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(self.accelerator.process_index, torch.cuda.device_count(), self.accelerator.num_processes)}
-        self.pipeline = Pipeline(self.config.model.name, max_memory=max_memory)
+        self.pipeline = Pipeline(self.config.model.name, max_memory=max_memory, temperature=self.config.model.temperature)
 
     def log_code(self):
         if not self.accelerator.is_main_process:
@@ -70,7 +70,7 @@ class BaseTrainer:
         Args:
             gathered: (N, ...) rank-major, N = num_processes * N_local
         """
-        return einops.rearrange(gathered, "(process n_local) ... -> process n_local ...", process=self.accelerator.num_processes)[self.accelerator.process_index]   # (N_local, ...)
+        return einops.rearrange(gathered, "(process N_local) ... -> process N_local ...", process=self.accelerator.num_processes)[self.accelerator.process_index]   # (N_local, ...)
 
     def log_rewards(self, objective_evaluations, rewards, stage, extra={}):
         self.best_reward[stage] = max(self.best_reward.get(stage, -math.inf), rewards.max().item())

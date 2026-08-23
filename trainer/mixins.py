@@ -1,6 +1,7 @@
 import random
 
 import torch
+from accelerate.utils import broadcast
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import Dataset
 
@@ -64,5 +65,6 @@ class LoraMixin:
             self.pipeline.model.enable_input_require_grads()
 
         self.trainable_parameters = list(filter(lambda p: p.requires_grad, self.pipeline.model.parameters()))
+        broadcast([parameter.data for parameter in self.trainable_parameters])
         self.optimizer = torch.optim.AdamW(self.trainable_parameters, lr=self.config.train.learning_rate)
-        self.pipeline.model, self.optimizer = self.accelerator.prepare(self.pipeline.model, self.optimizer)
+        self.optimizer = self.accelerator.prepare(self.optimizer)

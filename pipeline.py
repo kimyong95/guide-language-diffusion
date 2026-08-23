@@ -1,170 +1,163 @@
 import contextlib
 import dataclasses
-import itertools
 
-import einops
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache, AttentionInterface
-from flash_attn import flash_attn_varlen_func
+from einops import rearrange
+from transformers import AutoTokenizer, AutoModelForCausalLM, ContinuousBatchingConfig, GenerationConfig
 
 
-# ===================== our attention kernels (the only custom compute) =======
-def assemble_kv(kv_caches, key, value, cu_q, li):
+def intervene_token_id(position):
     """
     Args:
-        kv_caches: list (N) of DynamicCache | None, updated in place.
-        key: (1, heads_kv, NL, Dh)
-        value: (1, heads_kv, NL, Dh)
-        cu_q: (N+1,) int32
-        li: int layer index.
+        position: int, a slot's index into x flattened
 
     Returns:
-        (k, v), each (sum Lk_i, heads_kv, Dh) packed in sample order.
+        int, always negative so it cannot collide with a real token; -1 is left to the engine's own
+        TMP_TOKEN_ID. Its own inverse, so the same call maps a marked id back to the x row it reads.
     """
-    if kv_caches is None:
-        return key[0].transpose(0, 1), value[0].transpose(0, 1)    # Lk_i == L_i, already packed
-    k_full, v_full = [], []
-    for i, kv in enumerate(kv_caches):                             # per sample (varlen: batch is a python list)
-        ki, vi = kv.update(key[:, :, cu_q[i]:cu_q[i + 1]], value[:, :, cu_q[i]:cu_q[i + 1]], li)
-        k_full.append(ki[0].transpose(0, 1))                       # (Lk_i, heads_kv, Dh)
-        v_full.append(vi[0].transpose(0, 1))
-    return torch.cat(k_full), torch.cat(v_full)
-
-
-def varlen_attention(module, query, key, value, attention_mask, varlen_kwargs, **kwargs):
-    """Called by Qwen3Attention through the AttentionInterface registry, never by us directly.
-
-    Args:
-        module: Qwen3Attention
-        query: (1, heads_q, NL, Dh)
-        key: (1, heads_kv, NL, Dh)
-        value: (1, heads_kv, NL, Dh)
-        attention_mask: Always None.
-        varlen_kwargs: {"kv_caches": list (N) of DynamicCache | None, "cu_q": (N+1,) int32,
-            "cu_k": (N+1,) int32}, bundled by Pipeline.predict_logits.
-
-    Returns:
-        ((NL, heads_q, Dh), None) -- the (attn_output, attn_weights) pair Qwen3Attention expects.
-    """
-    kv_caches, cu_q, cu_k = varlen_kwargs["kv_caches"], varlen_kwargs["cu_q"], varlen_kwargs["cu_k"]
-    k, v = assemble_kv(kv_caches, key, value, cu_q, module.layer_idx)   # (sum Lk_i, heads_kv, Dh)
-    max_q = (cu_q[1:] - cu_q[:-1]).max().item()
-    max_k = (cu_k[1:] - cu_k[:-1]).max().item()
-    out = flash_attn_varlen_func(
-        query[0].transpose(0, 1).contiguous(),                     # (NL, heads_q, Dh)
-        k, v,
-        cu_q, cu_k, max_q, max_k,
-        softmax_scale=module.scaling, causal=True)                 # (NL, heads_q, Dh)
-    return out, None       # Qwen3Attention.forward reshapes (NL, heads_q, Dh) -> (1, NL, heads_q*Dh)
-
-
-AttentionInterface.register("varlen_attention", varlen_attention)
+    return -2 - position
 
 
 @dataclasses.dataclass
 class GenerateOutput:
     tokens: list              # 2D list (N, Lg), ragged
     texts: list               # list (N) of str
-    entropies: torch.Tensor   # (N,) nats/token, mean over each sample's Lg
+    entropies: torch.Tensor   # (N,) nats/token, from the log prob the engine reports for each sampled token
 
 
-# ===================== the loop's view: pack ragged tokens, get logits =======
 class Pipeline:
-    """ragged tokens + per-sample ragged caches (+ optional intervention) -> logits, generation, scoring (varlen)."""
+    """ragged tokens (+ optional intervention) -> paged generation, logits, scoring."""
 
-    INTERVENE_TOKEN = "<|image_pad|>"     # the prompt slot whose hidden state the caller optimizes
+    INTERVENE_TOKEN = "<|intervene_pad|>"    # marks a slot in the prompt; intervene relabels it per sample before any forward
 
-    def __init__(self, model_name, max_memory=None):
+    def __init__(self, model_name, max_memory=None, max_memory_percent=0.5, temperature=1.0):
         """
         Args:
             model_name: str HF repo id or local path.
             max_memory: {device: bytes} | None, the devices to shard across; None = every visible GPU.
+                The paged cache lives on one device, so this must resolve to a single GPU.
+            max_memory_percent: float, share of free memory the paged cache may take; the rest is left for
+                the scoring forwards, which run on the same card.
+            temperature: float, 0.0 = greedy. Fixed for the process: the engine binds it when it is built.
         """
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         max_memory = max_memory or {i: torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())}
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, attn_implementation="varlen_attention", device_map="auto", max_memory=max_memory,).eval()
-        self.model.requires_grad_(False)                 # only an intervention x or an adapter ever trains, never the base weights
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, attn_implementation="paged|flash_attention_2", device_map="auto", max_memory=max_memory,).eval()
+        self.model.requires_grad_(False)    # only an intervention x or an adapter ever trains, never the base weights
         self.device = self.model.device
-        self.intervene_token_id = self.tokenizer.convert_tokens_to_ids(self.INTERVENE_TOKEN)
 
-        # Read off the bare model now: a caller may replace self.model with a PEFT/DDP wrapper, and
-        # neither forwards these through. The decoder layers survive wrapping as the same objects.
         self.config = self.model.config
         self.layers = self.model.get_decoder().layers
-        eos = self.model.generation_config.eos_token_id      # int for a single stop token, list for several
+        eos = self.model.generation_config.eos_token_id
         self.eos_token_ids = eos if isinstance(eos, list) else [eos]
 
-    @staticmethod
-    def pack(input_tokens):
-        return list(itertools.chain.from_iterable(input_tokens))
+        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.INTERVENE_TOKEN]})
+        self.intervene_token_id = self.tokenizer.convert_tokens_to_ids(self.INTERVENE_TOKEN)
 
+        self.generation_config = GenerationConfig(
+            do_sample=temperature > 0,
+            temperature=temperature if temperature > 0 else 1.0,
+            top_k=0, top_p=1.0,      # off explicitly: Qwen3's own generation config would truncate to 20/0.95
+            eos_token_id=self.model.generation_config.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        self.cb_config = ContinuousBatchingConfig(
+            use_cuda_graph=(False, True),
+            allow_block_sharing=False,
+            max_memory_percent=max_memory_percent,
+            return_logprobs=True,
+        )
+
+    # ===================== the intervention =====================================
     @contextlib.contextmanager
-    def intervene(self, input_tokens, x):
+    def intervene(self, x, prompt_tokens):
         """
         Args:
-            input_tokens: 2D list (N, L), ragged; the batch the forward inside the block packs.
-            x: (N, Lx, D) | None; row i replaces every layer's input at sample i's Lx slots.
+            x: (N, Lx, D); row i replaces every layer's input at the Lx INTERVENE_TOKEN slots in prompt i.
+            prompt_tokens: 2D list (N, Lp), ragged; each holding Lx slots, where texts_to_tokens put them.
 
         Yields:
-            None; the hooks are live for the whole block, forward and backward.
+            2D list (N, Lp), the same prompts with every slot relabelled to the id of the x row it reads,
+            handed out in reading order. Every forward inside the block must be fed these, not the originals.
         """
-        if x is None:
-            yield
-            return
-        x_idx = (torch.tensor(self.pack(input_tokens), device=self.device) == self.intervene_token_id).nonzero()[:, 0]   # (N*Lx,) into the packed axis
-        assert x_idx.numel() == x.shape[0] * x.shape[1], f"{x_idx.numel()} slots for x (N={x.shape[0]}, Lx={x.shape[1]})"
+        N, Lx, _ = x.shape
+        intervene_token_ids = iter([intervene_token_id(nl) for nl in range(N * Lx)])    # x's rows flattened, so sample i takes i * Lx .. i * Lx + Lx - 1
+        intervene_prompt_tokens = [ [next(intervene_token_ids) if token == self.intervene_token_id else token for token in tokens] for tokens in prompt_tokens ]
+        state = {}
 
-        def pre_hook(layer, args):
-            h = args[0]                                              # (N, L, D) residual stream -- (1, NL, D) when packed
-            src = einops.repeat(x, "n lx d -> b (n lx) d", b=h.shape[0])
-            return (h.index_copy(1, x_idx.to(h.device), src.to(h)),)  # new tensor: no in-place on the graph
+        def compute_x_slots(module, args):
+            token_ids = args[0]                                                # (1, NL)
+            state["mask"] = (token_ids <= intervene_token_id(0))[..., None]    # (1, NL, 1)
+            state["x"] = rearrange(x, "N Lx D -> (N Lx) D")[intervene_token_id(token_ids).clamp(min=0)]    # (1, NL, D)
+            return token_ids.clamp(min=0)
 
-        handles = [layer.register_forward_pre_hook(pre_hook) for layer in self.layers]
+        def write_x(layer, args):
+            return torch.where(state["mask"], state["x"], args[0])
+
+        handles = [self.model.get_decoder().embed_tokens.register_forward_pre_hook(compute_x_slots)]
+        handles += [layer.register_forward_pre_hook(write_x) for layer in self.layers]
+
         try:
-            yield
+            yield intervene_prompt_tokens
         finally:
             for handle in handles:
                 handle.remove()
 
+    @contextlib.contextmanager
+    def unpaged(self):
+        """Swaps out the paged attention kernels, which need the engine's block tables, for ones a plain forward can run.
+
+        Yields:
+            None; the paged kernels are back on exit, which is what generate needs.
+        """
+        attn_implementation = self.config._attn_implementation
+        self.model.set_attn_implementation(attn_implementation.removeprefix("paged|"))
+        try:
+            yield
+        finally:
+            self.model.set_attn_implementation(attn_implementation)
+
+    # ===================== tokens =============================================
     def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False, n_intervene=0):
         """
         Args:
             prompts: list (N) of str
             system_prompt: str | None, prepended as a system turn; None omits the turn entirely.
             enable_thinking: bool, Qwen3's chat-template switch.
-            n_intervene: int, INTERVENE_TOKEN slots appended to every prompt's user content.
+            n_intervene: int, INTERVENE_TOKEN slots opening every prompt's user content; 0 omits them.
 
         Returns:
-            2D list (N, L), ragged (no padding)
+            2D list (N, Lp), ragged (no padding); intervene turns the slots into per-sample ids, and only a
+            forward inside that context may be fed a prompt still holding them.
         """
-        intervention = self.INTERVENE_TOKEN * n_intervene
         system = [{"role": "system", "content": system_prompt}] if system_prompt else []
+        intervention = self.INTERVENE_TOKEN * n_intervene    # its own token, so it also keeps a prompt's leading whitespace off the header's newline
         return [
-            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt + intervention}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
+            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": intervention + prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
             for prompt in prompts
         ]
 
-    def predict_logits(self, kv_caches, input_tokens):
+    def tokens_to_texts(self, token_lists):
         """
         Args:
-            kv_caches: list (N) of DynamicCache | None, updated in place.
-            input_tokens: 2D list (N, L), ragged; appended per sample.
+            token_lists: 2D list (N, L), ragged
 
         Returns:
-            (N, L, V) logits for each input_tokens.
+            list (N) of str, special tokens stripped.
         """
-        dev = self.device
-        past = [0] * len(input_tokens) if kv_caches is None else [kv.get_seq_length() for kv in kv_caches]  # per-sample length BEFORE append
-        q_lens = [len(t) for t in input_tokens]
-        input_ids = torch.tensor([self.pack(input_tokens)], device=dev)
-        position_ids = torch.tensor([[p for pa, q in zip(past, q_lens) for p in range(pa, pa + q)]], device=dev)  # (1, NL)
-        cu_q = torch.tensor(list(itertools.accumulate(q_lens, initial=0)), dtype=torch.int32, device=dev)  # query offsets
-        cu_k = torch.tensor(list(itertools.accumulate((pa + q for pa, q in zip(past, q_lens)), initial=0)), dtype=torch.int32, device=dev)
+        return [self.tokenizer.decode(t, skip_special_tokens=True) for t in token_lists]
 
-        # official black-box forward; our varlen state rides in as a kwarg, cache stays ours (use_cache=False)
-        varlen_kwargs = dict(kv_caches=kv_caches, cu_q=cu_q, cu_k=cu_k)
-        out = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=False, varlen_kwargs=varlen_kwargs)
-        return list(out.logits[0].split(q_lens))            # [ (L_i, V) ] per sample
+    # ===================== scoring (one sample, plain forward) =================
+    def predict_logits(self, tokens):
+        """
+        Args:
+            tokens: list (L), as yielded by intervene when one is live.
+
+        Returns:
+            (L, V) logits.
+        """
+        input_ids = torch.tensor([tokens], device=self.device)      # (1, L)
+        return self.model(input_ids=input_ids).logits[0]
 
     def log_probs(self, prompt_tokens, input_tokens):
         """Scores input_tokens teacher-forced after prompt_tokens, in one cache-free forward.
@@ -177,74 +170,28 @@ class Pipeline:
             (Lg,) log P(input_tokens[l] | prompt_tokens, input_tokens[:l]) for l in Lg
         """
         Lp = len(prompt_tokens)
-        logits = self.predict_logits(None, [prompt_tokens + input_tokens])[0]
-        logits = logits[Lp - 1:-1].float()                  # (Lg, V): next-token logits over each input pos
-        ids = torch.tensor(input_tokens, device=logits.device)
-        return logits.log_softmax(dim=-1).gather(1, ids[:, None])[:, 0]         # (Lg,)
+        logits = self.predict_logits(prompt_tokens + input_tokens)[Lp - 1:-1].float()    # (Lg, V): next-token logits over each input pos
+        return logits.log_softmax(dim=-1).gather(1, torch.tensor(input_tokens, device=logits.device)[:, None])[:, 0]         # (Lg,)
 
-    def logits_to_tokens(self, logits, temperature):
-        """
-        Args:
-            logits: (N, V)
-            temperature: float, 0.0 = greedy.
-
-        Returns:
-            (N, 1) int64
-        """
-        if temperature == 0.0:
-            return logits.argmax(-1, keepdim=True)             # greedy
-        probs = torch.softmax(logits / temperature, dim=-1)
-        return torch.multinomial(probs, num_samples=1)         # (N, 1)
-
-    def tokens_to_texts(self, token_lists):
-        """
-        Args:
-            token_lists: 2D list (N, L), ragged
-
-        Returns:
-            list (N) of str, special tokens stripped.
-        """
-        return [self.tokenizer.decode(t, skip_special_tokens=True) for t in token_lists]
-
+    # ===================== generation (the paged engine) =======================
     @torch.no_grad()
-    def generate(self, input_tokens, x=None, max_new_tokens=128, temperature=1.0):
+    def generate(self, prompt_tokens, x=None, max_new_tokens=128):
         """
         Args:
-            input_tokens: 2D list (N, L), the prompts.
-            x: (N, Lx, D) | None, one intervention per sample.
+            prompt_tokens: 2D list (N, Lp), ragged; with x None any INTERVENE_TOKEN slots stay as their own
+                untrained embedding row rather than becoming an intervention.
+            x: (N, Lx, D) | None, one intervention per sample, written at that sample's slots.
             max_new_tokens: int cap per sample.
-            temperature: float, 0.0 = greedy.
 
         Returns:
             GenerateOutput, ragged; each sample ends at eos (included) or the cap.
         """
-        input_tokens = list(input_tokens)           # local copy: entry i becomes sample i's last sampled token
-        kv_caches = [DynamicCache() for _ in input_tokens]
-        generated_tokens = [[] for _ in input_tokens]
-        entropies = [[] for _ in input_tokens]
+        with self.intervene(x, prompt_tokens) if x is not None else contextlib.nullcontext(prompt_tokens) as inputs:
+            outputs = self.model.generate_batch(inputs=inputs, max_new_tokens=max_new_tokens, generation_config=self.generation_config, continuous_batching_config=self.cb_config, progress_bar=False, persistent_manager=True)
 
-        def get_active_idx():
-            return [i for i, tokens in enumerate(generated_tokens) if not tokens or (tokens[-1] not in self.eos_token_ids and len(tokens) < max_new_tokens)]
+        assert len(outputs) == len(prompt_tokens), f"{len(prompt_tokens) - len(outputs)} requests never came back: the engine's thread died"
 
-        while active_idx := get_active_idx():
-            active_cache = [kv_caches[i] for i in active_idx]
-            active_tokens = [input_tokens[i] for i in active_idx]
-            with self.intervene(active_tokens, x):               # x rides in on the prefill; its k/v then lives in the cache
-                logits = self.predict_logits(active_cache, active_tokens)
-
-            logits = torch.stack([logit[-1] for logit in logits])    # (N_active, V)
-            tokens = self.logits_to_tokens(logits, temperature)
-            log_probs = logits.float().log_softmax(dim=-1)           # (N_active, V)
-            entropy = -(log_probs.exp() * log_probs).sum(dim=-1)     # (N_active,) at the model's own temperature, not the sampling one
-            for j, i in enumerate(active_idx):
-                generated_tokens[i].append(tokens[j, 0].item())
-                entropies[i].append(entropy[j])
-                input_tokens[i] = [generated_tokens[i][-1]]
-
-            x = None # no intervention after the prefill
-
-        return GenerateOutput(
-            tokens=generated_tokens,
-            texts=self.tokens_to_texts(generated_tokens),
-            entropies=torch.stack([torch.stack(entropy).mean() for entropy in entropies]),
-        )
+        # generate_batch returns its results already reordered into submission order
+        generated_tokens = [output.generated_tokens for output in outputs.values()]
+        entropies = torch.tensor([-sum(output.logprobs) / max(len(output.logprobs), 1) for output in outputs.values()], device=self.device)    # (N,) one sampled path, so an estimate rather than the full entropy
+        return GenerateOutput(tokens=generated_tokens, texts=self.tokens_to_texts(generated_tokens), entropies=entropies)

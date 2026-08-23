@@ -29,8 +29,6 @@ class Trainer(BaseTrainer, LoraMixin):
         val_dataloader = DataLoader(self.val_dataset, batch_size=self.val_dataset.N_local_batch, shuffle=False)
         self.val_dataloader = self.accelerator.prepare(val_dataloader)   # never re-subsampled, so every validation scores the same problems
 
-        self.accelerator.gradient_accumulation_steps = self.train_dataset.N_local   # one update per epoch, so the update is strictly on-policy
-
     @staticmethod
     def compute_reward_statistics(data_ids, rewards):
         means, stds = torch.zeros_like(rewards), torch.zeros_like(rewards)
@@ -59,7 +57,7 @@ class Trainer(BaseTrainer, LoraMixin):
         for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
             prompts = [self.sample_task.prompt(int(data_id)) for data_id in data_ids]
             prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.sample_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)  # 2D list (N_local_batch, Lp)
-            generated_output = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)
+            generated_output = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens)
             generated_tokens = generated_output.tokens                                                                    # 2D list (N_local_batch, Lg)
             generated_texts = generated_output.texts
             rewards = torch.tensor([self.sample_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
@@ -103,7 +101,7 @@ class Trainer(BaseTrainer, LoraMixin):
         for data_ids in tqdm(self.val_dataloader, desc="Validation", position=1, leave=False, disable=not self.accelerator.is_main_process):
             prompts = [self.val_task.prompt(int(data_id)) for data_id in data_ids]
             prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.val_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking)  # 2D list (N_local_batch, Lp)
-            generated_output = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature)
+            generated_output = self.pipeline.generate(prompt_tokens, max_new_tokens=cfg.max_new_tokens)
             generated_texts = generated_output.texts
             rewards = torch.tensor([self.val_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
             entropies = generated_output.entropies   # (N_local_batch,) nats/token
@@ -131,27 +129,28 @@ class Trainer(BaseTrainer, LoraMixin):
         self.pipeline.model.train()
         cfg = self.config.train
         algorithm = self.config.algorithm
+        N_local = len(training_data["rewards"])
 
         prompt_tokens_list, generated_tokens_list = training_data["prompt_tokens"], training_data["generated_tokens"]
 
-        with torch.no_grad():
-            training_data["old_log_probs"] = [self.pipeline.log_probs(prompt_tokens, generated_tokens) for prompt_tokens, generated_tokens in zip(prompt_tokens_list, generated_tokens_list)]
+        self.optimizer.zero_grad()
+        losses = []
+        with self.pipeline.unpaged():   # spans the backward: gradient checkpointing recomputes the layers there
+            with torch.no_grad():
+                training_data["old_log_probs"] = [self.pipeline.log_probs(prompt_tokens, generated_tokens) for prompt_tokens, generated_tokens in zip(prompt_tokens_list, generated_tokens_list)]
 
-        losses, grad_norm = [], torch.tensor(0.0)
-        for sample in iter_dict(training_data):   # log_probs takes one sequence at a time, so the micro-step is one sample and gradient_accumulation_steps is N_local
-            with self.accelerator.accumulate(self.pipeline.model):
-
+            for sample in iter_dict(training_data):   # log_probs takes one sequence at a time, so the adapter's grad accumulates over N_local backwards, one update per epoch
                 prompt_tokens, generated_tokens, old_log_probs = sample["prompt_tokens"], sample["generated_tokens"], sample["old_log_probs"]
                 reward, reward_mean, reward_std = sample["rewards"], sample["reward_means"], sample["reward_stds"]
                 mean_generated_length = sample["mean_generated_lengths"]
 
-                cur_log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # (Lg,), through the adapter
+                cur_log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # (Lg,)
                 log_ratio = cur_log_probs - old_log_probs                                  # (Lg,)
 
                 if algorithm == "grpo":
                     advantage = (reward - reward_mean) / (reward_std + 1e-6)
-                    with self.accelerator.unwrap_model(self.pipeline.model).disable_adapter(), torch.no_grad():
-                        ref_log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)   # same weights, adapter off
+                    with self.pipeline.model.disable_adapter(), torch.no_grad():
+                        ref_log_probs = self.pipeline.log_probs(prompt_tokens, generated_tokens)
                     ref_log_ratio = ref_log_probs - cur_log_probs
                     kl = torch.exp(ref_log_ratio) - ref_log_ratio - 1                                        # (Lg,)
                     ratio = torch.exp(log_ratio)
@@ -172,13 +171,13 @@ class Trainer(BaseTrainer, LoraMixin):
                     nft_loss = - (1 - reward_mean) * (reward * log_ratio + (1 - reward) * negative_log_ratio)   # (Lg,)
                     loss = nft_loss.sum() / mean_generated_length
 
-                self.accelerator.backward(loss)
-                if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.pipeline.model.parameters(), cfg.max_grad_norm)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
+                self.accelerator.backward(loss / N_local)
                 losses.append(loss.detach())
+
+        for parameter, gradient in zip(self.trainable_parameters, self.accelerator.reduce([parameter.grad for parameter in self.trainable_parameters], reduction="mean")):
+            parameter.grad = gradient
+        grad_norm = self.accelerator.clip_grad_norm_(self.trainable_parameters, cfg.max_grad_norm)
+        self.optimizer.step()
 
         loss_value = torch.stack(losses).mean().reshape(1)
         objective_evaluations = epoch * self.config.sample.total_samples
