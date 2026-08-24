@@ -4,10 +4,11 @@ import sys
 from datetime import timedelta
 import torch
 import wandb
+from pipeline import Pipeline
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, set_seed
 import tasks
-from pipeline import Pipeline
+
 
 
 class BaseTrainer:

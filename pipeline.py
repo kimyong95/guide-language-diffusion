@@ -1,7 +1,13 @@
 import contextlib
 import dataclasses
-
+import os
 import torch
+
+# Pins each rank to its own physical GPU before CUDA ever initializes, so each thread sees the correct device.
+if "LOCAL_RANK" in os.environ:
+    assert not torch.cuda.is_initialized(), "Please import Accelerator after this file."
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"].split(",")[int(os.environ["LOCAL_RANK"])]
+
 from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM, ContinuousBatchingConfig, GenerationConfig
 
