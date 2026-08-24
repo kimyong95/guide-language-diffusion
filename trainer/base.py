@@ -2,7 +2,6 @@ import math
 import os
 import sys
 from datetime import timedelta
-import einops
 import torch
 import wandb
 from accelerate import Accelerator
@@ -63,14 +62,6 @@ class BaseTrainer:
                     imported_py_files.add(abs_path)
 
         self.accelerator.get_tracker("wandb").run.log_code(".", include_fn=lambda path: path in imported_py_files)
-
-    def ungather(self, gathered):
-        """Inverse of accelerator.gather: rank r holds the block [r*N_local, (r+1)*N_local).
-
-        Args:
-            gathered: (N, ...) rank-major, N = num_processes * N_local
-        """
-        return einops.rearrange(gathered, "(process N_local) ... -> process N_local ...", process=self.accelerator.num_processes)[self.accelerator.process_index]   # (N_local, ...)
 
     def log_rewards(self, objective_evaluations, rewards, stage, extra={}):
         self.best_reward[stage] = max(self.best_reward.get(stage, -math.inf), rewards.max().item())

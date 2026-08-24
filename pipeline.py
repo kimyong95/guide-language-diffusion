@@ -29,6 +29,7 @@ class Pipeline:
     """ragged tokens (+ optional intervention) -> paged generation, logits, scoring."""
 
     INTERVENE_TOKEN = "<|intervene_pad|>"    # marks a slot in the prompt; intervene relabels it per sample before any forward
+    ATTN_IMPLEMENTATION = "flash_attention_2"    # what every forward runs on outside generate, which switches to the paged variant for as long as the engine holds the model
 
     def __init__(self, model_name, max_memory=None, max_memory_percent=0.5, temperature=1.0):
         """
@@ -42,7 +43,7 @@ class Pipeline:
         """
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         max_memory = max_memory or {i: torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())}
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, attn_implementation="paged|flash_attention_2", device_map="auto", max_memory=max_memory,).eval()
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, attn_implementation=self.ATTN_IMPLEMENTATION, device_map="auto", max_memory=max_memory,).eval()
         self.model.requires_grad_(False)    # only an intervention x or an adapter ever trains, never the base weights
         self.device = self.model.device
 
@@ -68,7 +69,8 @@ class Pipeline:
             return_logprobs=True,
         )
         self.cb_manager = self.model.init_continuous_batching(generation_config=self.generation_config, continuous_batching_config=self.cb_config)
-        self.cb_manager.warmup()
+        self.cb_manager.warmup()    # the paged cache and its graphs are taken here, before any plain forward has churned the allocator
+        self.model.set_attn_implementation(self.ATTN_IMPLEMENTATION)    # building the manager switched the model to the paged kernels, and only generate wants them
 
     # ===================== the intervention =====================================
     @contextlib.contextmanager
@@ -106,18 +108,19 @@ class Pipeline:
                 handle.remove()
 
     @contextlib.contextmanager
-    def unpaged(self):
-        """Swaps out the paged attention kernels, which need the engine's block tables, for ones a plain forward can run.
+    def paged(self):
+        """Hands the model to the engine: the paged attention kernels its block tables need, and a loop to run them.
 
         Yields:
-            None; the paged kernels are back on exit, which is what generate needs.
+            None; on exit the plain kernels are back, which is what a scoring forward needs, and the loop's
+            thread is gone, which is what the interpreter needs to exit at all.
         """
-        attn_implementation = self.config._attn_implementation
-        self.model.set_attn_implementation(attn_implementation.removeprefix("paged|"))
+        self.cb_manager.switch_to_paged_attn(self.model)
+        self.cb_manager.start()
         try:
             yield
         finally:
-            self.model.set_attn_implementation(attn_implementation)
+            self.cb_manager.stop(keep_for_next_session=True) # this will restore the attn_implementation
 
     # ===================== tokens =============================================
     def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False, n_intervene=0):
@@ -177,28 +180,21 @@ class Pipeline:
 
     # ===================== generation (the paged engine) =======================
     @torch.no_grad()
-    def generate(self, prompt_tokens, x=None, max_new_tokens=128):
+    def generate(self, prompt_tokens, x=None, max_new_tokens=1024):
         """
         Args:
-            prompt_tokens: 2D list (N, Lp), ragged; with x None any INTERVENE_TOKEN slots stay as their own
-                untrained embedding row rather than becoming an intervention.
-            x: (N, Lx, D) | None, one intervention per sample, written at that sample's slots.
-            max_new_tokens: int cap per sample.
+            prompt_tokens: 2D list (N, Lp)
+            x: (N, Lx, D) | None
 
         Returns:
             GenerateOutput, ragged; each sample ends at eos (included) or the cap.
         """
-        with self.intervene(x, prompt_tokens) if x is not None else contextlib.nullcontext(prompt_tokens) as inputs:
-            self.cb_manager.start()    # requests are only accepted while the loop is running
+        with self.intervene(x, prompt_tokens) if x is not None else contextlib.nullcontext(prompt_tokens) as inputs, self.paged():   # the hooks first, so nothing sits between the loop starting and its first request
             request_ids = self.cb_manager.add_requests(inputs=inputs, max_new_tokens=max_new_tokens)
             outputs = {}
-            while len(outputs) < len(request_ids) and self.cb_manager.is_running():
-                result = self.cb_manager.get_result(timeout=1)
-                if result is not None:
-                    outputs[result.request_id] = result
-            self.cb_manager.stop(keep_for_next_session=True)    # keeps the warmed-up cache and its graphs; the thread has to go, or the process cannot exit
-
-        assert len(outputs) == len(request_ids), f"{len(request_ids) - len(outputs)} requests never came back: the engine's thread died"
+            while len(outputs) < len(request_ids):
+                result = self.cb_manager.get_result()
+                outputs[result.request_id] = result
 
         outputs = [outputs[request_id] for request_id in request_ids]    # they come back in completion order; add_requests handed the ids out in submission order
         generated_tokens = [output.generated_tokens for output in outputs]
