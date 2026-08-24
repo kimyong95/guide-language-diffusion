@@ -56,8 +56,8 @@ class Pipeline:
 
         self.generation_config = GenerationConfig(
             do_sample=temperature > 0,
-            temperature=temperature if temperature > 0 else 1.0,
-            top_k=0, top_p=1.0,      # off explicitly: Qwen3's own generation config would truncate to 20/0.95
+            temperature=temperature,
+            top_k=0, top_p=1.0,
             eos_token_id=self.model.generation_config.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
@@ -67,6 +67,8 @@ class Pipeline:
             max_memory_percent=max_memory_percent,
             return_logprobs=True,
         )
+        self.cb_manager = self.model.init_continuous_batching(generation_config=self.generation_config, continuous_batching_config=self.cb_config)
+        self.cb_manager.warmup()
 
     # ===================== the intervention =====================================
     @contextlib.contextmanager
@@ -124,16 +126,16 @@ class Pipeline:
             prompts: list (N) of str
             system_prompt: str | None, prepended as a system turn; None omits the turn entirely.
             enable_thinking: bool, Qwen3's chat-template switch.
-            n_intervene: int, INTERVENE_TOKEN slots opening every prompt's user content; 0 omits them.
+            n_intervene: int, INTERVENE_TOKEN slots appended to the prompt's own user turn, right after the
+                prompt text and still inside the turn; 0 appends nothing.
 
         Returns:
             2D list (N, Lp), ragged (no padding); intervene turns the slots into per-sample ids, and only a
             forward inside that context may be fed a prompt still holding them.
         """
         system = [{"role": "system", "content": system_prompt}] if system_prompt else []
-        intervention = self.INTERVENE_TOKEN * n_intervene    # its own token, so it also keeps a prompt's leading whitespace off the header's newline
         return [
-            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": intervention + prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
+            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt + self.INTERVENE_TOKEN * n_intervene}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
             for prompt in prompts
         ]
 
@@ -187,11 +189,18 @@ class Pipeline:
             GenerateOutput, ragged; each sample ends at eos (included) or the cap.
         """
         with self.intervene(x, prompt_tokens) if x is not None else contextlib.nullcontext(prompt_tokens) as inputs:
-            outputs = self.model.generate_batch(inputs=inputs, max_new_tokens=max_new_tokens, generation_config=self.generation_config, continuous_batching_config=self.cb_config, progress_bar=False, persistent_manager=True)
+            self.cb_manager.start()    # requests are only accepted while the loop is running
+            request_ids = self.cb_manager.add_requests(inputs=inputs, max_new_tokens=max_new_tokens)
+            outputs = {}
+            while len(outputs) < len(request_ids) and self.cb_manager.is_running():
+                result = self.cb_manager.get_result(timeout=1)
+                if result is not None:
+                    outputs[result.request_id] = result
+            self.cb_manager.stop(keep_for_next_session=True)    # keeps the warmed-up cache and its graphs; the thread has to go, or the process cannot exit
 
-        assert len(outputs) == len(prompt_tokens), f"{len(prompt_tokens) - len(outputs)} requests never came back: the engine's thread died"
+        assert len(outputs) == len(request_ids), f"{len(request_ids) - len(outputs)} requests never came back: the engine's thread died"
 
-        # generate_batch returns its results already reordered into submission order
-        generated_tokens = [output.generated_tokens for output in outputs.values()]
-        entropies = torch.tensor([-sum(output.logprobs) / max(len(output.logprobs), 1) for output in outputs.values()], device=self.device)    # (N,) one sampled path, so an estimate rather than the full entropy
+        outputs = [outputs[request_id] for request_id in request_ids]    # they come back in completion order; add_requests handed the ids out in submission order
+        generated_tokens = [output.generated_tokens for output in outputs]
+        entropies = torch.tensor([-sum(output.logprobs) / max(len(output.logprobs), 1) for output in outputs], device=self.device)    # (N,) one sampled path, so an estimate rather than the full entropy
         return GenerateOutput(tokens=generated_tokens, texts=self.tokens_to_texts(generated_tokens), entropies=entropies)
