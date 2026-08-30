@@ -24,7 +24,7 @@ def get_config(algorithm="grpo"):
     config.val = ml_collections.ConfigDict()
     config.val.task = "aime-2024"
     config.val.every_n_epochs = 25
-    config.val.k = 4 # Pass@K
+    config.val.k = 8 # Pass@K
 
     config.train = ml_collections.ConfigDict()
     config.train.learning_rate = 3e-6

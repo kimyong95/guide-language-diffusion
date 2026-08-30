@@ -1,5 +1,8 @@
 from typing import List, Union
-
+import collections
+from functools import wraps
+import inspect
+from typing import List, Union
 import einops
 import torch
 from accelerate.utils import gather_object
@@ -82,3 +85,57 @@ def ungather(gathered, local_len, process_index):
     sizes = gather_object([local_len])
     start = sum(sizes[:process_index])
     return gathered[start:start + local_len]
+
+
+def func_cache(max_size: int = 1024):
+    """
+    A decorator to cache responses for batch functions at an item level with an LRU policy.
+    
+    Arguments with a value of `None` are ignored when creating the cache key.
+    
+    Assumes:
+    - The decorated function takes list arguments for batching.
+    - All list arguments representing the batch have the same length.
+    - The function returns a single value, a tensor or a list, whose first dimension is the batch size.
+    """
+    cache = collections.OrderedDict()
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 1. Bind args/kwargs and find batch size
+            bound_args = inspect.signature(func).bind(*args, **kwargs).arguments
+            batch_size = next((len(v) for v in bound_args.values() if isinstance(v, list)), 0)
+            if not batch_size: return func(*args, **kwargs)
+
+            # 2. Create a unique key for each item, ignoring None-valued arguments
+            scalar_args = tuple(sorted((k, v) for k, v in bound_args.items() if v is not None and not isinstance(v, list) ))
+            list_args = {k: v for k, v in bound_args.items() if v is not None and isinstance(v, list) and len(v) == batch_size}
+            keys = [scalar_args + tuple(sorted((k, v[i]) for k, v in list_args.items())) for i in range(batch_size)]
+
+            # 3. Separate cache hits from misses
+            results, miss_indices = [None] * batch_size, []
+            for i, key in enumerate(keys):
+                if key in cache:
+                    cache.move_to_end(key)
+                    results[i] = cache[key]
+                else:
+                    miss_indices.append(i)
+
+            # 4. Call the original function for misses using original arguments
+            if miss_indices:
+                miss_kwargs = {k: [v[i] for i in miss_indices] if k in list_args else v for k, v in bound_args.items()}
+                miss_results = func(**miss_kwargs)
+
+                # 5. Cache new results
+                for i, original_idx in enumerate(miss_indices):
+                    item_result = miss_results[i]
+                    results[original_idx] = item_result
+                    cache[keys[original_idx]] = item_result
+                    if len(cache) > max_size: cache.popitem(last=False)
+
+            # 6. Reconstruct the full batch tensor output
+            return torch.stack(results) if isinstance(results[0], torch.Tensor) else results
+
+        return wrapper
+    return decorator

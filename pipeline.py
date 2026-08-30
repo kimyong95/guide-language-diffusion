@@ -10,6 +10,7 @@ if "LOCAL_RANK" in os.environ:
 
 from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM, ContinuousBatchingConfig, GenerationConfig
+from utils import func_cache
 
 
 def intervene_token_id(position):
@@ -128,7 +129,7 @@ class Pipeline:
         finally:
             self.cb_manager.stop(keep_for_next_session=True) # this will restore the attn_implementation
 
-    # ===================== tokens =============================================
+    @func_cache()
     def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False, n_intervene=0):
         """
         Args:
@@ -140,13 +141,49 @@ class Pipeline:
 
         Returns:
             2D list (N, Lp), ragged (no padding); intervene turns the slots into per-sample ids, and only a
-            forward inside that context may be fed a prompt still holding them.
+            forward inside that context may be fed a prompt still holding them. Cached per prompt, so a
+            caller may ask for the same one every step rather than holding it.
         """
         system = [{"role": "system", "content": system_prompt}] if system_prompt else []
         return [
             self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt + self.INTERVENE_TOKEN * n_intervene}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
             for prompt in prompts
         ]
+
+    @func_cache()
+    @torch.no_grad()
+    def texts_to_embedding(self, prompts, layer, system_prompt=None, enable_thinking=False):
+        """
+        Args:
+            prompts: list (N) of str
+            layer: int, the decoder layer whose input is read
+            system_prompt: str | None
+            enable_thinking: bool
+
+        Returns:
+            (N, D) float32, the hidden state at each prompt's last token, which under the causal mask is the
+            only position that has read the whole prompt. There is no n_intervene: an embedding describes the
+            prompt alone, so it cannot move when x does. Cached per prompt, so only the prompts this call
+            has not seen reach a forward, and the batch is whatever the caller asks for at once.
+        """
+        prompt_tokens = self.texts_to_tokens(prompts, system_prompt=system_prompt, enable_thinking=enable_thinking)
+        lengths = torch.tensor([len(tokens) for tokens in prompt_tokens], device=self.device)                    # (N,)
+        input_ids = torch.full((len(prompt_tokens), int(lengths.max())), self.tokenizer.pad_token_id, device=self.device)
+        for i, tokens in enumerate(prompt_tokens):
+            input_ids[i, :len(tokens)] = torch.tensor(tokens, device=self.device)
+        attention_mask = torch.arange(input_ids.shape[1], device=self.device) < lengths[:, None]                 # (N, Lp) padded on the right, so a real token keeps the position id it would have had alone
+        state = {}
+
+        def capture(module, args):
+            state["hidden"] = args[0]                                                                            # (N, Lp, D)
+
+        handle = self.layers[layer].register_forward_pre_hook(capture)
+        try:
+            self.model.get_decoder()(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)    # the decoder alone, so neither the (N, Lp, V) the lm head would build nor the cache nothing here reads
+        finally:
+            handle.remove()
+
+        return state["hidden"][torch.arange(len(prompt_tokens), device=self.device), lengths - 1].float()
 
     def tokens_to_texts(self, token_lists):
         """
