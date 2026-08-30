@@ -1,7 +1,6 @@
 import inspect
 import json
 import re
-from pathlib import Path
 from datasets import load_dataset
 from math_verify import parse, verify, ExprExtractionConfig, LatexExtractionConfig
 
@@ -56,33 +55,34 @@ class AIME2024(MathTask):
         self.data = list(data.values())
 
 
+class AIME2025(MathTask):
+
+    def __init__(self):
+        dataset = load_dataset("MathArena/aime_2025", split="train")
+        self.data = [{'question':x, 'answer':str(y)} for x,y in zip(dataset['problem'], dataset['answer'])]
+
+
+class AIME2026(MathTask):
+
+    def __init__(self):
+        dataset = load_dataset("MathArena/aime_2026", split="train")
+        self.data = [{'question':x, 'answer':str(y)} for x,y in zip(dataset['problem'], dataset['answer'])]
+
+
 class MATH500(MathTask):
 
     def __init__(self):
         dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
         self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['problem'], dataset['answer'])]
 
-class CirclePacking:
-    """problems.CirclePacking behind the task interface: one prompt, so the dataset is a single dummy item."""
-
-    SYSTEM_PROMPT = problems.CirclePacking.SYSTEM_PROMPT
-
-    def __init__(self):
-        self.problem = problems.CirclePacking()
-        self.data = [None]
-
-    def prompt(self, data_id: int) -> str:
-        return self.problem.prompt()
-
-    def evaluate(self, data_id: int, response: str) -> float:
-        return self.problem.evaluate(response)
 
 
 TASKS_CLS = {
     "aime-2024": AIME2024,
+    "aime-2025": AIME2025,
+    "aime-2026": AIME2026,
     "math-500": MATH500,
     "dapo-math-17k": DAPOMath17K,
-    "circle-packing": CirclePacking,
 }
 
 SLICE_STR_PATTERN = r"([^\[]+)(?:\[([-\d:]+)\])?"
