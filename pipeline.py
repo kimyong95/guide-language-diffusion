@@ -38,7 +38,7 @@ class Pipeline:
     INTERVENE_TOKEN = "<|intervene_pad|>"    # marks a slot in the prompt; intervene relabels it per sample before any forward
     ATTN_IMPLEMENTATION = "flash_attention_2"    # what every forward runs on outside generate, which switches to the paged variant for as long as the engine holds the model
 
-    def __init__(self, model_name, max_memory=None, max_memory_percent=0.5, temperature=1.0):
+    def __init__(self, model_name, max_memory=None, max_memory_percent=0.5, temperature=1.0, top_p=1.0, top_k=0):
         """
         Args:
             model_name: str HF repo id or local path.
@@ -47,6 +47,8 @@ class Pipeline:
             max_memory_percent: float, share of free memory the paged cache may take; the rest is left for
                 the scoring forwards, which run on the same card.
             temperature: float, 0.0 = greedy. Fixed for the process: the engine binds it when it is built.
+            top_p: float, 1.0 keeps the whole distribution.
+            top_k: int, 0 keeps the whole distribution. Bound with temperature, and like it fixed for the process.
         """
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         max_memory = max_memory or {i: torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())}
@@ -65,7 +67,7 @@ class Pipeline:
         self.generation_config = GenerationConfig(
             do_sample=temperature > 0,
             temperature=temperature,
-            top_k=0, top_p=1.0,
+            top_k=top_k, top_p=top_p,
             eos_token_id=self.model.generation_config.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
