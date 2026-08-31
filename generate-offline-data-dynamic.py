@@ -14,7 +14,6 @@ from tasks import get_reward_fn
 from utils import gather
 
 MODEL = "Qwen/Qwen3-8B"
-K_INIT = 1           # a round smaller than the process count leaves the tail of the processes idle, so K_INIT = G wastes nothing
 MAX_NEW_TOKENS = 16384
 TEMPERATURE = 0.6    # Qwen3's own thinking-mode settings, with the two below; its MinP=0 filters nothing, so no min_p is set
 TOP_P = 0.95
@@ -24,13 +23,13 @@ SEED = 0
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--task", default="aime-2024")
-parser.add_argument("--k-max", type=int, default=4096)
+parser.add_argument("--k", type=int, default=16)
 args = parser.parse_args()
-TASK, K_MAX = args.task, args.k_max
+TASK, K = args.task, args.k
 
-OUT_PATH = f"test-data/{TASK}-pass@{K_MAX*2}.pt"   # the doubling redraws from scratch each round, so a question costs up to 2 * K_MAX samples
+OUT_PATH = f"test-data/{TASK}-pass@{K}.pt"   # a question gets one draw per step and at most K steps, so solving it at all is exactly pass@K
 
-accelerator = Accelerator(kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=60))])   # a round is one full generation long, and the processes only meet at its end
+accelerator = Accelerator(kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=60))])   # a step is one full generation long, and the processes only meet at its end
 set_seed(SEED, device_specific=True)
 G, g = accelerator.num_processes, accelerator.process_index
 
@@ -40,30 +39,29 @@ if accelerator.is_main_process:
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
 
 data = {"data_ids": [], "prompt_tokens": [], "generated_tokens": []}   # (N,) and two 2D ragged lists (N, Lp) / (N, Lg), one entry per solved question
-progress = tqdm(range(len(task.data)), desc="Sampling", disable=not accelerator.is_main_process)
-for data_id in progress:
-    prompt_tokens, = pipeline.texts_to_tokens([task.prompt(data_id)], system_prompt=task.SYSTEM_PROMPT, enable_thinking=ENABLE_THINKING)
+unsolved = list(range(len(task.data)))
+progress = tqdm(range(1, K + 1), desc="Sampling", disable=not accelerator.is_main_process)
+for step in progress:
+    local = unsolved[g * len(unsolved) // G:(g + 1) * len(unsolved) // G]   # a contiguous block of what is still open, empty once fewer questions remain than there are processes
 
-    k, correct = K_INIT, None
-    while correct is None and k <= K_MAX:
-        k_local = k // G + (g < k % G)   # the round's k copies split over the processes, as evenly as k allows
-        correct_local = None
-        if k_local:
-            generated_output = pipeline.generate([prompt_tokens] * k_local, max_new_tokens=MAX_NEW_TOKENS)   # k_local copies of one prompt, one completion each
-            correct_local = next((tokens for tokens, text in zip(generated_output.tokens, generated_output.texts) if task.evaluate(data_id, text)), None)
-        correct = next((tokens for tokens in gather([correct_local]) if tokens is not None), None)   # every process leaves the round holding the same answer, so they stay in step
-        k *= 2
+    solved = []
+    if local:
+        generated_output = pipeline.generate(pipeline.texts_to_tokens([task.prompt(data_id) for data_id in local], system_prompt=task.SYSTEM_PROMPT, enable_thinking=ENABLE_THINKING), max_new_tokens=MAX_NEW_TOKENS)   # one draw for each question in the block
+        solved = [(data_id, tokens) for data_id, tokens, text in zip(local, generated_output.tokens, generated_output.texts) if task.evaluate(data_id, text)]
 
-    progress.set_postfix(kept=len(data["data_ids"]), k=k // 2)
-    if correct is None:   # unsolved at K_MAX: the question contributes no entry
-        continue
+    solved = gather(solved)   # every process leaves the step holding the same answers, so they stay in step
+    data["data_ids"] += [data_id for data_id, _ in solved]
+    data["prompt_tokens"] += pipeline.texts_to_tokens([task.prompt(data_id) for data_id, _ in solved], system_prompt=task.SYSTEM_PROMPT, enable_thinking=ENABLE_THINKING)
+    data["generated_tokens"] += [tokens for _, tokens in solved]
+    solved_ids = {data_id for data_id, _ in solved}
+    unsolved = [data_id for data_id in unsolved if data_id not in solved_ids]
 
-    data["data_ids"].append(data_id)
-    data["prompt_tokens"].append(prompt_tokens)
-    data["generated_tokens"].append(correct)
-
+    progress.set_postfix(solved=len(data["data_ids"]), unsolved=len(unsolved))
     if accelerator.is_main_process:
         torch.save({**data, "data_ids": torch.tensor(data["data_ids"])}, OUT_PATH + ".tmp")   # write-then-rename: a crash mid-save leaves the last good file
         os.replace(OUT_PATH + ".tmp", OUT_PATH)
 
-accelerator.print(f"{len(data['data_ids'])}/{len(task.data)} questions solved -> {OUT_PATH}")
+    if not unsolved:
+        break
+
+accelerator.print(f"{len(data['data_ids'])}/{len(task.data)} questions solved in {step} steps -> {OUT_PATH}")
