@@ -4,8 +4,6 @@ import re
 from datasets import load_dataset
 from math_verify import parse, verify, ExprExtractionConfig, LatexExtractionConfig
 
-import problems
-
 
 class MathTask:
     """DAPO's prompt format and Answer:-line grading; subclasses only supply self.data.
