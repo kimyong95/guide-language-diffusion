@@ -67,27 +67,28 @@ class Trainer(BaseTrainer):
 
         self.train_dataset.subsample(epoch)
         training_data = []
-        for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
-            data_ids = data_ids.to(self.accelerator.device)
-            prompts = [self.sample_task.prompt(int(data_id)) for data_id in data_ids]
-            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.sample_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking, n_intervene=cfg.n_intervene)  # 2D list (N_local_batch, Lp)
-            x = einops.repeat(self.x.to(self.pipeline.model.dtype), "Lx D -> N Lx D", N=len(prompt_tokens))                                                                                                      # (N_local_batch, Lx, D)
-            generated_output = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens)
-            generated_tokens = generated_output.tokens                                                                    # 2D list (N_local_batch, Lg)
-            generated_texts = generated_output.texts
-            rewards = torch.tensor([self.sample_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
-            entropies = generated_output.entropies   # (N_local_batch,) nats/token
-            generated_lengths = torch.tensor([len(tokens) for tokens in generated_tokens], device=self.accelerator.device, dtype=torch.float32)
+        with self.pipeline.paged():
+            for data_ids in tqdm(self.training_dataloader, desc="Sampling", position=1, leave=False, disable=not self.accelerator.is_main_process):
+                data_ids = data_ids.to(self.accelerator.device)
+                prompts = [self.sample_task.prompt(int(data_id)) for data_id in data_ids]
+                prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.sample_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking, n_intervene=cfg.n_intervene)  # 2D list (N_local_batch, Lp)
+                x = einops.repeat(self.x.to(self.pipeline.model.dtype), "Lx D -> N Lx D", N=len(prompt_tokens))                                                                                                      # (N_local_batch, Lx, D)
+                generated_output = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens)
+                generated_tokens = generated_output.tokens                                                                    # 2D list (N_local_batch, Lg)
+                generated_texts = generated_output.texts
+                rewards = torch.tensor([self.sample_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
+                entropies = generated_output.entropies   # (N_local_batch,) nats/token
+                generated_lengths = torch.tensor([len(tokens) for tokens in generated_tokens], device=self.accelerator.device, dtype=torch.float32)
 
-            training_data.append({
-                "data_ids": data_ids,                     # (N_local_batch,)
-                "prompt_tokens": prompt_tokens,           # 2D list (N_local_batch, Lp), ragged
-                "generated_tokens": generated_tokens,     # 2D list (N_local_batch, Lg), ragged
-                "generated_texts": generated_texts,       # N_local_batch x str
-                "rewards": rewards,                       # (N_local_batch,)
-                "entropies": entropies,                   # (N_local_batch,)
-                "generated_lengths": generated_lengths,   # (N_local_batch,)
-            })
+                training_data.append({
+                    "data_ids": data_ids,                     # (N_local_batch,)
+                    "prompt_tokens": prompt_tokens,           # 2D list (N_local_batch, Lp), ragged
+                    "generated_tokens": generated_tokens,     # 2D list (N_local_batch, Lg), ragged
+                    "generated_texts": generated_texts,       # N_local_batch x str
+                    "rewards": rewards,                       # (N_local_batch,)
+                    "entropies": entropies,                   # (N_local_batch,)
+                    "generated_lengths": generated_lengths,   # (N_local_batch,)
+                })
 
         training_data = {key: concat([batch[key] for batch in training_data]) for key in training_data[0]}
 
@@ -112,22 +113,23 @@ class Trainer(BaseTrainer):
         cfg = self.config.model
 
         val_data = []
-        for data_ids in tqdm(self.val_dataloader, desc="Validation", position=1, leave=False, disable=not self.accelerator.is_main_process):
-            data_ids = data_ids.to(self.accelerator.device)
-            prompts = [self.val_task.prompt(int(data_id)) for data_id in data_ids]
-            prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.val_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking, n_intervene=cfg.n_intervene)  # 2D list (N_local_batch, Lp)
-            x = einops.repeat(self.x.to(self.pipeline.model.dtype), "Lx D -> N Lx D", N=len(prompt_tokens))   # (N_local_batch, Lx, D)
-            generated_output = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens)
-            generated_texts = generated_output.texts
-            rewards = torch.tensor([self.val_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
-            entropies = generated_output.entropies   # (N_local_batch,) nats/token
+        with self.pipeline.paged():
+            for data_ids in tqdm(self.val_dataloader, desc="Validation", position=1, leave=False, disable=not self.accelerator.is_main_process):
+                data_ids = data_ids.to(self.accelerator.device)
+                prompts = [self.val_task.prompt(int(data_id)) for data_id in data_ids]
+                prompt_tokens = self.pipeline.texts_to_tokens(prompts, system_prompt=self.val_task.SYSTEM_PROMPT, enable_thinking=cfg.enable_thinking, n_intervene=cfg.n_intervene)  # 2D list (N_local_batch, Lp)
+                x = einops.repeat(self.x.to(self.pipeline.model.dtype), "Lx D -> N Lx D", N=len(prompt_tokens))   # (N_local_batch, Lx, D)
+                generated_output = self.pipeline.generate(prompt_tokens, x, max_new_tokens=cfg.max_new_tokens)
+                generated_texts = generated_output.texts
+                rewards = torch.tensor([self.val_task.evaluate(int(data_id), text) for data_id, text in zip(data_ids, generated_texts)], device=self.accelerator.device, dtype=torch.float32)
+                entropies = generated_output.entropies   # (N_local_batch,) nats/token
 
-            val_data.append({
-                "data_ids": data_ids,                 # (N_local_batch,)
-                "generated_texts": generated_texts,   # N_local_batch x str
-                "rewards": rewards,                   # (N_local_batch,)
-                "entropies": entropies,               # (N_local_batch,)
-            })
+                val_data.append({
+                    "data_ids": data_ids,                 # (N_local_batch,)
+                    "generated_texts": generated_texts,   # N_local_batch x str
+                    "rewards": rewards,                   # (N_local_batch,)
+                    "entropies": entropies,               # (N_local_batch,)
+                })
 
         val_data = {key: concat([batch[key] for batch in val_data]) for key in val_data[0]}
 

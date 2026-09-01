@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import gc
 import os
 import torch
 
@@ -38,14 +39,16 @@ class Pipeline:
     INTERVENE_TOKEN = "<|intervene_pad|>"    # marks a slot in the prompt; intervene relabels it per sample before any forward
     ATTN_IMPLEMENTATION = "flash_attention_2"    # what every forward runs on outside generate, which switches to the paged variant for as long as the engine holds the model
 
-    def __init__(self, model_name, max_memory=None, max_memory_percent=0.5, temperature=1.0, top_p=1.0, top_k=0):
+    def __init__(self, model_name, max_memory=None, max_memory_percent=0.8, temperature=1.0, top_p=1.0, top_k=0):
         """
         Args:
             model_name: str HF repo id or local path.
             max_memory: {device: bytes} | None, the devices to shard across; None = every visible GPU.
                 The paged cache lives on one device, so this must resolve to a single GPU.
-            max_memory_percent: float, share of free memory the paged cache may take; the rest is left for
-                the scoring forwards, which run on the same card.
+            max_memory_percent: float, share of the memory free on entry to paged() that the cache may take;
+                the rest is left for the scoring forwards, which run on the same card. Read at every entry,
+                not here, so what a fit is holding at the time counts against the cache rather than the cache
+                being sized once against an empty card and held over everything that follows.
             temperature: float, 0.0 = greedy. Fixed for the process: the engine binds it when it is built.
             top_p: float, 1.0 keeps the whole distribution.
             top_k: int, 0 keeps the whole distribution. Bound with temperature, and like it fixed for the process.
@@ -77,8 +80,7 @@ class Pipeline:
             max_memory_percent=max_memory_percent,
             return_logprobs=True,
         )
-        self.cb_manager = self.model.init_continuous_batching(generation_config=self.generation_config, continuous_batching_config=self.cb_config)
-        self.cb_manager.warmup()    # the paged cache and its graphs are taken here, before any plain forward has churned the allocator
+        self.cb_manager = self.model.init_continuous_batching(generation_config=self.generation_config, continuous_batching_config=self.cb_config)   # no warmup here: the cache is paged()'s to take and to give back
         self.model.set_attn_implementation(self.ATTN_IMPLEMENTATION)    # building the manager switched the model to the paged kernels, and only generate wants them
 
     # ===================== the intervention =====================================
@@ -118,18 +120,35 @@ class Pipeline:
 
     @contextlib.contextmanager
     def paged(self):
-        """Hands the model to the engine: the paged attention kernels its block tables need, and a loop to run them.
+        """Hands the model to the engine: the paged attention kernels its block tables need, the cache those
+        kernels read, and a loop to run them.
+
+        The cache is taken on the way in and handed back on the way out, so it costs nothing while a caller
+        is scoring rather than generating, and each entry sizes it against whatever is free at that moment.
+        The engine memoises the size it settled on, so that is cleared first: left in place it is reused
+        verbatim, which makes max_memory_percent a silent no-op and raises if the room it wants has since
+        gone. Cheap to hold and dear to re-enter -- the CUDA graphs are captured again every time -- so a
+        caller should wrap a whole run of generate calls in one block, never one call at a time.
 
         Yields:
-            None; on exit the plain kernels are back, which is what a scoring forward needs, and the loop's
-            thread is gone, which is what the interpreter needs to exit at all.
+            None; on exit the plain kernels are back, which is what a scoring forward needs, the cache and
+            its graphs are released, and the loop's thread is gone, which is what the interpreter needs to
+            exit at all.
         """
         self.cb_manager.switch_to_paged_attn(self.model)
+        gc.collect()
+        torch.cuda.empty_cache()    # the cache is sized off max(allocated, reserved), so the caller's slack would count against it
+        cb_config = self.cb_manager.continuous_batching_config    # the manager deep-copies what it was handed, so this is not self.cb_config
+        cb_config.num_blocks = cb_config.max_batch_tokens = None
+        self.cb_manager.warmup()
         self.cb_manager.start()
         try:
             yield
         finally:
             self.cb_manager.stop(keep_for_next_session=True) # this will restore the attn_implementation
+            self.cb_manager.batch_processor = None            # the cache and the captured graphs go with it
+            gc.collect()
+            torch.cuda.empty_cache()
 
     @func_cache()
     def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False, n_intervene=0):
@@ -226,7 +245,9 @@ class Pipeline:
     # ===================== generation (the paged engine) =======================
     @torch.no_grad()
     def generate(self, prompt_tokens, x=None, max_new_tokens=1024):
-        """
+        """Must be called inside the caller's paged() block: the cache that block takes is worth keeping
+        across a run of calls, and only the caller knows where that run ends.
+
         Args:
             prompt_tokens: 2D list (N, Lp)
             x: (N, Lx, D) | None
@@ -234,7 +255,8 @@ class Pipeline:
         Returns:
             GenerateOutput, ragged; each sample ends at eos (included) or the cap.
         """
-        with self.intervene(x, prompt_tokens) if x is not None else contextlib.nullcontext(prompt_tokens) as inputs, self.paged():   # the hooks first, so nothing sits between the loop starting and its first request
+        assert "paged|" in self.model.config._attn_implementation, "generate needs the engine's cache and kernels, which only paged() puts in place; wrap the calling loop in `with pipeline.paged():`"
+        with self.intervene(x, prompt_tokens) if x is not None else contextlib.nullcontext(prompt_tokens) as inputs:
             request_ids = self.cb_manager.add_requests(inputs=inputs, max_new_tokens=max_new_tokens)
             outputs = {}
             while len(outputs) < len(request_ids):
