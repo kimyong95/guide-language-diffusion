@@ -41,28 +41,27 @@ if accelerator.is_main_process:
 data = {"data_ids": [], "prompt_tokens": [], "generated_tokens": []}   # (N,) and two 2D ragged lists (N, Lp) / (N, Lg), one entry per solved question
 unsolved = list(range(len(task.data)))
 progress = tqdm(range(1, K + 1), desc="Sampling", disable=not accelerator.is_main_process)
-with pipeline.paged():
-    for step in progress:
-        local = unsolved[g * len(unsolved) // G:(g + 1) * len(unsolved) // G]   # a contiguous block of what is still open, empty once fewer questions remain than there are processes
+for step in progress:
+    local = unsolved[g * len(unsolved) // G:(g + 1) * len(unsolved) // G]   # a contiguous block of what is still open, empty once fewer questions remain than there are processes
 
-        solved = []
-        if local:
-            generated_output = pipeline.generate(pipeline.texts_to_tokens([task.prompt(data_id) for data_id in local], system_prompt=task.SYSTEM_PROMPT, enable_thinking=ENABLE_THINKING), max_new_tokens=MAX_NEW_TOKENS)   # one draw for each question in the block
-            solved = [(data_id, tokens) for data_id, tokens, text in zip(local, generated_output.tokens, generated_output.texts) if task.evaluate(data_id, text)]
+    solved = []
+    if local:
+        generated_output = pipeline.generate(pipeline.texts_to_tokens([task.prompt(data_id) for data_id in local], system_prompt=task.SYSTEM_PROMPT, enable_thinking=ENABLE_THINKING), max_new_tokens=MAX_NEW_TOKENS)   # one draw for each question in the block
+        solved = [(data_id, tokens) for data_id, tokens, text in zip(local, generated_output.tokens, generated_output.texts) if task.evaluate(data_id, text)]
 
-        solved = gather(solved)   # every process leaves the step holding the same answers, so they stay in step
-        data["data_ids"] += [data_id for data_id, _ in solved]
-        data["prompt_tokens"] += pipeline.texts_to_tokens([task.prompt(data_id) for data_id, _ in solved], system_prompt=task.SYSTEM_PROMPT, enable_thinking=ENABLE_THINKING)
-        data["generated_tokens"] += [tokens for _, tokens in solved]
-        solved_ids = {data_id for data_id, _ in solved}
-        unsolved = [data_id for data_id in unsolved if data_id not in solved_ids]
+    solved = gather(solved)   # every process leaves the step holding the same answers, so they stay in step
+    data["data_ids"] += [data_id for data_id, _ in solved]
+    data["prompt_tokens"] += pipeline.texts_to_tokens([task.prompt(data_id) for data_id, _ in solved], system_prompt=task.SYSTEM_PROMPT, enable_thinking=ENABLE_THINKING)
+    data["generated_tokens"] += [tokens for _, tokens in solved]
+    solved_ids = {data_id for data_id, _ in solved}
+    unsolved = [data_id for data_id in unsolved if data_id not in solved_ids]
 
-        progress.set_postfix(solved=len(data["data_ids"]), unsolved=len(unsolved))
-        if accelerator.is_main_process:
-            torch.save({**data, "data_ids": torch.tensor(data["data_ids"])}, OUT_PATH + ".tmp")   # write-then-rename: a crash mid-save leaves the last good file
-            os.replace(OUT_PATH + ".tmp", OUT_PATH)
+    progress.set_postfix(solved=len(data["data_ids"]), unsolved=len(unsolved))
+    if accelerator.is_main_process:
+        torch.save({**data, "data_ids": torch.tensor(data["data_ids"])}, OUT_PATH + ".tmp")   # write-then-rename: a crash mid-save leaves the last good file
+        os.replace(OUT_PATH + ".tmp", OUT_PATH)
 
-        if not unsolved:
-            break
+    if not unsolved:
+        break
 
 accelerator.print(f"{len(data['data_ids'])}/{len(task.data)} questions solved in {step} steps -> {OUT_PATH}")
