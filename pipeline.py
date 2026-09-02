@@ -38,7 +38,7 @@ class Pipeline:
     INTERVENE_TOKEN = "<|intervene_pad|>"    # marks a slot in the prompt; intervene relabels it per sample before any forward
     ATTN_IMPLEMENTATION = "flash_attention_2"    # what every forward runs on outside generate, which switches to the paged variant for as long as the engine holds the model
 
-    def __init__(self, model_name, max_memory=None, max_memory_percent=0.5, temperature=1.0, top_p=1.0, top_k=0):
+    def __init__(self, model_name, max_memory=None, max_memory_percent=0.8, temperature=1.0, top_p=1.0, top_k=0):
         """
         Args:
             model_name: str HF repo id or local path.
