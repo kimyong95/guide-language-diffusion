@@ -117,6 +117,46 @@ class Pipeline:
                 handle.remove()
 
     @contextlib.contextmanager
+    def rotate(self, R, prompt_tokens, spans=None):
+        """
+        Args:
+            R: (Dv, Dv), Dv = num_key_value_heads * head_dim; turns the value every layer's attention
+                computes at the marked tokens, before the heads read it. One matrix over the whole
+                concatenated value, shared by every layer, and never applied to a generated token. Queries
+                and keys are untouched, so the attention pattern is the model's own and only what it carries
+                back is turned.
+            prompt_tokens: 2D list (N, Lp), ragged
+            spans: 2D list (N, 2) | None, the half-open range of each prompt whose tokens are turned; None
+                turns the whole prompt, chat template and all.
+
+        Yields:
+            2D list (N, Lp), the same prompts with the tokens inside each span relabelled to their marked
+            ids. Every forward inside the block must be fed these, not the originals; the marks travel with
+            the tokens, so the packed NL axis the engine builds needs nothing extra.
+        """
+        spans = spans if spans is not None else [(0, len(tokens)) for tokens in prompt_tokens]
+        rotate_prompt_tokens = [tokens[:start] + [intervene_token_id(token) for token in tokens[start:end]] + tokens[end:] for tokens, (start, end) in zip(prompt_tokens, spans)]
+        state = {}
+
+        def unmark(module, args):
+            token_ids = args[0]                             # (1, NL)
+            marked = token_ids <= intervene_token_id(0)     # (1, NL); -1 is the engine's own TMP_TOKEN_ID, so it stays out
+            state["mask"] = marked[..., None]               # (1, NL, 1)
+            return torch.where(marked, intervene_token_id(token_ids), token_ids).clamp(min=0)    # its own inverse, so a marked id comes back as the real one, already non-negative; the clamp is only for TMP_TOKEN_ID
+
+        def rotate_value(v_proj, args, output):
+            return torch.where(state["mask"], output @ R.T, output)    # turned over the whole axis and then masked; at H layers that is a few percent of the forward, and cheaper than gathering the rows
+
+        handles = [self.model.get_decoder().embed_tokens.register_forward_pre_hook(unmark)]
+        handles += [layer.self_attn.v_proj.register_forward_hook(rotate_value) for layer in self.layers]    # before the head reshape, so output is (1, NL, Dv) and the mask lines up
+
+        try:
+            yield rotate_prompt_tokens
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    @contextlib.contextmanager
     def paged(self):
         """Hands the model to the engine: the paged attention kernels its block tables need, and a loop to run them.
 
