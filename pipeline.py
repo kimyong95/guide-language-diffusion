@@ -1,6 +1,7 @@
 import contextlib
 import dataclasses
 import os
+from itertools import accumulate
 import torch
 
 # Pins each rank to its own physical GPU before CUDA ever initializes, so each thread sees the correct device.
@@ -8,187 +9,163 @@ if "LOCAL_RANK" in os.environ:
     assert not torch.cuda.is_initialized(), "Please import Accelerator after this file."
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"].split(",")[int(os.environ["LOCAL_RANK"])]
 
-from einops import rearrange
-from transformers import AutoTokenizer, AutoModelForCausalLM, ContinuousBatchingConfig, GenerationConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
+from transformers.generation.logits_process import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
 from utils import func_cache
-
-
-def intervene_token_id(position):
-    """
-    Args:
-        position: int, a slot's index into x flattened
-
-    Returns:
-        int, always negative so it cannot collide with a real token; -1 is left to the engine's own
-        TMP_TOKEN_ID. Its own inverse, so the same call maps a marked id back to the x row it reads.
-    """
-    return -2 - position
 
 
 @dataclasses.dataclass
 class GenerateOutput:
     tokens: list              # 2D list (N, Lg), ragged
     texts: list               # list (N) of str
-    entropies: torch.Tensor   # (N,) nats/token, from the log prob the engine reports for each sampled token
+    entropies: torch.Tensor   # (N,) mean sampled-token negative log probability, in nats
+
+
+class VarlenCache(DynamicCache):
+    """Owns packed inputs, request boundaries, and KV storage for ragged decoding."""
+
+    def __init__(self, prompts, device):
+        super().__init__()
+        self.device = device
+        self.active = list(range(len(prompts)))
+        self.lengths = [len(tokens) for tokens in prompts]
+        self.query_lengths = self.lengths.copy()
+        self.input_ids = torch.tensor([[token for tokens in prompts for token in tokens]], device=device, dtype=torch.long)
+        self.position_ids = torch.tensor([[pos for length in self.lengths for pos in range(length)]], device=device, dtype=torch.long)
+        self.indices = torch.arange(sum(self.lengths), device=device)
+
+    def model_inputs(self):
+        """Returns decoder arguments for the pending prefill or decode step."""
+        cu_q = torch.tensor(list(accumulate(self.query_lengths, initial=0)), device=self.device, dtype=torch.int32)
+        cu_k = torch.tensor(list(accumulate(self.lengths, initial=0)), device=self.device, dtype=torch.int32)
+        return dict(input_ids=self.input_ids, position_ids=self.position_ids, past_key_values=self, use_cache=True,
+                    cu_seq_lens_q=cu_q, cu_seq_lens_k=cu_k,
+                    max_length_q=max(self.query_lengths), max_length_k=max(self.lengths))
+
+    def last_hidden(self, hidden):
+        """Selects the final query state of each active request for sampling."""
+        positions = torch.tensor(list(accumulate(self.query_lengths)), device=hidden.device) - 1
+        return hidden[0, positions]
+
+    def advance(self, tokens, keep):
+        """Queues sampled tokens for surviving request indices in the current batch."""
+        offsets = list(accumulate(self.lengths, initial=0))
+        # Cache.update appends all new KVs first; gather each prefix beside its new KV.
+        self.indices = torch.cat([
+            torch.cat((torch.arange(offsets[i], offsets[i + 1], device=self.device),
+                       torch.tensor([offsets[-1] + j], device=self.device)))
+            for j, i in enumerate(keep)
+        ])
+        self.input_ids = torch.tensor([[tokens[i] for i in keep]], device=self.device)
+        self.position_ids = torch.tensor([[self.lengths[i] for i in keep]], device=self.device)
+        self.active = [self.active[i] for i in keep]
+        self.lengths = [self.lengths[i] + 1 for i in keep]
+        self.query_lengths = [1] * len(keep)
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        keys, values = super().update(key_states, value_states, layer_idx, *args, **kwargs)
+        layer = self.layers[layer_idx]
+        layer.keys = keys = keys[:, :, self.indices.to(keys.device), :]
+        layer.values = values = values[:, :, self.indices.to(values.device), :]
+        return keys, values
 
 
 class Pipeline:
-    """ragged tokens (+ optional intervention) -> paged generation, logits, scoring."""
+    """Flash Attention 2 generation over packed, variable-length requests."""
 
-    INTERVENE_TOKEN = "<|intervene_pad|>"    # marks a slot in the prompt; intervene relabels it per sample before any forward
-    ATTN_IMPLEMENTATION = "flash_attention_2"    # what every forward runs on outside generate, which switches to the paged variant for as long as the engine holds the model
+    ATTN_IMPLEMENTATION = "flash_attention_2"
 
-    def __init__(self, model_name, max_memory=None, max_memory_percent=0.8, temperature=1.0, top_p=1.0, top_k=0):
-        """
-        Args:
-            model_name: str HF repo id or local path.
-            max_memory: {device: bytes} | None, the devices to shard across; None = every visible GPU.
-                The paged cache lives on one device, so this must resolve to a single GPU.
-            max_memory_percent: float, share of free memory the paged cache may take; the rest is left for
-                the scoring forwards, which run on the same card.
-            temperature: float, 0.0 = greedy. Fixed for the process: the engine binds it when it is built.
-            top_p: float, 1.0 keeps the whole distribution.
-            top_k: int, 0 keeps the whole distribution. Bound with temperature, and like it fixed for the process.
-        """
+    def __init__(self, model_name, max_memory=None, temperature=1.0, top_p=1.0, top_k=0):
+        """Loads a frozen model; max_memory optionally controls device placement."""
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        max_memory = max_memory or {i: torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())}
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, attn_implementation=self.ATTN_IMPLEMENTATION, device_map="auto", max_memory=max_memory,).eval()
-        self.model.requires_grad_(False)    # only an intervention x or an adapter ever trains, never the base weights
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.bfloat16, attn_implementation=self.ATTN_IMPLEMENTATION,
+            device_map="auto", max_memory=max_memory,
+        ).eval().requires_grad_(False)
         self.device = self.model.device
-
         self.config = self.model.config
+        self.config.use_cache = False
         self.layers = self.model.get_decoder().layers
         eos = self.model.generation_config.eos_token_id
-        self.eos_token_ids = eos if isinstance(eos, list) else [eos]
-
-        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.INTERVENE_TOKEN]})
-        self.intervene_token_id = self.tokenizer.convert_tokens_to_ids(self.INTERVENE_TOKEN)
-
-        self.generation_config = GenerationConfig(
-            do_sample=temperature > 0,
-            temperature=temperature,
-            top_k=top_k, top_p=top_p,
-            eos_token_id=self.model.generation_config.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        self.cb_config = ContinuousBatchingConfig(
-            use_cuda_graph=(False, True),
-            allow_block_sharing=False,
-            max_memory_percent=max_memory_percent,
-            return_logprobs=True,
-        )
-        self.cb_manager = self.model.init_continuous_batching(generation_config=self.generation_config, continuous_batching_config=self.cb_config)
-        self.cb_manager.warmup()    # the paged cache and its graphs are taken here, before any plain forward has churned the allocator
-        self.model.set_attn_implementation(self.ATTN_IMPLEMENTATION)    # building the manager switched the model to the paged kernels, and only generate wants them
-
-    # ===================== the intervention =====================================
-    @contextlib.contextmanager
-    def intervene(self, x, prompt_tokens):
-        """
-        Args:
-            x: (N, Lx, D); row i replaces every layer's input at the Lx INTERVENE_TOKEN slots in prompt i.
-            prompt_tokens: 2D list (N, Lp), ragged; each holding Lx slots, where texts_to_tokens put them.
-
-        Yields:
-            2D list (N, Lp), the same prompts with every slot relabelled to the id of the x row it reads,
-            handed out in reading order. Every forward inside the block must be fed these, not the originals.
-        """
-        N, Lx, _ = x.shape
-        intervene_token_ids = iter([intervene_token_id(nl) for nl in range(N * Lx)])    # x's rows flattened, so sample i takes i * Lx .. i * Lx + Lx - 1
-        intervene_prompt_tokens = [ [next(intervene_token_ids) if token == self.intervene_token_id else token for token in tokens] for tokens in prompt_tokens ]
-        state = {}
-
-        def compute_x_slots(module, args):
-            token_ids = args[0]                                                # (1, NL)
-            state["mask"] = (token_ids <= intervene_token_id(0))[..., None]    # (1, NL, 1)
-            state["x"] = rearrange(x, "N Lx D -> (N Lx) D")[intervene_token_id(token_ids).clamp(min=0)]    # (1, NL, D)
-            return token_ids.clamp(min=0)
-
-        def write_x(layer, args):
-            return torch.where(state["mask"], state["x"], args[0])
-
-        handles = [self.model.get_decoder().embed_tokens.register_forward_pre_hook(compute_x_slots)]
-        handles += [layer.register_forward_pre_hook(write_x) for layer in self.layers]
-
-        try:
-            yield intervene_prompt_tokens
-        finally:
-            for handle in handles:
-                handle.remove()
+        self.eos_token_ids = eos if isinstance(eos, list) else ([] if eos is None else [eos])
+        self.do_sample = temperature > 0
+        self.logits_processors = LogitsProcessorList()
+        if self.do_sample:
+            if temperature != 1.0:
+                self.logits_processors.append(TemperatureLogitsWarper(temperature))
+            if top_k:
+                self.logits_processors.append(TopKLogitsWarper(top_k))
+            if top_p < 1.0:
+                self.logits_processors.append(TopPLogitsWarper(top_p))
 
     @contextlib.contextmanager
     def rotate(self, R, prompt_tokens, spans=None):
-        """
+        """Rotates marked hidden states before every decoder layer, including its residual.
+
         Args:
-            R: (Dv, Dv), Dv = num_key_value_heads * head_dim; turns the value every layer's attention
-                computes at the marked tokens, before the heads read it. One matrix over the whole
-                concatenated value, shared by every layer, and never applied to a generated token. Queries
-                and keys are untouched, so the attention pattern is the model's own and only what it carries
-                back is turned.
-            prompt_tokens: 2D list (N, Lp), ragged
-            spans: 2D list (N, 2) | None, the half-open range of each prompt whose tokens are turned; None
-                turns the whole prompt, chat template and all.
+            R: (hidden_size, hidden_size), one matrix shared across layers and marked tokens.
+            prompt_tokens: Ragged token IDs; selected tokens must have nonzero IDs.
+            spans: One half-open token range per prompt; None selects each whole prompt.
 
         Yields:
-            2D list (N, Lp), the same prompts with the tokens inside each span relabelled to their marked
-            ids. Every forward inside the block must be fed these, not the originals; the marks travel with
-            the tokens, so the packed NL axis the engine builds needs nothing extra.
+            Marked prompts to use inside the context. Template and generated positions outside
+            the selected spans receive no direct rotation. Final normalization is not hooked.
+
+        Notes:
+            h ← E                        # embed_tokens(|ids|), never rotated
+            for l = 0 … L-1:
+                h[M] ← h[M] Rᵀ           # the hook: in-place on the stream
+                h ← h + Attn_l(LN₁(h))
+                h ← h + MLP_l(LN₂(h))
+            logits ← LN_f(h) W_uᵀ        # no rotation here
+
         """
+        dim = self.config.hidden_size
+        if R.shape != (dim, dim):
+            raise ValueError(f"Expected rotation shaped {(dim, dim)}, got {tuple(R.shape)}")
         spans = spans if spans is not None else [(0, len(tokens)) for tokens in prompt_tokens]
-        rotate_prompt_tokens = [tokens[:start] + [intervene_token_id(token) for token in tokens[start:end]] + tokens[end:] for tokens, (start, end) in zip(prompt_tokens, spans)]
+        if len(spans) != len(prompt_tokens) or any(
+            not 0 <= start <= end <= len(tokens) for tokens, (start, end) in zip(prompt_tokens, spans)
+        ):
+            raise ValueError("Require one valid half-open span per prompt")
+        marked_prompts = [
+            tokens[:start] + [-token for token in tokens[start:end]] + tokens[end:]
+            for tokens, (start, end) in zip(prompt_tokens, spans)
+        ]
         state = {}
 
         def unmark(module, args):
-            token_ids = args[0]                             # (1, NL)
-            marked = token_ids <= intervene_token_id(0)     # (1, NL); -1 is the engine's own TMP_TOKEN_ID, so it stays out
-            state["mask"] = marked[..., None]               # (1, NL, 1)
-            return torch.where(marked, intervene_token_id(token_ids), token_ids).clamp(min=0)    # its own inverse, so a marked id comes back as the real one, already non-negative; the clamp is only for TMP_TOKEN_ID
+            state["mask"] = args[0] < 0
+            return (args[0].abs(), *args[1:])
 
-        def rotate_value(v_proj, args, output):
-            return torch.where(state["mask"], output @ R.T, output)    # turned over the whole axis and then masked; at H layers that is a few percent of the forward, and cheaper than gathering the rows
+        def rotate_hidden(module, args):
+            if not state["mask"].any():
+                return
+            hidden = args[0]
+            mask = state["mask"].to(hidden.device)
+            dtype = torch.promote_types(torch.promote_types(hidden.dtype, R.dtype), torch.float32)
+            rotated = hidden[mask].to(dtype) @ R.to(device=hidden.device, dtype=dtype).T
+            result = hidden.clone()
+            result[mask] = rotated.to(hidden.dtype)
+            return (result, *args[1:])
 
-        handles = [self.model.get_decoder().embed_tokens.register_forward_pre_hook(unmark)]
-        handles += [layer.self_attn.v_proj.register_forward_hook(rotate_value) for layer in self.layers]    # before the head reshape, so output is (1, NL, Dv) and the mask lines up
-
+        handles = []
         try:
-            yield rotate_prompt_tokens
+            handles.append(self.model.get_decoder().embed_tokens.register_forward_pre_hook(unmark))
+            for layer in self.layers:
+                handles.append(layer.register_forward_pre_hook(rotate_hidden))
+            yield marked_prompts
         finally:
             for handle in handles:
                 handle.remove()
-
-    @contextlib.contextmanager
-    def paged(self):
-        """Hands the model to the engine: the paged attention kernels its block tables need, and a loop to run them.
-
-        Yields:
-            None; on exit the plain kernels are back, which is what a scoring forward needs, and the loop's
-            thread is gone, which is what the interpreter needs to exit at all.
-        """
-        self.cb_manager.switch_to_paged_attn(self.model)
-        self.cb_manager.start()
-        try:
-            yield
-        finally:
-            self.cb_manager.stop(keep_for_next_session=True) # this will restore the attn_implementation
+            state.clear()
 
     @func_cache()
-    def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False, n_intervene=0):
-        """
-        Args:
-            prompts: list (N) of str
-            system_prompt: str | None, prepended as a system turn; None omits the turn entirely.
-            enable_thinking: bool, Qwen3's chat-template switch.
-            n_intervene: int, INTERVENE_TOKEN slots appended to the prompt's own user turn, right after the
-                prompt text and still inside the turn; 0 appends nothing.
-
-        Returns:
-            2D list (N, Lp), ragged (no padding); intervene turns the slots into per-sample ids, and only a
-            forward inside that context may be fed a prompt still holding them. Cached per prompt, so a
-            caller may ask for the same one every step rather than holding it.
-        """
+    def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False):
+        """Returns ragged chat-template token IDs, cached per prompt."""
         system = [{"role": "system", "content": system_prompt}] if system_prompt else []
         return [
-            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt + self.INTERVENE_TOKEN * n_intervene}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
+            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
             for prompt in prompts
         ]
 
@@ -204,8 +181,7 @@ class Pipeline:
 
         Returns:
             (N, D) float32, the hidden state at each prompt's last token, which under the causal mask is the
-            only position that has read the whole prompt. There is no n_intervene: an embedding describes the
-            prompt alone, so it cannot move when x does. Cached per prompt, so only the prompts this call
+            only position that has read the whole prompt. Cached per prompt, so only the prompts this call
             has not seen reach a forward, and the batch is whatever the caller asks for at once.
         """
         prompt_tokens = self.texts_to_tokens(prompts, system_prompt=system_prompt, enable_thinking=enable_thinking)
@@ -241,47 +217,57 @@ class Pipeline:
     def predict_logits(self, tokens):
         """
         Args:
-            tokens: list (L), as yielded by intervene when one is live.
+            tokens: list (L), as yielded by rotate when one is live.
 
         Returns:
             (L, V) logits.
         """
         input_ids = torch.tensor([tokens], device=self.device)      # (1, L)
-        return self.model(input_ids=input_ids).logits[0]
+        return self.model(input_ids=input_ids, use_cache=False).logits[0]
 
     def log_probs(self, prompt_tokens, input_tokens):
-        """Scores input_tokens teacher-forced after prompt_tokens, in one cache-free forward.
+        """Scores only continuation tokens, without retaining prompt vocabulary logits."""
+        if not input_tokens:
+            return torch.empty(0, device=self.device)
+        input_ids = torch.tensor([prompt_tokens + input_tokens[:-1]], device=self.device)
+        hidden = self.model.get_decoder()(input_ids=input_ids, use_cache=False).last_hidden_state[0, len(prompt_tokens) - 1:]
+        logits = self.model.get_output_embeddings()(hidden).float()
+        targets = torch.tensor(input_tokens, device=logits.device)
+        return logits.log_softmax(-1).gather(1, targets[:, None])[:, 0]
 
-        Args:
-            prompt_tokens: list (Lp)
-            input_tokens: list (Lg)
-
-        Returns:
-            (Lg,) log P(input_tokens[l] | prompt_tokens, input_tokens[:l]) for l in Lg
-        """
-        Lp = len(prompt_tokens)
-        logits = self.predict_logits(prompt_tokens + input_tokens)[Lp - 1:-1].float()    # (Lg, V): next-token logits over each input pos
-        return logits.log_softmax(dim=-1).gather(1, torch.tensor(input_tokens, device=logits.device)[:, None])[:, 0]         # (Lg,)
-
-    # ===================== generation (the paged engine) =======================
     @torch.no_grad()
-    def generate(self, prompt_tokens, x=None, max_new_tokens=1024):
-        """
+    def generate(self, prompt_tokens, max_new_tokens=1024):
+        """Generates ragged continuations using packed FA2 attention and a fresh KV cache.
+
         Args:
-            prompt_tokens: 2D list (N, Lp)
-            x: (N, Lx, D) | None
+            prompt_tokens: Ragged lists of nonempty prompt token IDs.
+            max_new_tokens: Per-request token limit, including terminating EOS.
 
         Returns:
-            GenerateOutput, ragged; each sample ends at eos (included) or the cap.
+            GenerateOutput in request order. Entropies are mean sampled-token NLLs under
+            the filtered distribution, or the raw distribution for greedy decoding.
         """
-        with self.intervene(x, prompt_tokens) if x is not None else contextlib.nullcontext(prompt_tokens) as inputs, self.paged():   # the hooks first, so nothing sits between the loop starting and its first request
-            request_ids = self.cb_manager.add_requests(inputs=inputs, max_new_tokens=max_new_tokens)
-            outputs = {}
-            while len(outputs) < len(request_ids):
-                result = self.cb_manager.get_result()
-                outputs[result.request_id] = result
+        if max_new_tokens < 0 or any(not tokens for tokens in prompt_tokens):
+            raise ValueError("Require nonempty prompts and a nonnegative token limit")
+        generated = [[] for _ in prompt_tokens]
+        nll = torch.zeros(len(prompt_tokens), device=self.device)
+        cache = VarlenCache(prompt_tokens, self.device)
+        for step in range(max_new_tokens):
+            if not cache.active:
+                break
+            hidden = self.model.get_decoder()(**cache.model_inputs()).last_hidden_state # will update cache in-place
+            logits = self.model.get_output_embeddings()(cache.last_hidden(hidden)).float()
+            log_probs = self.logits_processors(cache.input_ids, logits).log_softmax(-1)
+            tokens = torch.multinomial(log_probs.exp(), 1) if self.do_sample else log_probs.argmax(-1, keepdim=True)
+            nll[cache.active] -= log_probs.gather(1, tokens)[:, 0].to(self.device)
+            sampled = tokens[:, 0].tolist()
+            for index, token in zip(cache.active, sampled):
+                generated[index].append(token)
+            keep = [i for i, token in enumerate(sampled) if token not in self.eos_token_ids]
+            if not keep or step + 1 == max_new_tokens:
+                break
 
-        outputs = [outputs[request_id] for request_id in request_ids]    # they come back in completion order; add_requests handed the ids out in submission order
-        generated_tokens = [output.generated_tokens for output in outputs]
-        entropies = torch.tensor([-sum(output.logprobs) / max(len(output.logprobs), 1) for output in outputs], device=self.device)    # (N,) one sampled path, so an estimate rather than the full entropy
-        return GenerateOutput(tokens=generated_tokens, texts=self.tokens_to_texts(generated_tokens), entropies=entropies)
+            cache.advance(sampled, keep)
+
+        counts = torch.tensor([max(len(tokens), 1) for tokens in generated], device=self.device)
+        return GenerateOutput(tokens=generated, texts=self.tokens_to_texts(generated), entropies=nll / counts)
