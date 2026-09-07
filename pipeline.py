@@ -11,6 +11,8 @@ if "LOCAL_RANK" in os.environ:
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 from transformers.generation.logits_process import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
+from peft import LoraConfig, inject_adapter_in_model
+from peft.tuners.lora import LoraLayer
 from utils import func_cache
 
 
@@ -74,6 +76,7 @@ class Pipeline:
     """Flash Attention 2 generation over packed, variable-length requests."""
 
     ATTN_IMPLEMENTATION = "flash_attention_2"
+    LORA_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
     def __init__(self, model_name, max_memory=None, temperature=1.0, top_p=1.0, top_k=0):
         """Loads a frozen model; max_memory optionally controls device placement."""
@@ -97,68 +100,6 @@ class Pipeline:
                 self.logits_processors.append(TopKLogitsWarper(top_k))
             if top_p < 1.0:
                 self.logits_processors.append(TopPLogitsWarper(top_p))
-
-    @contextlib.contextmanager
-    def rotate(self, R, prompt_tokens, spans=None):
-        """Rotates marked hidden states before every decoder layer, including its residual.
-
-        Args:
-            R: (hidden_size, hidden_size), one matrix shared across layers and marked tokens.
-            prompt_tokens: Ragged token IDs; selected tokens must have nonzero IDs.
-            spans: One half-open token range per prompt; None selects each whole prompt.
-
-        Yields:
-            Marked prompts to use inside the context. Template and generated positions outside
-            the selected spans receive no direct rotation. Final normalization is not hooked.
-
-        Notes:
-            h ← E                        # embed_tokens(|ids|), never rotated
-            for l = 0 … L-1:
-                h[M] ← h[M] Rᵀ           # the hook: in-place on the stream
-                h ← h + Attn_l(LN₁(h))
-                h ← h + MLP_l(LN₂(h))
-            logits ← LN_f(h) W_uᵀ        # no rotation here
-
-        """
-        dim = self.config.hidden_size
-        if R.shape != (dim, dim):
-            raise ValueError(f"Expected rotation shaped {(dim, dim)}, got {tuple(R.shape)}")
-        spans = spans if spans is not None else [(0, len(tokens)) for tokens in prompt_tokens]
-        if len(spans) != len(prompt_tokens) or any(
-            not 0 <= start <= end <= len(tokens) for tokens, (start, end) in zip(prompt_tokens, spans)
-        ):
-            raise ValueError("Require one valid half-open span per prompt")
-        marked_prompts = [
-            tokens[:start] + [-token for token in tokens[start:end]] + tokens[end:]
-            for tokens, (start, end) in zip(prompt_tokens, spans)
-        ]
-        state = {}
-
-        def unmark(module, args):
-            state["mask"] = args[0] < 0
-            return (args[0].abs(), *args[1:])
-
-        def rotate_hidden(module, args):
-            if not state["mask"].any():
-                return
-            hidden = args[0]
-            mask = state["mask"].to(hidden.device)
-            dtype = torch.promote_types(torch.promote_types(hidden.dtype, R.dtype), torch.float32)
-            rotated = hidden[mask].to(dtype) @ R.to(device=hidden.device, dtype=dtype).T
-            result = hidden.clone()
-            result[mask] = rotated.to(hidden.dtype)
-            return (result, *args[1:])
-
-        handles = []
-        try:
-            handles.append(self.model.get_decoder().embed_tokens.register_forward_pre_hook(unmark))
-            for layer in self.layers:
-                handles.append(layer.register_forward_pre_hook(rotate_hidden))
-            yield marked_prompts
-        finally:
-            for handle in handles:
-                handle.remove()
-            state.clear()
 
     @func_cache()
     def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False):
@@ -213,6 +154,91 @@ class Pipeline:
         """
         return [self.tokenizer.decode(t, skip_special_tokens=True) for t in token_lists]
 
+    # ===================== LoRA worn only while thinking =======================
+    def init_thinking_lora(self, rank=8, alpha=16, dropout=0.0, target_modules=LORA_TARGET_MODULES):
+        """Adds LoRA adapters that contribute nothing until a lora_thinking context says where.
+
+        peft injects the adapters in place, so every module reference the pipeline already holds stays
+        valid. Each adapter's lora_B is then hooked, and since peft adds exactly lora_B(lora_A(x)) *
+        scaling to the frozen layer's output, zeroing rows of lora_B's output zeroes the delta at those
+        positions and leaves the frozen path untouched. With no context open the gate is shut and the
+        delta is zeroed everywhere, so the model answers exactly as the one that was loaded.
+
+        Args:
+            rank: Rank of each adapter.
+            alpha: Scaling numerator; peft multiplies each delta by alpha / rank.
+            dropout: Dropout applied to the adapter branch's input.
+            target_modules: Name suffixes of the nn.Linear modules to adapt.
+
+        Returns:
+            list of the adapter parameters, float32 and requiring grad, to hand to an optimizer. The
+            base model stays frozen in bfloat16, and peft casts each adapter's input and output around it.
+        """
+        config = LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=dropout, target_modules=list(target_modules), bias="none")
+        inject_adapter_in_model(config, self.model)
+        parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        for parameter in parameters:
+            parameter.data = parameter.data.float()    # peft builds adapters in the base dtype, and Adam needs more than bfloat16 carries
+        self.lora_gate = None
+
+        def gate(module, args, output):
+            """Keeps the adapter's contribution only at the positions the gate is open for."""
+            if self.lora_gate is None:
+                return torch.zeros_like(output)
+            return output * self.lora_gate.to(output.device)[..., None].to(output.dtype)
+
+        for module in self.model.modules():
+            if isinstance(module, LoraLayer):
+                for projection in module.lora_B.values():
+                    projection.register_forward_hook(gate)
+        return parameters
+
+    @contextlib.contextmanager
+    def lora_thinking(self, open_token="<think>", close_token="</think>"):
+        """Wears the LoRA adapters on thinking tokens only, for the duration of the block.
+
+        The thinking is read off the token ids as the decoder sees them, so no span has to be supplied:
+        a position is adapted from the open_token up to but not including the close_token, which leaves
+        the prompt and everything from the close onward with the frozen model. Each request carries its
+        own flag, keyed by its index in the cache, so a packed batch whose requests sit at different
+        points is gated in one pass. Thinking the model is still writing is adapted as it is produced,
+        and a context scored in a single forward is adapted in the same place.
+
+        Args:
+            open_token: Token opening the block; its own position is adapted, so the adapter shapes the
+                first thinking token rather than inheriting a frozen opening.
+            close_token: Token closing the block; its own position is not adapted, so whether the block
+                ends here is the frozen model's call, and a loss can score it.
+
+        Yields:
+            None; no input is rewritten. The flags start empty and do not survive the exit, so use one
+            context per decoding and one per scored forward. Outside the block the adapters are inert.
+        """
+        assert hasattr(self, "lora_gate"), "call init_thinking_lora before lora_thinking"
+        open_id, close_id = self.tokenizer.convert_tokens_to_ids([open_token, close_token])
+        inside = {}    # request index -> whether the next token it reads falls inside its block
+
+        def set_gate(module, args, kwargs):
+            input_ids = kwargs["input_ids"]
+            tokens = input_ids.flatten().tolist()
+            cache = kwargs.get("past_key_values")
+            keys = cache.active if cache is not None else [0]                 # one plain sequence when nothing is packed
+            lengths = cache.query_lengths if cache is not None else [len(tokens)]
+            gate = []
+            for key, start, length in zip(keys, accumulate(lengths, initial=0), lengths):
+                state = inside.get(key, False)
+                for token in tokens[start:start + length]:
+                    state = (state or token == open_id) and token != close_id  # the opening marker joins the block, the closing one leaves it
+                    gate.append(state)
+                inside[key] = state
+            self.lora_gate = torch.tensor(gate, device=input_ids.device).reshape(input_ids.shape)
+
+        handle = self.model.get_decoder().register_forward_pre_hook(set_gate, with_kwargs=True)
+        try:
+            yield
+        finally:
+            handle.remove()
+            self.lora_gate = None
     # ===================== scoring (one sample, plain forward) =================
     def predict_logits(self, tokens):
         """
