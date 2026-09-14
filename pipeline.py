@@ -259,11 +259,11 @@ class Pipeline:
 
 
     @contextlib.contextmanager
-    def replace_hidden(self, hidden, system_tokens):
+    def replace_latent(self, latent, system_tokens):
         """Replaces the residual stream entering every layer at the system prompt's positions.
 
         Args:
-            hidden: (H, P, D), one state per layer per system-prompt token, the instances' tokens
+            latent: (H, P, D), one state per layer per system-prompt token, the instances' tokens
                 concatenated in packed order; layer 0's is the token embedding
             system_tokens: list, the system prompt's token ids, located as a subsequence of each
                 forward's input ids. A forward without them, such as a decode step, is left alone.
@@ -282,7 +282,7 @@ class Pipeline:
             return hook
 
         with self.system_positions(system_tokens) as state:
-            handles = [layer.register_forward_pre_hook(replace(states, state)) for layer, states in zip(self.layers, hidden)]
+            handles = [layer.register_forward_pre_hook(replace(states, state)) for layer, states in zip(self.layers, latent)]
             try:
                 yield
             finally:
@@ -290,7 +290,7 @@ class Pipeline:
                     handle.remove()
 
     @torch.no_grad()
-    def record_hidden(self, prompt_tokens, system_tokens):
+    def record_latent(self, prompt_tokens, system_tokens):
         """Records the residual stream entering every layer at the system prompt's positions.
 
         Args:
@@ -298,7 +298,7 @@ class Pipeline:
             system_tokens: list, the system prompt's token ids
 
         Returns:
-            (H, P, D) float32, what replace_hidden with these states would leave unchanged.
+            (H, P, D) float32, what replace_latent with these states would leave unchanged.
         """
         recorded = []
 
