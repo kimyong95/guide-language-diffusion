@@ -47,7 +47,7 @@ class BaseTrainer:
     def setup_pipeline(self):
         """Give each rank its own slice of the visible GPUs, so G ranks never contend for one device."""
         max_memory = {i: torch.cuda.get_device_properties(i).total_memory for i in range(self.accelerator.process_index, torch.cuda.device_count(), self.accelerator.num_processes)}
-        self.pipeline = Pipeline(self.config.model.name, max_memory=max_memory, temperature=self.config.model.temperature)
+        self.pipeline = Pipeline(self.config.model.name, max_memory=max_memory)
 
     def log_code(self):
         if not self.accelerator.is_main_process:

@@ -26,16 +26,26 @@ dependencies = [
     "lm_eval[api,hf,vllm]==0.4.12",
     "peft==0.19.*",
     "math-verify==0.9.*",
-    "flash-attn==2.8.*"
+    "bm25s==0.2.12",
+    "pystemmer==2.2.0.3",
+    "diskcache",
+    "flash-attn==2.8.*",
+    "flash-linear-attention[cuda]",
+    "causal-conv1d==1.7.*",
+    "cma",
+    "botorch",
+    "gpytorch",
+
 ]
 
 [tool.uv]
 python-preference = "only-managed"
 environments = ["sys_platform == 'linux'"]
-no-build-isolation-package = ["flash-attn"]
+no-build-isolation-package = ["flash-attn", "causal-conv1d"]
 
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]
+causal-conv1d = ["torch"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu129" }]

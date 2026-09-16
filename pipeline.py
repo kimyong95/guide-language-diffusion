@@ -4,11 +4,6 @@ import os
 from itertools import accumulate
 import torch
 
-# Pins each rank to its own physical GPU before CUDA ever initializes, so each thread sees the correct device.
-if "LOCAL_RANK" in os.environ:
-    assert not torch.cuda.is_initialized(), "Please import Accelerator after this file."
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"].split(",")[int(os.environ["LOCAL_RANK"])]
-
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 from transformers.generation.logits_process import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper, MinPLogitsWarper
 from peft import LoraConfig, inject_adapter_in_model
@@ -144,7 +139,7 @@ class VarlenCache(DynamicCache):
 
 
 class Pipeline:
-    """Generation over packed, variable-length instances: flash attention by default; sdpa, one instance at a time, when a layer needs its own mask."""
+    """Generation over packed, variable-length instances with flash attention."""
 
     ATTN_IMPLEMENTATION = "flash_attention_2"
     LORA_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
@@ -170,149 +165,18 @@ class Pipeline:
         Args:
             prompts: list (N) of str
             system_prompt: str | None, the system turn's text; None omits the turn
-            enable_thinking: bool, Qwen's chat-template switch
+            enable_thinking: bool, Qwen's chat-template switch; True also opens the think block in the
+                prompt so the model starts inside it instead of generating "<think>\n"
 
         Returns:
             2D list (N, Lp), ragged
         """
         system = [] if system_prompt is None else [{"role": "system", "content": system_prompt}]
+        suffix = "<think>\n" if enable_thinking else ""
         return [
-            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
+            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking) + suffix).input_ids
             for prompt in prompts
         ]
-
-    @func_cache()
-    @torch.no_grad()
-    def texts_to_embedding(self, prompts, layer, system_prompt=None, enable_thinking=False):
-        """
-        Args:
-            prompts: list (N) of str
-            layer: int, the decoder layer whose input is read
-            system_prompt: str | None
-            enable_thinking: bool
-
-        Returns:
-            (N, D) float32, the hidden state at each prompt's last token, which under the causal mask is the
-            only position that has read the whole prompt. Cached per prompt, so only the prompts this call
-            has not seen reach a forward, and the batch is whatever the caller asks for at once.
-        """
-        prompt_tokens = self.texts_to_tokens(prompts, system_prompt=system_prompt, enable_thinking=enable_thinking)
-        lengths = torch.tensor([len(tokens) for tokens in prompt_tokens], device=self.device)                    # (N,)
-        input_ids = torch.full((len(prompt_tokens), int(lengths.max())), self.tokenizer.pad_token_id, device=self.device)
-        for i, tokens in enumerate(prompt_tokens):
-            input_ids[i, :len(tokens)] = torch.tensor(tokens, device=self.device)
-        attention_mask = torch.arange(input_ids.shape[1], device=self.device) < lengths[:, None]                 # (N, Lp) padded on the right, so a real token keeps the position id it would have had alone
-        state = {}
-
-        def capture(module, args):
-            state["hidden"] = args[0]                                                                            # (N, Lp, D)
-
-        handle = self.layers[layer].register_forward_pre_hook(capture)
-        try:
-            self.model.get_decoder()(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)    # the decoder alone, so neither the (N, Lp, V) the lm head would build nor the cache nothing here reads
-        finally:
-            handle.remove()
-
-        return state["hidden"][torch.arange(len(prompt_tokens), device=self.device), lengths - 1].float()
-
-    @staticmethod
-    def get_token_positions(input_tokens, target_tokens):
-        """Returns the positions covered by every occurrence of target_tokens in input_tokens.
-
-        Args:
-            input_tokens: (1, L) long, a forward's packed input ids
-            target_tokens: list, the token ids to locate as a contiguous subsequence
-
-        Returns:
-            (1, L) bool, True at every token of every match, all False when there is none
-        """
-        ids = input_tokens[0].tolist()
-        positions = torch.zeros_like(input_tokens, dtype=torch.bool)
-        for start in range(len(ids) - len(target_tokens) + 1):
-            if ids[start:start + len(target_tokens)] == target_tokens:
-                positions[0, start:start + len(target_tokens)] = True
-        return positions
-
-    @contextlib.contextmanager
-    def system_positions(self, system_tokens):
-        """Tracks where the system prompt sits in each forward's packed input.
-
-        Args:
-            system_tokens: list, the system prompt's token ids, located as a subsequence of each
-                forward's input ids
-
-        Yields:
-            dict whose "positions" entry is refreshed at every forward to the (1, L) bool mask of
-            the system prompt in that forward's input ids, all False when it is absent, as in a
-            decode step.
-        """
-        state = {}
-
-        def hook(module, args):
-            state["positions"] = self.get_token_positions(args[0], system_tokens)
-
-        handle = self.model.get_decoder().embed_tokens.register_forward_pre_hook(hook)
-        try:
-            yield state
-        finally:
-            handle.remove()
-
-
-    @contextlib.contextmanager
-    def replace_latent(self, latent, system_tokens):
-        """Replaces the residual stream entering every layer at the system prompt's positions.
-
-        Args:
-            latent: (H, P, D), one state per layer per system-prompt token, the instances' tokens
-                concatenated in packed order; layer 0's is the token embedding
-            system_tokens: list, the system prompt's token ids, located as a subsequence of each
-                forward's input ids. A forward without them, such as a decode step, is left alone.
-
-        Yields:
-            None. Outside the block nothing is replaced.
-        """
-        def replace(states, state):
-            def hook(module, args):
-                positions = state["positions"]
-                if not positions.any():
-                    return
-                hidden_states = args[0].clone()
-                hidden_states[positions.to(hidden_states.device)] = states.to(hidden_states.device, hidden_states.dtype)
-                return (hidden_states, *args[1:])
-            return hook
-
-        with self.system_positions(system_tokens) as state:
-            handles = [layer.register_forward_pre_hook(replace(states, state)) for layer, states in zip(self.layers, latent)]
-            try:
-                yield
-            finally:
-                for handle in handles:
-                    handle.remove()
-
-    @torch.no_grad()
-    def record_latent(self, prompt_tokens, system_tokens):
-        """Records the residual stream entering every layer at the system prompt's positions.
-
-        Args:
-            prompt_tokens: list (Lp), one instance's tokens, containing system_tokens
-            system_tokens: list, the system prompt's token ids
-
-        Returns:
-            (H, P, D) float32, what replace_latent with these states would leave unchanged.
-        """
-        recorded = []
-
-        def hook(module, args):
-            recorded.append(args[0][state["positions"].to(args[0].device)].float())
-
-        with self.system_positions(system_tokens) as state:
-            handles = [layer.register_forward_pre_hook(hook) for layer in self.layers]
-            try:
-                self.model.get_decoder()(input_ids=torch.tensor([prompt_tokens], device=self.device), use_cache=False)
-            finally:
-                for handle in handles:
-                    handle.remove()
-        return torch.stack(recorded)
 
     def tokens_to_texts(self, token_lists):
         """
