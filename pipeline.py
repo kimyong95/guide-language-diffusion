@@ -118,16 +118,16 @@ class Pipeline:
         Args:
             prompts: list (N) of str
             system_prompt: str | None, the system turn's text; None omits the turn
-            enable_thinking: bool, Qwen's chat-template switch; True also opens the think block in the
-                prompt so the model starts inside it instead of generating "<think>\n"
+            enable_thinking: bool, Qwen's chat-template switch; False raises for thinking-only templates
+                that ignore it
 
         Returns:
             2D list (N, Lp), ragged
         """
+        assert enable_thinking or "enable_thinking" in self.tokenizer.chat_template, "chat template does not support enable_thinking=False"
         system = [] if system_prompt is None else [{"role": "system", "content": system_prompt}]
-        suffix = "<think>\n" if enable_thinking else ""
         return [
-            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking) + suffix).input_ids
+            self.tokenizer(self.tokenizer.apply_chat_template(system + [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)).input_ids
             for prompt in prompts
         ]
 

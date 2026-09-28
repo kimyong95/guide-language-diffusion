@@ -6,7 +6,7 @@ from math_verify import parse, verify, ExprExtractionConfig, LatexExtractionConf
 
 
 class MathTask:
-    """DAPO's prompt format and Answer:-line grading; subclasses only supply self.data.
+    """The Qwen3 model card's math prompt and math_verify grading of the whole response, \\boxed{} first; subclasses only supply self.data.
 
     No system prompt: verl feeds the parquet's lone user turn straight to apply_chat_template,
     leaving whatever system turn the model's own template injects (none, for Qwen3).
@@ -15,24 +15,17 @@ class MathTask:
     SYSTEM_PROMPT = None
 
     PROMPT_TEMPLATE = inspect.cleandoc("""
-        Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.
-
         {question}
-
-        Remember to put your answer on its own line after "Answer:".
+        Please reason step by step, and put your final answer within \\boxed{{}}.
     """)
 
-    ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
-
-    EXTRACTION_CONFIG = [LatexExtractionConfig(), ExprExtractionConfig()]
+    EXTRACTION_CONFIG = [LatexExtractionConfig(boxed_match_priority=0), ExprExtractionConfig()]
 
     def prompt(self, data_id: int) -> str:
         return self.PROMPT_TEMPLATE.format(question=self.data[data_id]["question"])
 
     def evaluate(self, data_id: int, response: str) -> float:
-        matches = re.findall(self.ANSWER_PATTERN, response)
-        if not matches: return 0
-        answer = parse(f"${matches[-1].strip()}$", extraction_config=self.EXTRACTION_CONFIG)
+        answer = parse(response, extraction_config=self.EXTRACTION_CONFIG)
         ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
         return 1 if verify(ground_truth, answer) else 0
 
@@ -94,92 +87,6 @@ class MATH500(MathTask):
         self.data = [{'question':x, 'answer':y.strip()} for x,y in zip(dataset['problem'], dataset['answer'])]
 
 
-class LiveBenchMath(MathTask):
-    """LiveBench's math split, graded the way livebench/process_results/math grades it.
-
-    Every row carries its own prompt, already naming the answer format its subtask is scored on,
-    so prompt hands it over untouched and PROMPT_TEMPLATE goes unused. Two departures from
-    LiveBench: AMPS_Hard's sympy comparison and the GPT tiebreaker behind it become math_verify,
-    and olympiad is all-or-nothing where LiveBench scores the fraction of positions correct,
-    since pass@k has nothing to do with a fractional reward.
-    """
-
-    CHOICE_PATTERN = r"\\textbf{\(([A-E])\)\s?}(.*?)(?:\\qquad|\$)"    # a letter and the value printed beside it in the question's own choice list
-
-    def __init__(self):
-        dataset = load_dataset("livebench/math", split="test")
-        self.data = [{'question':x[0], 'answer':y.strip(), 'task':z} for x,y,z in zip(dataset['turns'], dataset['ground_truth'], dataset['task'])]
-
-    def prompt(self, data_id: int) -> str:
-        return self.data[data_id]["question"]
-
-    def evaluate(self, data_id: int, response: str) -> float:
-        question = self.data[data_id]
-        return {"math_comp": self.evaluate_math_comp, "AMPS_Hard": self.evaluate_amps_hard, "olympiad": self.evaluate_olympiad}[question["task"]](question, response)
-
-    def evaluate_math_comp(self, question: dict, response: str) -> float:
-        ground_truth = question["answer"]
-        if ground_truth.isdigit():
-            return 1 if ground_truth in response[-50:] else 0    # AIME: the prompt asks for the three digits as the last thing written
-
-        if ground_truth * 4 in response:    # the prompt asks for the letter five times over, and four in a row cannot be an accident
-            return 1
-
-        if self.last_boxed(response).replace("\\text{", "").replace("}", "").replace("\\", "").strip().lower() == ground_truth.lower():
-            return 1
-
-        value = dict(re.findall(self.CHOICE_PATTERN, question["question"])).get(ground_truth, "").strip().strip("$").strip("~")
-        if value and value in response[-(20 + len(value)):]:    # the tail names the answer's value rather than its letter
-            return 1
-
-        last_line = response.strip().split("\n")[-1].strip().replace("*", "")
-        parenthesized = re.search(r"\((.*?)\)", last_line)
-        return 1 if last_line.lower() == ground_truth.lower() or (parenthesized and parenthesized.group(1).lower() == ground_truth.lower()) else 0
-
-    def evaluate_amps_hard(self, question: dict, response: str) -> float:
-        response = re.sub(r"\s*\+\s*[Cc]\b", "", response)    # the integral rows' ground truth carries no constant of integration
-        answer = parse(response, extraction_config=self.EXTRACTION_CONFIG)
-        ground_truth = parse(f"${question['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
-        return 1 if verify(ground_truth, answer) else 0
-
-    def evaluate_olympiad(self, question: dict, response: str) -> float:
-        return 1 if self.extract_expression_ids(response) == [int(n) for n in question["answer"].split(",")] else 0
-
-    def last_boxed(self, response: str) -> str:
-        """
-        Args:
-            response: str
-
-        Returns:
-            str, what the last \\boxed{} holds, matched by counting braces so a \\text{} nested
-            inside it survives; "" when the response boxes nothing.
-        """
-        start = response.rfind("\\boxed{")
-        depth = 0
-        for i in range(start + len("\\boxed"), len(response) if start >= 0 else 0):
-            depth += (response[i] == "{") - (response[i] == "}")
-            if depth == 0:
-                return response[start + len("\\boxed{"):i]
-        return ""
-
-    def extract_expression_ids(self, response: str):
-        """
-        Args:
-            response: str
-
-        Returns:
-            list of int, the expression identifiers filling the masked slots, in the order given;
-            empty when none of the places the answer is allowed to sit parses as a list of numbers.
-        """
-        candidates = [response.lower().split("answer:")[-1].strip().split("\n")[0]] if "answer:" in response.lower() else []    # stripped first, so an empty Answer: line falls through to the one below it
-        candidates += [self.last_boxed(response), response.strip().split("\n")[-1]]
-        for candidate in candidates:
-            ids = [re.sub(r"\D", "", token) for token in candidate.split(",")]
-            if ids and all(ids):
-                return [int(i) for i in ids]
-        return []
-
-
 TASKS_CLS = {
     "aime-2022": AIME2022,
     "aime-2023": AIME2023,
@@ -188,7 +95,6 @@ TASKS_CLS = {
     "aime-2026": AIME2026,
     "math-500": MATH500,
     "dapo-math-17k": DAPOMath17K,
-    "livebench-math": LiveBenchMath,
 }
 
 SLICE_STR_PATTERN = r"([^\[]+)(?:\[([-\d:]+)\])?"
