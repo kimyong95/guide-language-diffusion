@@ -4,7 +4,7 @@ import os
 from itertools import accumulate
 import torch
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
+from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache, GenerationConfig
 from peft import LoraConfig, inject_adapter_in_model
 from peft.tuners.lora import LoraLayer
 from utils import func_cache
@@ -96,6 +96,7 @@ class Pipeline:
 
     ATTN_IMPLEMENTATION = "flash_attention_2"
     LORA_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+    RAW_SAMPLING_CONFIG = GenerationConfig(do_sample=True, temperature=1.0, top_k=None, top_p=1.0)
 
     def __init__(self, model_name, max_memory=None, attn_implementation=ATTN_IMPLEMENTATION):
         """Loads a frozen model; max_memory optionally controls device placement."""
@@ -221,24 +222,24 @@ class Pipeline:
                 handle.remove()
 
     @torch.no_grad()
-    def generate(self, prompt_tokens, max_new_tokens=1024, generation_config=None, strip_eos=False):
+    def generate(self, prompt_tokens, max_new_tokens=1024, generation_config=None):
         """Generates packed continuations with independent per-instance cache state.
 
         Args:
             prompt_tokens: 2D list (N, Lp), ragged, each nonempty
             max_new_tokens: int, per-instance token limit, including terminating EOS
             generation_config: GenerationConfig | None, whose sampling fields build the logits
-                processors; None takes the model's own, as loaded from generation_config.json.
-                Sampling is greedy unless do_sample is set. Processors reading the history, such as
-                repetition_penalty, see the generated tokens only, never the prompt.
-            strip_eos: bool, whether a terminating EOS is dropped from the returned tokens; the
-                entropies still count it
+                processors; None takes RAW_SAMPLING_CONFIG, plain sampling at temperature 1 with no
+                top-k or top-p filter. Sampling is greedy unless do_sample is set. Processors
+                reading the history, such as repetition_penalty, see the generated tokens only,
+                never the prompt.
 
         Returns:
-            GenerateOutput in instance order. Entropies are mean sampled-token NLLs under the
-            filtered distribution, the model's own when the config sets no filter.
+            GenerateOutput in instance order, a terminating EOS kept in the tokens. Entropies are
+            mean sampled-token NLLs under the filtered distribution, the model's own when the
+            config sets no filter.
         """
-        generation_config = self.model.generation_config if generation_config is None else generation_config
+        generation_config = self.RAW_SAMPLING_CONFIG if generation_config is None else generation_config
         logits_processors = self.model._get_logits_processor(generation_config, device=self.device)
 
         generated_tokens = [[] for _ in prompt_tokens]
@@ -261,6 +262,4 @@ class Pipeline:
             step += 1
 
         counts = torch.tensor([max(len(tokens), 1) for tokens in generated_tokens], device=self.device)
-        if strip_eos:
-            generated_tokens = [tokens[:-1] if tokens and tokens[-1] in self.eos_token_ids else tokens for tokens in generated_tokens]
         return GenerateOutput(tokens=generated_tokens, texts=self.tokens_to_texts(generated_tokens), entropies=nll / counts)
