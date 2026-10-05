@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import inspect
 import os
 from itertools import accumulate
 import torch
@@ -22,7 +23,8 @@ class VarlenCache(DynamicCache):
     Initialize with {instance_id: prompt_tokens}. After each forward, call
     advance({instance_id: next_token}) with only surviving instances. Mapping
     order determines batch order. New instances cannot join during decoding.
-    lengths includes the prepared queries; histories locates their previous K/V.
+    lengths includes the prepared queries; histories locates their previous K/V,
+    rows their previous linear-attention states.
     """
 
     def __init__(self, prompts, device, config):
@@ -39,11 +41,12 @@ class VarlenCache(DynamicCache):
     def output_positions(self):
         return [query.stop - 1 for query in self.queries]
 
-    def prepare(self, tokens, histories):
-        """Builds a forward's packed inputs from its tokens and prior K/V slices."""
+    def prepare(self, tokens, histories, rows=None):
+        """Builds a forward's packed inputs from its tokens, prior K/V slices and prior state rows; rows is None before the first forward."""
         packed = []
         self.lengths, self.queries = {}, []
         self.histories = [histories[i] for i in tokens]
+        self.rows = None if rows is None else [rows[i] for i in tokens]
         for instance_id, query in tokens.items():
             history = histories[instance_id]
             length = history.stop - history.start
@@ -80,22 +83,88 @@ class VarlenCache(DynamicCache):
         layer.device, layer.dtype = layer.keys.device, layer.keys.dtype
         return layer.keys, layer.values
 
+    def linear_forward(self, forward, layer_idx, hidden_states):
+        """Runs a linear-attention layer's own forward once per query length, batching those instances over their state rows.
+
+        Args:
+            forward: the layer's original forward, taking (B, T, D) hidden states and cache_params
+            layer_idx: int
+            hidden_states: (1, L, D), the prepared queries packed in batch order
+
+        Returns:
+            (1, L, D)
+        """
+        layer = self.layers[layer_idx]
+        previous = None if self.rows is None else self.linear_states(layer)
+        groups = {}
+        for row, query in enumerate(self.queries):
+            groups.setdefault(query.stop - query.start, []).append(row)
+
+        output = torch.empty_like(hidden_states)
+        members, states = [], []
+        for length, rows in groups.items():
+            positions = [position for row in rows for position in range(self.queries[row].start, self.queries[row].stop)]
+            prior_rows = None if previous is None else [self.rows[row] for row in rows]
+            self.load_linear_states(layer, None if previous is None else {key: state[prior_rows] for key, state in previous.items()})
+            output[0, positions] = forward(hidden_states[0, positions].unflatten(0, (len(rows), length)), cache_params=self).flatten(0, 1)
+            members += rows
+            states.append(self.linear_states(layer))
+        order = torch.tensor(members).argsort()
+        self.load_linear_states(layer, {key: torch.cat([state[key] for state in states])[order] for key in states[0]})
+        return output
+
     def advance(self, tokens):
         """Keeps the supplied instance IDs and queues one next token for each."""
-        histories = {}
+        histories, rows = {}, {}
         offset = 0
-        for instance_id, length in self.lengths.items():
+        for row, (instance_id, length) in enumerate(self.lengths.items()):
             histories[instance_id] = slice(offset, offset + length)
+            rows[instance_id] = row
             offset += length
-        # K/V removal is fused into the next update's concatenation of surviving histories.
-        self.prepare({i: [token] for i, token in tokens.items()}, histories)
+        # K/V and linear-state removal are fused into the next forward's gathers of surviving histories and rows.
+        self.prepare({i: [token] for i, token in tokens.items()}, histories, rows)
+
+    @staticmethod
+    def linear_states(layer):
+        """Returns a linear-attention cache layer's initialized states, keyed by (kind, state_idx), batch first."""
+        conv = {("conv", i): state for i, state in layer.conv_states.items() if layer.is_conv_states_initialized[i]}
+        recurrent = {("recurrent", i): state for i, state in layer.recurrent_states.items() if layer.is_recurrent_states_initialized[i]}
+        return conv | recurrent
+
+    @staticmethod
+    def load_linear_states(layer, states):
+        """Sets a linear-attention cache layer's states, as returned by linear_states; None empties it for a prefill."""
+        states = {} if states is None else states
+        for i in range(layer.number_of_states):
+            layer.conv_states[i], layer.recurrent_states[i] = states.get(("conv", i)), states.get(("recurrent", i))
+            layer.is_conv_states_initialized[i] = layer.conv_states[i] is not None
+            layer.is_recurrent_states_initialized[i] = layer.recurrent_states[i] is not None
+            layer.has_previous_state[i] = layer.is_conv_states_initialized[i] or layer.is_recurrent_states_initialized[i]
+
+    @staticmethod
+    def route_linear_attention(layers):
+        """Wraps each decoder layer's linear-attention module, the child whose forward takes cache_params, so a VarlenCache runs it through linear_forward.
+
+        Args:
+            layers: iterable of decoder layers; a model without linear attention is left untouched
+        """
+        for module in (child for layer in layers for child in layer.children()):
+            if "cache_params" not in inspect.signature(module.forward).parameters:
+                continue
+
+            def routed(hidden_states, cache_params=None, forward=module.forward, layer_idx=module.layer_idx, **kwargs):
+                if isinstance(cache_params, VarlenCache):
+                    return cache_params.linear_forward(forward, layer_idx, hidden_states)
+                return forward(hidden_states, cache_params=cache_params, **kwargs)
+
+            module.forward = routed
 
 
 class Pipeline:
     """Generation over packed, variable-length instances with flash attention."""
 
     ATTN_IMPLEMENTATION = "flash_attention_2"
-    LORA_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+    LORA_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z", "out_proj")
     RAW_SAMPLING_CONFIG = GenerationConfig(do_sample=True, temperature=1.0, top_k=None, top_p=1.0)
 
     def __init__(self, model_name, max_memory=None, attn_implementation=ATTN_IMPLEMENTATION):
@@ -108,9 +177,11 @@ class Pipeline:
         self.device = self.model.device
         self.config = self.model.config
         self.layers = self.model.get_decoder().layers
+        VarlenCache.route_linear_attention(self.layers)
 
         eos = self.model.generation_config.eos_token_id
-        self.eos_token_ids = eos if isinstance(eos, list) else ([] if eos is None else [eos])
+        eos = eos if isinstance(eos, list) else ([] if eos is None else [eos])
+        self.eos_token_ids = eos + [self.tokenizer.eos_token_id] * (self.tokenizer.eos_token_id not in eos)
 
     @func_cache()
     def texts_to_tokens(self, prompts, system_prompt=None, enable_thinking=False):
