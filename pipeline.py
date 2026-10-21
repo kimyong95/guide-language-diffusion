@@ -320,7 +320,7 @@ class Pipeline:
         while cache.lengths and step < max_new_tokens:
             instance_ids = cache.instance_ids
             outputs = self.model.get_decoder()(**cache.model_inputs())
-            logits = self.model.get_output_embeddings()(outputs.last_hidden_state[0, cache.output_positions]).float()
+            logits = self.model.get_output_embeddings()(outputs.last_hidden_state[0, cache.output_positions]).float().to(self.device)
             # (N, step), unpadded: every live instance has generated step tokens
             log_probs = logits_processors(torch.tensor([generated_tokens[i] for i in instance_ids], device=self.device, dtype=torch.long), logits).log_softmax(-1)
             tokens = torch.multinomial(log_probs.exp(), 1) if generation_config.do_sample else log_probs.argmax(-1, keepdim=True)
