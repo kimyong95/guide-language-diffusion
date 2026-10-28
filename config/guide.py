@@ -13,7 +13,7 @@ def get_config():
     config.algo_mode = "A"  # or "B"
 
     config.model = ml_collections.ConfigDict()
-    config.model.name = "Qwen/Qwen3.8-27B-FP8"
+    config.model.name = "Qwen/Qwen3-4B-Thinking-2507"
     config.model.max_total_tokens = 100000
     config.model.enable_thinking = True
     config.model.reasoning_effort = "medium"
