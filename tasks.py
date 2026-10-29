@@ -21,6 +21,7 @@ from simpletes.node import Node, score_from_metrics
 from simpletes.utils.code_extract import EvolveBlockContext, extract_code_detailed
 from simpletes.utils.task_prep import load_task_requirements
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, truncate_error_in_metrics
+from transformers import AutoModel, AutoTokenizer
 
 
 async def subprocess_run(args, **kwargs):
@@ -187,14 +188,17 @@ class SimpletesTask:
         {suffix}
         ```
         {available_packages_text}
-        Reference:
-        ```{code_fence_tag}
         {inspirations_text}
-        ```
 
         Generate an improved solution with higher score.
     """)
-    INSPIRATION_TEMPLATE = "{code}"
+
+    REFERENCE_TEMPLATE = inspect.cleandoc("""
+        {header}:
+        ```{code_fence_tag}
+        {code}
+        ```
+    """)
 
     def __init__(self, task: str):
         """
@@ -231,12 +235,8 @@ class SimpletesTask:
         )
         self.eval_concurrency = config.eval_concurrency
 
-    @mock.patch.multiple("simpletes.generator", GENERATION_PROMPT_TEMPLATE=GENERATION_PROMPT_TEMPLATE, INSPIRATION_TEMPLATE=INSPIRATION_TEMPLATE)
     def prompts(self, responses: list[str]) -> list[str]:
-        """SimpleTES's Generator.build_prompt of each response's code as its one inspiration, with no failure patterns,
-        under GENERATION_PROMPT_TEMPLATE and INSPIRATION_TEMPLATE.
-
-        Both are patched into simpletes.generator only during the call, so other build_prompt calls keep SimpleTES's.
+        """Each response's code as the one reference of its own prompt.
 
         Args:
             responses: list (G) of str, each holding the EVOLVE-BLOCK markers, e.g. [init_program]
@@ -244,7 +244,37 @@ class SimpletesTask:
         Returns:
             list (G) of str
         """
-        return [self.generator.build_prompt([Node(id="", code=self.extract_code(response), score=0.0)]) for response in responses]
+        return [self.prompt(["Reference"], [response]) for response in responses]
+
+    def prompts_with_experience(self, responses: list[str], scores: list[float]) -> str:
+        """Every response's code as a reference of one prompt, numbered from 1 in the given order with its score.
+
+        Args:
+            responses: list (G) of str, each holding the EVOLVE-BLOCK markers
+            scores: list (G) of float
+
+        Returns:
+            str
+        """
+        return self.prompt([f"Reference {i} (score={score:.6f})" for i, score in enumerate(scores, 1)], responses)
+
+    @mock.patch.multiple("simpletes.generator", GENERATION_PROMPT_TEMPLATE=GENERATION_PROMPT_TEMPLATE, INSPIRATION_TEMPLATE="{code}")
+    def prompt(self, headers: list[str], responses: list[str]) -> str:
+        """SimpleTES's Generator.build_prompt under GENERATION_PROMPT_TEMPLATE, with no failure patterns, its
+        inspirations the responses' codes, each under its header by REFERENCE_TEMPLATE.
+
+        GENERATION_PROMPT_TEMPLATE and INSPIRATION_TEMPLATE are patched into simpletes.generator only during the call,
+        so other build_prompt calls keep SimpleTES's.
+
+        Args:
+            headers: list (G) of str
+            responses: list (G) of str, each holding the EVOLVE-BLOCK markers
+
+        Returns:
+            str
+        """
+        references = "\n\n".join(self.REFERENCE_TEMPLATE.format(header=header, code_fence_tag=self.generator._code_fence_tag, code=self.extract_code(response)) for header, response in zip(headers, responses))
+        return self.generator.build_prompt([Node(id="", code=references, score=0.0)])
 
     def extract_code(self, response: str) -> str | None:
         """The response's code: the seed with its EVOLVE-BLOCK replaced by the response's, stripped; None without an
@@ -310,10 +340,113 @@ class CirclePacking32(SimpletesTask):
         super().__init__("circle_packing/circle_packing_32")
 
 
+class Story:
+    """A story pulled toward the hidden TARGET_STORY, scored by the distance between their hidden states.
+
+    A response's story is its last code block's, of any language. A story's hidden state is MODEL_NAME's last-layer
+    hidden state of its last token, the story tokenized without a chat template, computed on CPU.
+    """
+
+    MODEL_NAME = "Qwen/Qwen3-0.6B"
+    TARGET_STORY = "A playful puppy and a sleepy bear chased each other through the forest, then shared a pot of yummy honey."
+    init_program = inspect.cleandoc("""
+        ```text
+        A small boat drifted slowly across the quiet lake at dawn.
+        ```
+    """)
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        With reference to the following story, create a new story in one sentence.
+
+        {references}
+
+        Write the new story within a text block.
+    """)
+    REFERENCE_TEMPLATE = inspect.cleandoc("""
+        {header}:
+        {story}
+    """)
+    STORY_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
+
+    def __init__(self):
+        self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
+        self.model = AutoModel.from_pretrained(self.MODEL_NAME, dtype=torch.float32)
+        self.hidden_state_target = self.hidden_state(self.TARGET_STORY)
+
+    def prompts(self, responses: list[str]) -> list[str]:
+        """Each response's story as the one reference of its own prompt.
+
+        Args:
+            responses: list (G) of str, each holding a code block, e.g. [init_program]
+
+        Returns:
+            list (G) of str
+        """
+        return [self.prompt(["Reference"], [response]) for response in responses]
+
+    def prompts_with_experience(self, responses: list[str], scores: list[float]) -> str:
+        """Every response's story as a reference of one prompt, numbered from 1 in the given order with its score.
+
+        Args:
+            responses: list (G) of str, each holding a code block
+            scores: list (G) of float
+
+        Returns:
+            str
+        """
+        return self.prompt([f"Reference {i} (score={score:.2f})" for i, score in enumerate(scores, 1)], responses)
+
+    def prompt(self, headers: list[str], responses: list[str]) -> str:
+        """PROMPT_TEMPLATE of the responses' stories, each under its header by REFERENCE_TEMPLATE.
+
+        Args:
+            headers: list (G) of str
+            responses: list (G) of str, each holding a code block
+
+        Returns:
+            str
+        """
+        references = "\n\n".join(self.REFERENCE_TEMPLATE.format(header=header, story=self.extract_story(response)) for header, response in zip(headers, responses))
+        return self.PROMPT_TEMPLATE.format(references=references)
+
+    def extract_story(self, response: str) -> str | None:
+        """The response's last code block, of any language, stripped, its closing fence optional at the end; None
+        without one or when it is empty."""
+        stories = self.STORY_BLOCK.findall(response)
+        return (stories[-1].strip() or None) if stories else None
+
+    @torch.no_grad()
+    def hidden_state(self, story: str) -> torch.Tensor:
+        """MODEL_NAME's last-layer hidden state of the story's last token.
+
+        Args:
+            story: str, nonempty
+
+        Returns:
+            (D,) float32
+        """
+        input_ids = self.tokenizer(story, return_tensors="pt").input_ids
+        return self.model(input_ids).last_hidden_state[0, -1]
+
+    def evaluate(self, responses: list[str]) -> torch.Tensor:
+        """Evaluates the responses one by one.
+
+        Args:
+            responses: list (N) of str, each holding a code block
+
+        Returns:
+            (N,) float64, the negative Euclidean distance between each response's story's hidden state and
+            TARGET_STORY's, 0 for a perfect match; -inf without a story
+        """
+        stories = [self.extract_story(response) for response in responses]
+        rewards = [-torch.dist(self.hidden_state(story), self.hidden_state_target).item() if story else -math.inf for story in stories]
+        return torch.tensor(rewards, dtype=torch.float64)
+
+
 TASKS_CLS = {
     "openfoam": OpenFOAM,
     "circle-packing-26": CirclePacking26,
     "circle-packing-32": CirclePacking32,
+    "story": Story,
 }
 
 def get_reward_fn(task_name: str):
