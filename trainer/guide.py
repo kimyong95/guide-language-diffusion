@@ -1,12 +1,14 @@
 """Mutates config.task's SimpleTES seed program toward a higher reward by sampling config.model.name inside vLLM, each
 response anchored on one buffer program and guided by every buffer program's weight, no training.
 
-The buffer starts as the task's seed program alone, so there is no initial generation. Every one of config.L iterations
-samples config.N new responses over the buffer's G programs, response n anchored on program i = n mod G, under
-log p_i + Σ_k w_ik log p_k, its thinking included; p_k is the model under SimpleTES's own generation prompt holding
-program k's code alone with its metrics, thinking at config.model.reasoning_effort when config.model.enable_thinking, scoring
-response n after its own prompt. A response's answer is what follows its </think> when thinking, empty when its thinking
-never ends, and the whole response otherwise. The weights follow config.algo_mode. "A" pulls
+The buffer starts as the task's seed program alone, taken as a response, so there is no initial generation. Every one
+of config.L iterations samples config.N new responses over the buffer's G responses, response n anchored on response
+i = n mod G, under log p_i + Σ_k w_ik log p_k, its thinking included; p_k is the model under the task's prompts of
+response k, SimpleTES's generation prompt in tasks.py's templates with its code as the one reference, thinking at
+config.model.reasoning_effort when
+config.model.enable_thinking, scoring response n after its own prompt. A response's answer is what follows its </think>
+when thinking, empty when its thinking never ends, and the whole response otherwise. The weights follow
+config.algo_mode. "A" pulls
 program i toward the programs above it and pushes it from those below in proportion to the reward gap d_ik = r_k - r_i,
 each side normalised by its gap sum, D⁺_i = Σ_{d_ik > 0} d_ik and D⁻_i = Σ_{d_ik < 0} |d_ik|, so the positive weights sum
 to 1 and the negative to -1; i fills its own empty side, w_ii = 1 as the best and -1 as the worst, and ties get 0. "B"
@@ -14,12 +16,12 @@ gives every anchor the same weights w_k = (r̃_k - r̄) / (G r̄ (1 - r̄)), r̃
 r̄ their mean, so they sum to 0. Each response's weights 1[k = i] + w_ik thus sum to 1; all rewards tied gives w = 0,
 each response sampling from its anchor alone.
 
-All N responses are sampled together by one llm.generate call of N × G vLLM requests, request (n, k) holding prompt k and
-response n as group n, so every response's G guides run in parallel. GuideLogitsProcessor, a vLLM batch-level logits processor, sees
-every request's logits at every step; it combines each group's rows as their weighted logits, sampling as the weighted
-log probabilities since the weights sum to 1, samples one token from its softmax at the requests' temperature, the
-model's generation config's, with no top-k or top-p filter, and leaves that token the only finite logit in each of the
-group's rows, so all its guides advance by the same token and stop together.
+All N responses are sampled together by one llm.generate call of N × G vLLM requests, request (n, k) holding prompt k
+and response n as group n, so every response's G guides run in parallel. GuideLogitsProcessor, a vLLM batch-level
+logits processor, sees every request's logits at every step; it combines each group's rows as their weighted logits,
+sampling as the weighted log probabilities since the weights sum to 1, samples one token from its softmax at the
+requests' temperature, the model's generation config's, with no top-k or top-p filter, and leaves that token the only
+finite logit in each of the group's rows, so all its guides advance by the same token and stop together.
 
 A group's requests must share every step from their first: vLLM's engine core runs in this process, so it steps only
 once a call has added every request; max_num_seqs, N², fits every request as G ≤ N, and max_num_batched_tokens,
@@ -28,11 +30,10 @@ step. Every request gets vLLM's default budget, config.model.max_total_tokens mi
 it ends one request before the rest of its group. apply raises when a group is split, as by that or by a preemption once
 the KV cache runs out, or its outputs differ in length.
 
-A response's code is the seed with its EVOLVE-BLOCK replaced by the answer's, saved to config.output_dir as
-circle-{l}-{n}.py; its reward r is score_from_metrics of the task's metrics. A response without an EVOLVE-BLOCK or a code
-the evaluator rejects scores -inf and is dropped. The buffer then keeps the N highest-reward codes, with their metrics,
-among the new ones and itself, the new ones first on ties. Each iteration logs every reward and code to wandb, -inf and
-"" included.
+Each response is saved to config.output_dir as circle-{l}-{n}.md, and its reward r is the task's evaluate; a response
+without an EVOLVE-BLOCK or one whose code the evaluator rejects scores -inf and is dropped. The buffer then keeps the N
+highest-reward responses among the new ones and itself, the new ones first on ties. Each iteration logs every reward
+and response to wandb, -inf and "" included.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/guide.py --config config/guide.py
 """
@@ -47,7 +48,6 @@ import torch
 import wandb
 from absl import flags
 from ml_collections import config_flags
-from simpletes.node import score_from_metrics
 from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessor
 from vllm.v1.sample.logits_processor.builtin import process_dict_updates
 
@@ -163,6 +163,7 @@ class Trainer(BaseTrainer):
         super().setup_pipeline(
             max_num_seqs=self.config.N ** 2,
             max_num_batched_tokens=self.config.model.max_total_tokens,
+            gpu_memory_utilization=0.85,
             logits_processors=[GuideLogitsProcessor],
         )
 
@@ -191,28 +192,24 @@ class Trainer(BaseTrainer):
     def run(self):
         """Runs config.L iterations of guided sampling, evaluation and buffer update from the seed program."""
         task, L, N = self.task, self.config.L, self.config.N
-        init_metrics = task.evaluate([task.init_program])[0]
-        init_metrics.pop("code")
-        buffer = [{"code": task.init_program, "metrics": init_metrics, "reward": score_from_metrics(init_metrics)}]
+        buffer = [{"response": task.init_program, "reward": task.evaluate([task.init_program]).item()}]
         for l in range(L):
-            prompts = [task.prompt([data_i["code"]], [data_i["metrics"]]) for data_i in buffer]
+            prompts = task.prompts([data_i["response"] for data_i in buffer])
             weights = GUIDE_WEIGHTS[self.config.algo_mode]([data_i["reward"] for data_i in buffer])
             responses = self.guided_generate(prompts, weights, N)
-            metrics = task.evaluate(responses)
-            codes = [metrics_i.pop("code") for metrics_i in metrics]
-            rewards = torch.tensor([score_from_metrics(metrics_i) for metrics_i in metrics], dtype=torch.float64)
+            rewards = task.evaluate(responses)
             data = []
-            for n, (code, metrics_i, reward) in enumerate(zip(codes, metrics, rewards.tolist())):
-                with open(os.path.join(self.config.output_dir, f"circle-{l}-{n}.py"), "w") as f:
-                    f.write(code or "")
+            for n, (response, reward) in enumerate(zip(responses, rewards.tolist())):
+                with open(os.path.join(self.config.output_dir, f"circle-{l}-{n}.md"), "w") as f:
+                    f.write(response)
                 if math.isfinite(reward):
-                    data.append({"code": code, "metrics": metrics_i, "reward": reward})
+                    data.append({"response": response, "reward": reward})
             buffer = sorted(data + buffer, key=lambda data_i: data_i["reward"], reverse=True)[:N]
 
             objective_evaluations = (l + 1) * N
             extra = {"best": buffer[0]["reward"]}
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards, extra=extra)
-            self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=[code or "" for code in codes])
+            self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=responses)
 
         wandb.finish()
 

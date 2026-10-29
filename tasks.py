@@ -8,9 +8,11 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from unittest import mock
 import numpy as np
 import shapely
 import simpletes
+import torch
 import trimesh
 from simpletes.config import EngineConfig, resolve_eval_python, task_dir_from_evaluator_path
 from simpletes.evaluator import EvaluatorWorker
@@ -18,6 +20,7 @@ from simpletes.generator import Generator
 from simpletes.node import Node, score_from_metrics
 from simpletes.utils.code_extract import EvolveBlockContext, extract_code_detailed
 from simpletes.utils.task_prep import load_task_requirements
+from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, truncate_error_in_metrics
 
 
 async def subprocess_run(args, **kwargs):
@@ -44,7 +47,7 @@ async def subprocess_run(args, **kwargs):
 class OpenFOAM:
     """Drag coefficient of a car, simulated with OpenFOAM v14 (Foundation) following its official drivaerFastback case.
 
-    evaluate_one_async builds the car by running the response's bpy script in headless Blender and exporting the scene to STL,
+    evaluate_one builds the car by running the response's bpy script in headless Blender and exporting the scene to STL,
     BLENDER_SCRIPT as execute-blender.py does before rendering. It then runs IMAGE, microfluidica's docker image of the
     Foundation's own packages, on a copy of the image's tutorials/incompressibleFluid/drivaerFastback. OPENFOAM_COMMAND changes
     only the entries tagged by their source: [DrivAerNet++] following Elrefaie et al. (NeurIPS 2024), [ours] otherwise.
@@ -98,15 +101,10 @@ class OpenFOAM:
         return self.PROMPT_TEMPLATE
 
     def evaluate(self, responses: list[str]) -> list[float | None]:
-        """evaluate_async, blocking until every response is evaluated.
+        """Evaluates the responses with evaluate_one, N_PARALLEL at a time, blocking until all are done.
 
-        Ctrl+C cancels every evaluate_one_async, each removing its container and temporary directory, then raises
+        Ctrl+C cancels every evaluate_one, each removing its container and temporary directory, then raises
         KeyboardInterrupt.
-        """
-        return asyncio.run(self.evaluate_async(responses))
-
-    async def evaluate_async(self, responses: list[str]) -> list[float | None]:
-        """Evaluates the responses with evaluate_one_async, N_PARALLEL at a time.
 
         Args:
             responses: list (N) of str
@@ -115,9 +113,13 @@ class OpenFOAM:
             list (N) of float, each response's C_d, None where it failed
         """
         semaphore = asyncio.Semaphore(self.N_PARALLEL)
-        return await asyncio.gather(*(self.evaluate_one_async(response, semaphore) for response in responses))
 
-    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float | None:
+        async def evaluate_async():
+            return await asyncio.gather(*(self.evaluate_one(response, semaphore) for response in responses))
+
+        return asyncio.run(evaluate_async())
+
+    async def evaluate_one(self, response: str, semaphore: asyncio.Semaphore) -> float | None:
         """Builds the response's car in Blender, simulates it in a docker container and reads its drag coefficient.
 
         Every file lives in one temporary directory, removed with the container on any exception or cancellation.
@@ -149,7 +151,7 @@ class OpenFOAM:
                     header = [line for line in lines if line.startswith("#")][-1].lstrip("#").split()
                     Cd = float(np.loadtxt(lines, comments="#")[-self.AVERAGE_LAST:, header.index("Cd")].mean())
                 except Exception as exception:
-                    print(f"OpenFOAM.evaluate_one_async failed: {exception!r}", file=sys.stderr)
+                    print(f"OpenFOAM.evaluate_one failed: {exception!r}", file=sys.stderr)
                     return None
                 finally:
                     subprocess.run(f"docker rm -f {name}".split(), capture_output=True)
@@ -161,10 +163,38 @@ class SimpletesTask:
     under SimpleTES's datasets; subclasses only pass that directory.
 
     A response's code is the seed with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's own
-    extract_code_detailed, so only the code between the markers counts. Programs are evaluated as SimpleTES's engine
-    does: its EvaluatorWorker runs the task's evaluator in a fresh subprocess per program, EngineConfig's
-    eval_concurrency at a time, killed after its eval_timeout.
+    extract_code_detailed, so only the code between the markers counts. Codes are evaluated as SimpleTES's engine
+    does: its EvaluatorWorker runs the task's evaluator in a fresh subprocess per code, EngineConfig's eval_concurrency
+    at a time, killed after its eval_timeout, its error truncated to DEFAULT_METRICS_ERROR_MAX_CHARS.
     """
+
+    GENERATION_PROMPT_TEMPLATE = inspect.cleandoc("""
+        Task: {instruction}
+
+        Generation instruction (must follow exactly):
+        1) Only the code between `{start_marker_line}` and `{end_marker_line}` is extracted.
+        2) The final program is reconstructed as EXACT_PREFIX + evolved_block + EXACT_SUFFIX.
+        3) Keep marker lines exactly as written.
+        4) Return one {language_name} code block that includes both EVOLVE-BLOCK markers.
+
+        EXACT_PREFIX (kept unchanged):
+        ```{code_fence_tag}
+        {prefix}
+        ```
+
+        EXACT_SUFFIX (kept unchanged):
+        ```{code_fence_tag}
+        {suffix}
+        ```
+        {available_packages_text}
+        Reference:
+        ```{code_fence_tag}
+        {inspirations_text}
+        ```
+
+        Generate an improved solution with higher score.
+    """)
+    INSPIRATION_TEMPLATE = "{code}"
 
     def __init__(self, task: str):
         """
@@ -201,69 +231,71 @@ class SimpletesTask:
         )
         self.eval_concurrency = config.eval_concurrency
 
-    def prompt(self, codes: list[str], metrics: list[dict], reflections: list[str | None] | None = None, failure_patterns: dict[str, float] | None = None) -> str:
-        """SimpleTES's own generation prompt, holding the codes as its inspirations.
+    @mock.patch.multiple("simpletes.generator", GENERATION_PROMPT_TEMPLATE=GENERATION_PROMPT_TEMPLATE, INSPIRATION_TEMPLATE=INSPIRATION_TEMPLATE)
+    def prompts(self, responses: list[str]) -> list[str]:
+        """SimpleTES's Generator.build_prompt of each response's code as its one inspiration, with no failure patterns,
+        under GENERATION_PROMPT_TEMPLATE and INSPIRATION_TEMPLATE.
+
+        Both are patched into simpletes.generator only during the call, so other build_prompt calls keep SimpleTES's.
 
         Args:
-            codes: list (G) of str, each a whole program's code, e.g. [init_program]
-            metrics: list (G) of dict, each code's metrics from evaluate, without "code"
-            reflections: list (G) of str or None, each code's reflection; None for none
-            failure_patterns: dict of str to float, each error summary's frequency, as the selector's select returns;
-                None for none
+            responses: list (G) of str, each holding the EVOLVE-BLOCK markers, e.g. [init_program]
 
         Returns:
-            str, Generator.build_prompt under EngineConfig's default selector, the codes sorted by score_from_metrics,
-            stably
+            list (G) of str
         """
-        reflections = reflections or [None] * len(codes)
-        return self.generator.build_prompt(
-            [Node(id="", code=code, metrics=metrics_i, score=score_from_metrics(metrics_i), reflection=reflection) for code, metrics_i, reflection in zip(codes, metrics, reflections)],
-            failure_patterns,
-        )
+        return [self.generator.build_prompt([Node(id="", code=self.extract_code(response), score=0.0)]) for response in responses]
 
-    def evaluate(self, responses: list[str]) -> list[dict]:
-        """evaluate_async, blocking until every response is evaluated.
+    def extract_code(self, response: str) -> str | None:
+        """The response's code: the seed with its EVOLVE-BLOCK replaced by the response's, stripped; None without an
+        EVOLVE-BLOCK."""
+        code, _ = extract_code_detailed(response, self.evolve_context)
+        return code and code.strip()
 
-        Ctrl+C cancels every evaluate_one_async, the EvaluatorWorker killing its subprocess, then raises
-        KeyboardInterrupt.
-        """
-        return asyncio.run(self.evaluate_async(responses))
+    def evaluate(self, responses: list[str]) -> torch.Tensor:
+        """Evaluates the responses with evaluate_one, eval_concurrency at a time, blocking until all are done.
 
-    async def evaluate_async(self, responses: list[str]) -> list[dict]:
-        """Evaluates the responses with evaluate_one_async, eval_concurrency at a time.
+        Ctrl+C cancels every evaluate_one, the EvaluatorWorker killing its subprocess, then raises KeyboardInterrupt.
 
         Args:
-            responses: list (N) of str
+            responses: list (N) of str, each holding the EVOLVE-BLOCK markers, preferably within a code block
 
         Returns:
-            list (N) of dict, each response's metrics
+            (N,) float64, each response's score_from_metrics, higher is better; -inf without an EVOLVE-BLOCK or on any
+            evaluator error
         """
         semaphore = asyncio.Semaphore(self.eval_concurrency)
-        return await asyncio.gather(*(self.evaluate_one_async(response, semaphore) for response in responses))
 
-    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> dict:
-        """Evaluates the response's code with the EvaluatorWorker.
+        async def evaluate_async():
+            return await asyncio.gather(*(self.evaluate_one(response, semaphore) for response in responses))
+
+        return torch.tensor(asyncio.run(evaluate_async()), dtype=torch.float64)
+
+    async def evaluate_one(self, response: str, semaphore: asyncio.Semaphore) -> float:
+        """Extracts the response's code and evaluates it as SimpleTES's engine's _evaluate_code does.
 
         Args:
-            response: str, holding the EVOLVE-BLOCK markers, preferably within a code block
+            response: str
             semaphore: asyncio.Semaphore, held during the evaluation
 
         Returns:
-            dict, the evaluator's metrics as SimpleTES's engine gets them, {"error": ..., "combined_score": -inf} when
-            the evaluator crashes or times out; {"error": reason, "combined_score": -inf} when the response has no
-            EVOLVE-BLOCK. score_from_metrics gives the score, higher is better, -inf on any error. Its "code" is the
-            response's code, None without an EVOLVE-BLOCK; pop it before the metrics reach a Node, since build_prompt
-            and the reflection prompt list every metric
+            float, the metrics' score_from_metrics: their combined_score, -inf on any error; the metrics are
+            {"error": ..., "combined_score": -inf} without an EVOLVE-BLOCK or when the evaluator crashes, times out or
+            raises
         """
         code, reason = extract_code_detailed(response, self.evolve_context)
 
         if code is None:
-            return {"error": reason, "combined_score": -math.inf, "code": None}
+            metrics = {"error": reason, "combined_score": -math.inf}
+        else:
+            async with semaphore:
+                try:
+                    metrics = (await self.evaluator.evaluate(code)).metrics
+                except Exception as exception:
+                    metrics = {"error": str(exception), "combined_score": -math.inf}
+            metrics = truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
 
-        async with semaphore:
-            metrics = (await self.evaluator.evaluate(code)).metrics
-
-        return {**metrics, "code": code}
+        return score_from_metrics(metrics)
 
 
 class CirclePacking26(SimpletesTask):
