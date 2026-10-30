@@ -1,5 +1,6 @@
 import dataclasses
 import torch
+import os
 
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
@@ -20,7 +21,8 @@ class Pipeline:
         response together, kwargs go to vllm.LLM, such as max_num_seqs or logits_processors."""
         self.llm = LLM(
             model=model_name, tensor_parallel_size=torch.cuda.device_count(), max_model_len=max_total_tokens,
-            generation_config="auto", seed=seed, language_model_only=True, **kwargs,
+            generation_config="auto", seed=seed, language_model_only=True,
+            disable_custom_all_reduce=os.environ.get("NCCL_P2P_DISABLE") == "1", **kwargs,
         )
         self.sampling_kwargs = {**self.llm.model_config.get_diff_sampling_param(), "max_tokens": None}
         self.tokenizer = self.llm.get_tokenizer()
