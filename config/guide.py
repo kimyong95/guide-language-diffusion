@@ -6,7 +6,6 @@ def get_config():
     config.seed = 0
     config.run_name = "guide"
     config.task = "circle-packing-26"
-    config.output_dir = "checkpoints/guide"
 
     config.L = 100
     config.N = 5

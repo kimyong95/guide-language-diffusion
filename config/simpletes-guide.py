@@ -6,7 +6,6 @@ def get_config():
     config.seed = 0
     config.run_name = "simpletes-guide"
     config.task = "circle-packing-26"
-    config.output_dir = "checkpoints/simpletes-guide"
 
     config.L = 1000
     config.C = 4

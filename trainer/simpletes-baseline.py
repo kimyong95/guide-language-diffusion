@@ -15,10 +15,10 @@ Each chain's best new node then gets its reflection, as the policy's reflection_
 SimpleTES's reflection prompt over that node's prompt, code and metrics, sampled as for generation, and the answer is
 kept only when it starts with "Approach". The policy then appends that node to the chain.
 
-A response's code is saved to config.output_dir as circle-{l}-{chain_idx}-{k}.py. A response without an EVOLVE-BLOCK
-is a failed generation, never evaluated, and a code with a non-finite combined_score is dropped; a code with an
-evaluator error but a finite combined_score joins the database at score -inf, its error counting toward the chain's
-failure patterns. Each step logs every reward and code to wandb, a failed generation's as -inf and "".
+A response without an EVOLVE-BLOCK is a failed generation, never evaluated, and a code with a non-finite combined_score
+is dropped; a code with an evaluator error but a finite combined_score joins the database at score -inf, its error
+counting toward the chain's failure patterns. Each step logs every reward and code to wandb, a failed generation's as
+-inf and "".
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/simpletes-baseline.py --config config/simpletes-baseline.py
 """
@@ -26,7 +26,6 @@ Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/simpletes-baseline.p
 import asyncio
 import itertools
 import math
-import os
 import random
 import sys
 import uuid
@@ -59,7 +58,6 @@ class Trainer(BaseTrainer):
             max_generations=config.L * config.C * config.K,
             k=config.K,
         )
-        os.makedirs(config.output_dir, exist_ok=True)
 
     def setup_task(self):
         """Takes config.task's seed program, EVOLVE-BLOCK context, generator and EvaluatorWorker from its tasks.py task."""
@@ -128,10 +126,8 @@ class Trainer(BaseTrainer):
             prompts, responses = self.generate(all_inspirations, all_failure_patterns)
 
             nodes, pendings = [], []
-            for (c, k), response in zip(itertools.product(range(C), range(K)), responses):
+            for (c, _), response in zip(itertools.product(range(C), range(K)), responses):
                 code, _ = extract_code_detailed(response, self.evolve_context)
-                with open(os.path.join(self.config.output_dir, f"circle-{l}-{chain_idxs[c]}-{k}.py"), "w") as f:
-                    f.write(code or "")
                 if code is None:
                     pendings.append(self.selector.on_generation_failed(gen_ids[c]))
                 else:
