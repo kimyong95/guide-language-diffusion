@@ -9,12 +9,11 @@ def get_config():
 
     config.L = 100
     config.N = 5
-    config.algo_mode = "A"  # or "B"
 
     config.model = ml_collections.ConfigDict()
-    config.model.name = "Qwen/Qwen3-4B-Thinking-2507"
+    config.model.name = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
     config.model.max_total_tokens = 100000
-    config.model.enable_thinking = True
+    config.model.enable_thinking = False
     config.model.reasoning_effort = "medium"
 
     return config

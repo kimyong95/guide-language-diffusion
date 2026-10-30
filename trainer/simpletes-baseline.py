@@ -7,12 +7,12 @@ fresh subprocess, EngineConfig's eval_concurrency at a time, killed after its ev
 to DEFAULT_METRICS_ERROR_MAX_CHARS. The seed is evaluated EngineConfig.init_eval_repeats times at once, keeping the
 best metrics.
 
-Every one of config.L steps samples each of config.C chains once. SimpleTES's balance policy picks up to config.N of the
-chain's nodes, the generator's prompt holds them with their metrics and reflections and the chain's failure patterns,
-and the model answers it config.K times under its generation config, thinking at config.model.reasoning_effort when
-config.model.enable_thinking.
-Each chain's best new node then gets its reflection, as the policy's reflection_mode would: the model answers
-SimpleTES's reflection prompt over that node's prompt, code and metrics, sampled as for generation, and the answer is
+Every one of config.L steps samples each of config.C chains once. SimpleTES's RPUCG policy, at EngineConfig's puct_c and
+rpucg_gamma as SimpleTES's engine passes them, picks up to config.N of the chain's nodes, the generator's prompt holds
+them with their metrics and reflections and the chain's failure patterns, and the model answers it config.K times under
+its generation config, thinking at config.model.reasoning_effort when config.model.enable_thinking.
+Each chain's best new node then gets its reflection, as the policy's reflection_mode would: the model answers the
+policy's reflection prompt over that node's prompt, code and metrics, sampled as for generation, and the answer is
 kept only when it starts with "Approach". The policy then appends that node to the chain.
 
 A response without an EVOLVE-BLOCK is a failed generation, never evaluated, and a code with a non-finite combined_score
@@ -36,8 +36,8 @@ from absl import flags
 from ml_collections import config_flags
 from simpletes.config import EngineConfig
 from simpletes.node import Node, NodeDatabase, Status, score_from_metrics
-from simpletes.policies.balance import BalancePolicy
 from simpletes.policies.base import _MAX_REFLECTION_OUTPUT_CHARS
+from simpletes.policies.rpucg import RpucgPolicy
 from simpletes.utils.code_extract import extract_code_detailed
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, extract_approach_insight, metrics_to_text, truncate_error_in_metrics
 
@@ -53,10 +53,12 @@ class Trainer(BaseTrainer):
         super().__init__(config)
         random.seed(config.seed)
         self.db = NodeDatabase()
-        self.selector = BalancePolicy(
+        self.selector = RpucgPolicy(
             num_chains=config.C,
             max_generations=config.L * config.C * config.K,
             k=config.K,
+            c=EngineConfig.puct_c,
+            gamma=EngineConfig.rpucg_gamma,
         )
 
     def setup_task(self):

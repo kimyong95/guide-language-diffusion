@@ -41,7 +41,7 @@ class Pipeline:
         Returns:
             2D list (N, Lp), ragged
         """
-        assert enable_thinking or "enable_thinking" in self.tokenizer.chat_template, "chat template does not support enable_thinking=False"
+        assert enable_thinking or "enable_thinking" in self.tokenizer.chat_template or "<think>" not in self.tokenizer.chat_template, "chat template does not support enable_thinking=False"
         system = [] if system_prompt is None else [{"role": "system", "content": system_prompt}]
         effort = {} if reasoning_effort is None else {"reasoning_effort": reasoning_effort}
         return [
