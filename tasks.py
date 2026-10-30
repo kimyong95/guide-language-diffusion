@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import glob
 import inspect
 import math
@@ -8,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from unittest import mock
 import numpy as np
 import shapely
 import simpletes
@@ -17,7 +17,7 @@ import trimesh
 from simpletes.config import EngineConfig, resolve_eval_python, task_dir_from_evaluator_path
 from simpletes.evaluator import EvaluatorWorker
 from simpletes.generator import Generator
-from simpletes.node import Node, score_from_metrics
+from simpletes.node import score_from_metrics
 from simpletes.utils.code_extract import EvolveBlockContext, extract_code_detailed
 from simpletes.utils.task_prep import load_task_requirements
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, truncate_error_in_metrics
@@ -161,7 +161,8 @@ class OpenFOAM:
 
 class SimpletesTask:
     """A SimpleTES task, its problem statement, seed program, evaluator and generation prompt taken from its directory
-    under SimpleTES's datasets; subclasses only pass that directory.
+    under SimpleTES's datasets; subclasses only pass that directory and the name of its score. Its generator builds
+    SimpleTES's rpucg prompt.
 
     A response's code is the seed with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's own
     extract_code_detailed, so only the code between the markers counts. Codes are evaluated as SimpleTES's engine
@@ -169,7 +170,7 @@ class SimpletesTask:
     at a time, killed after its eval_timeout, its error truncated to DEFAULT_METRICS_ERROR_MAX_CHARS.
     """
 
-    GENERATION_PROMPT_TEMPLATE = inspect.cleandoc("""
+    PROMPT_TEMPLATE = inspect.cleandoc("""
         Task: {instruction}
 
         Generation instruction (must follow exactly):
@@ -188,23 +189,43 @@ class SimpletesTask:
         {suffix}
         ```
         {available_packages_text}
-        {inspirations_text}
-
-        Generate an improved solution with higher score.
+        {in_context_text}
     """)
 
-    REFERENCE_TEMPLATE = inspect.cleandoc("""
-        {header}:
+    UNLABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
+        In-context inspiration:
+        ```{code_fence_tag}
+        {code}
+        ```
+
+        Create an improved program with higher {metric}. Try diverse approaches to solve the problem. Think outside the box.
+    """)
+
+    LABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
+        In-context inspirations (sorted by score, higher is better):
+
+        {item}
+
+        Analyze the inspirations above and create an improved program with higher {metric}. Try diverse approaches to solve the problem. Think outside the box.
+    """)
+
+    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        --- Inspiration {index} ---
+        Score: {score}
+        Code:
         ```{code_fence_tag}
         {code}
         ```
     """)
 
-    def __init__(self, task: str):
+    def __init__(self, task: str, metric: str):
         """
         Args:
             task: str, the task's directory under SimpleTES's datasets, e.g. "circle_packing/circle_packing_26"
+            metric: str, the score's name in the prompts' closing instruction, e.g. "sum_radii"
         """
+        self.metric = metric
+
         # Setup paths
         task_dir = os.path.join(os.path.dirname(os.path.dirname(simpletes.__file__)), "datasets", task)
         self.instruction_path = os.path.join(task_dir, f"{os.path.basename(task)}.txt")
@@ -222,9 +243,11 @@ class SimpletesTask:
             evaluator_path=self.evaluator_path,
             instruction_path=self.instruction_path,
             gen_concurrency=0,
+            selector="rpucg",
             eval_python=resolve_eval_python(evaluator_path=self.evaluator_path, eval_venv=None),
         )
         self.generator = Generator(config, self.instruction, self.evolve_context, load_task_requirements(task_dir_from_evaluator_path(self.evaluator_path))[1])
+        self.preformat_prompt_templates()
 
         # Setup evaluator
         self.evaluator = EvaluatorWorker(
@@ -235,8 +258,30 @@ class SimpletesTask:
         )
         self.eval_concurrency = config.eval_concurrency
 
+    def preformat_prompt_templates(self):
+        """Replaces each prompt template, on the instance, by a functools.partial of its str.format pre-filling the
+        fields that the task fixes, taking the rest: PROMPT_TEMPLATE in_context_text,
+        UNLABELLED_IN_CONTEXT_TEMPLATE code, LABELLED_IN_CONTEXT_TEMPLATE item, LABELLED_IN_CONTEXT_ITEM_TEMPLATE index,
+        score and code."""
+        packages = self.generator._available_packages
+        self.PROMPT_TEMPLATE = functools.partial(
+            self.PROMPT_TEMPLATE.format,
+            instruction=self.instruction,
+            start_marker_line=self.evolve_context.start_marker_line,
+            end_marker_line=self.evolve_context.end_marker_line,
+            language_name=self.generator._language_name,
+            code_fence_tag=self.generator._code_fence_tag,
+            prefix=self.evolve_context.prefix.rstrip("\n"),
+            suffix=self.evolve_context.suffix.rstrip("\n"),
+            available_packages_text="\nAvailable packages from requirements.txt (these are the task-local dependencies you can use):\n" + "".join(f"- {package}\n" for package in packages) if packages else "",
+        )
+        self.UNLABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.UNLABELLED_IN_CONTEXT_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag, metric=self.metric)
+        self.LABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_TEMPLATE.format, metric=self.metric)
+        self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag)
+
     def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's code as the one reference of its own prompt.
+        """Each response's code as the one in-context inspiration of its own prompt, PROMPT_TEMPLATE's
+        in_context_text by UNLABELLED_IN_CONTEXT_TEMPLATE.
 
         Args:
             responses: list (G) of str, each holding the EVOLVE-BLOCK markers, e.g. [init_program]
@@ -244,10 +289,16 @@ class SimpletesTask:
         Returns:
             list (G) of str
         """
-        return [self.prompt(["Reference"], [response]) for response in responses]
+        prompts = []
+        for response in responses:
+            in_context_text = self.UNLABELLED_IN_CONTEXT_TEMPLATE(code=self.extract_code(response))
+            prompts.append(self.PROMPT_TEMPLATE(in_context_text=in_context_text))
+        return prompts
 
     def prompts_with_experience(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's code as a reference of one prompt, numbered from 1 in the given order with its score.
+        """Every response's code as an in-context inspiration of one prompt, PROMPT_TEMPLATE's in_context_text
+        by LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 by
+        score, highest first.
 
         Args:
             responses: list (G) of str, each holding the EVOLVE-BLOCK markers
@@ -256,25 +307,11 @@ class SimpletesTask:
         Returns:
             str
         """
-        return self.prompt([f"Reference {i} (score={score:.6f})" for i, score in enumerate(scores, 1)], responses)
-
-    @mock.patch.multiple("simpletes.generator", GENERATION_PROMPT_TEMPLATE=GENERATION_PROMPT_TEMPLATE, INSPIRATION_TEMPLATE="{code}")
-    def prompt(self, headers: list[str], responses: list[str]) -> str:
-        """SimpleTES's Generator.build_prompt under GENERATION_PROMPT_TEMPLATE, with no failure patterns, its
-        inspirations the responses' codes, each under its header by REFERENCE_TEMPLATE.
-
-        GENERATION_PROMPT_TEMPLATE and INSPIRATION_TEMPLATE are patched into simpletes.generator only during the call,
-        so other build_prompt calls keep SimpleTES's.
-
-        Args:
-            headers: list (G) of str
-            responses: list (G) of str, each holding the EVOLVE-BLOCK markers
-
-        Returns:
-            str
-        """
-        references = "\n\n".join(self.REFERENCE_TEMPLATE.format(header=header, code_fence_tag=self.generator._code_fence_tag, code=self.extract_code(response)) for header, response in zip(headers, responses))
-        return self.generator.build_prompt([Node(id="", code=references, score=0.0)])
+        inspirations = []
+        for i, (score, response) in enumerate(sorted(zip(scores, responses), key=lambda pair: pair[0], reverse=True), 1):
+            inspirations.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE(index=i, score=score, code=self.extract_code(response)))
+        in_context_text = self.LABELLED_IN_CONTEXT_TEMPLATE(item="\n\n".join(inspirations))
+        return self.PROMPT_TEMPLATE(in_context_text=in_context_text)
 
     def extract_code(self, response: str) -> str | None:
         """The response's code: the seed with its EVOLVE-BLOCK replaced by the response's, stripped; None without an
@@ -331,13 +368,13 @@ class SimpletesTask:
 class CirclePacking26(SimpletesTask):
 
     def __init__(self):
-        super().__init__("circle_packing/circle_packing_26")
+        super().__init__("circle_packing/circle_packing_26", metric="sum_radii")
 
 
 class CirclePacking32(SimpletesTask):
 
     def __init__(self):
-        super().__init__("circle_packing/circle_packing_32")
+        super().__init__("circle_packing/circle_packing_32", metric="sum_radii")
 
 
 class Story:
@@ -357,12 +394,16 @@ class Story:
     PROMPT_TEMPLATE = inspect.cleandoc("""
         With reference to the following story, create a new story in one sentence.
 
-        {references}
+        {in_context_text}
 
         Write the new story within a text block.
     """)
-    REFERENCE_TEMPLATE = inspect.cleandoc("""
-        {header}:
+    UNLABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
+        Reference:
+        {story}
+    """)
+    LABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
+        Reference {index} (score={score:.2f}):
         {story}
     """)
     STORY_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
@@ -373,7 +414,8 @@ class Story:
         self.hidden_state_target = self.hidden_state(self.TARGET_STORY)
 
     def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's story as the one reference of its own prompt.
+        """Each response's story as the one reference of its own prompt, PROMPT_TEMPLATE's in_context_text by
+        UNLABELLED_IN_CONTEXT_TEMPLATE.
 
         Args:
             responses: list (G) of str, each holding a code block, e.g. [init_program]
@@ -381,10 +423,15 @@ class Story:
         Returns:
             list (G) of str
         """
-        return [self.prompt(["Reference"], [response]) for response in responses]
+        prompts = []
+        for response in responses:
+            in_context_text = self.UNLABELLED_IN_CONTEXT_TEMPLATE.format(story=self.extract_story(response))
+            prompts.append(self.PROMPT_TEMPLATE.format(in_context_text=in_context_text))
+        return prompts
 
     def prompts_with_experience(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's story as a reference of one prompt, numbered from 1 in the given order with its score.
+        """Every response's story as a reference of one prompt, PROMPT_TEMPLATE's in_context_text, each by
+        LABELLED_IN_CONTEXT_TEMPLATE with its score, numbered from 1 in the given order.
 
         Args:
             responses: list (G) of str, each holding a code block
@@ -393,20 +440,10 @@ class Story:
         Returns:
             str
         """
-        return self.prompt([f"Reference {i} (score={score:.2f})" for i, score in enumerate(scores, 1)], responses)
-
-    def prompt(self, headers: list[str], responses: list[str]) -> str:
-        """PROMPT_TEMPLATE of the responses' stories, each under its header by REFERENCE_TEMPLATE.
-
-        Args:
-            headers: list (G) of str
-            responses: list (G) of str, each holding a code block
-
-        Returns:
-            str
-        """
-        references = "\n\n".join(self.REFERENCE_TEMPLATE.format(header=header, story=self.extract_story(response)) for header, response in zip(headers, responses))
-        return self.PROMPT_TEMPLATE.format(references=references)
+        references = []
+        for i, (score, response) in enumerate(zip(scores, responses), 1):
+            references.append(self.LABELLED_IN_CONTEXT_TEMPLATE.format(index=i, score=score, story=self.extract_story(response)))
+        return self.PROMPT_TEMPLATE.format(in_context_text="\n\n".join(references))
 
     def extract_story(self, response: str) -> str | None:
         """The response's last code block, of any language, stripped, its closing fence optional at the end; None
