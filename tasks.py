@@ -73,7 +73,6 @@ class OpenFOAM:
     AVERAGE_LAST = 100
     N_CPUS = 6
     MESH_SIZE = "S"  # S, M, L, XL
-    N_PARALLEL = 4
 
     BLENDER_SCRIPT = inspect.cleandoc("""
         import runpy
@@ -98,11 +97,18 @@ class OpenFOAM:
         cat postProcessing/forceCoeffsIncompressible/0/forceCoeffs.dat
     """)
 
+    def __init__(self, concurrency: int):
+        """
+        Args:
+            concurrency: int, cars simulated at once, each in its own container of N_CPUS
+        """
+        self.concurrency = concurrency
+
     def prompt(self) -> str:
         return self.PROMPT_TEMPLATE
 
     def evaluate(self, responses: list[str]) -> list[float | None]:
-        """Evaluates the responses with evaluate_one, N_PARALLEL at a time, blocking until all are done.
+        """Evaluates the responses with evaluate_one, concurrency at a time, blocking until all are done.
 
         Ctrl+C cancels every evaluate_one, each removing its container and temporary directory, then raises
         KeyboardInterrupt.
@@ -113,7 +119,7 @@ class OpenFOAM:
         Returns:
             list (N) of float, each response's C_d, None where it failed
         """
-        semaphore = asyncio.Semaphore(self.N_PARALLEL)
+        semaphore = asyncio.Semaphore(self.concurrency)
 
         async def evaluate_async():
             return await asyncio.gather(*(self.evaluate_one(response, semaphore) for response in responses))
@@ -166,8 +172,8 @@ class SimpletesTask:
 
     A response's code is the seed with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's own
     extract_code_detailed, so only the code between the markers counts. Codes are evaluated as SimpleTES's engine
-    does: its EvaluatorWorker runs the task's evaluator in a fresh subprocess per code, EngineConfig's eval_concurrency
-    at a time, killed after its eval_timeout, its error truncated to DEFAULT_METRICS_ERROR_MAX_CHARS.
+    does: its EvaluatorWorker runs the task's evaluator in a fresh subprocess per code, concurrency at a time, killed
+    after EngineConfig's eval_timeout, its error truncated to DEFAULT_METRICS_ERROR_MAX_CHARS.
     """
 
     PROMPT_TEMPLATE = inspect.cleandoc("""
@@ -218,13 +224,15 @@ class SimpletesTask:
         ```
     """)
 
-    def __init__(self, task: str, metric: str):
+    def __init__(self, task: str, metric: str, concurrency: int):
         """
         Args:
             task: str, the task's directory under SimpleTES's datasets, e.g. "circle_packing/circle_packing_26"
             metric: str, the score's name in the prompts' closing instruction, e.g. "sum_radii"
+            concurrency: int, codes evaluated at once
         """
         self.metric = metric
+        self.concurrency = concurrency
 
         # Setup paths
         task_dir = os.path.join(os.path.dirname(os.path.dirname(simpletes.__file__)), "datasets", task)
@@ -256,7 +264,6 @@ class SimpletesTask:
             python_executable=config.eval_python,
             target_filename=f"program{os.path.splitext(self.init_program_path)[1]}",
         )
-        self.eval_concurrency = config.eval_concurrency
 
     def preformat_prompt_templates(self):
         """Replaces each prompt template, on the instance, by a functools.partial of its str.format pre-filling the
@@ -319,8 +326,8 @@ class SimpletesTask:
         code, _ = extract_code_detailed(response, self.evolve_context)
         return code and code.strip()
 
-    def evaluate(self, responses: list[str]) -> torch.Tensor:
-        """Evaluates the responses with evaluate_one, eval_concurrency at a time, blocking until all are done.
+    def evaluate(self, responses: list[str]) -> list:
+        """Evaluates the responses with evaluate_one, concurrency at a time, blocking until all are done.
 
         Ctrl+C cancels every evaluate_one, the EvaluatorWorker killing its subprocess, then raises KeyboardInterrupt.
 
@@ -328,15 +335,14 @@ class SimpletesTask:
             responses: list (N) of str, each holding the EVOLVE-BLOCK markers, preferably within a code block
 
         Returns:
-            (N,) float64, each response's score_from_metrics, higher is better; -inf without an EVOLVE-BLOCK or on any
-            evaluator error
+            list (N), each response's evaluate_one
         """
-        semaphore = asyncio.Semaphore(self.eval_concurrency)
+        semaphore = asyncio.Semaphore(self.concurrency)
 
         async def evaluate_async():
             return await asyncio.gather(*(self.evaluate_one(response, semaphore) for response in responses))
 
-        return torch.tensor(asyncio.run(evaluate_async()), dtype=torch.float64)
+        return asyncio.run(evaluate_async())
 
     async def evaluate_one(self, response: str, semaphore: asyncio.Semaphore) -> float:
         """Extracts the response's code and evaluates it as SimpleTES's engine's _evaluate_code does.
@@ -367,21 +373,22 @@ class SimpletesTask:
 
 class CirclePacking26(SimpletesTask):
 
-    def __init__(self):
-        super().__init__("circle_packing/circle_packing_26", metric="sum_radii")
+    def __init__(self, concurrency: int):
+        super().__init__("circle_packing/circle_packing_26", metric="sum_radii", concurrency=concurrency)
 
 
 class CirclePacking32(SimpletesTask):
 
-    def __init__(self):
-        super().__init__("circle_packing/circle_packing_32", metric="sum_radii")
+    def __init__(self, concurrency: int):
+        super().__init__("circle_packing/circle_packing_32", metric="sum_radii", concurrency=concurrency)
 
 
 class Story:
     """A story pulled toward the hidden TARGET_STORY, scored by the distance between their hidden states.
 
     A response's story is its last code block's, of any language. A story's hidden state is MODEL_NAME's last-layer
-    hidden state of its last token, the story tokenized without a chat template, computed on CPU.
+    hidden state of its last token, the story tokenized without a chat template, computed on CPU in batches of
+    concurrency stories.
     """
 
     MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -408,10 +415,15 @@ class Story:
     """)
     STORY_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
 
-    def __init__(self):
+    def __init__(self, concurrency: int):
+        """
+        Args:
+            concurrency: int, stories per forward pass
+        """
+        self.concurrency = concurrency
         self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
         self.model = AutoModel.from_pretrained(self.MODEL_NAME, dtype=torch.float32)
-        self.hidden_state_target = self.hidden_state(self.TARGET_STORY)
+        self.hidden_state_target = self.hidden_states([self.TARGET_STORY])[0]
 
     def prompts(self, responses: list[str]) -> list[str]:
         """Each response's story as the one reference of its own prompt, PROMPT_TEMPLATE's in_context_text by
@@ -452,31 +464,37 @@ class Story:
         return (stories[-1].strip() or None) if stories else None
 
     @torch.no_grad()
-    def hidden_state(self, story: str) -> torch.Tensor:
-        """MODEL_NAME's last-layer hidden state of the story's last token.
+    def hidden_states(self, stories: list[str]) -> torch.Tensor:
+        """MODEL_NAME's last-layer hidden state of each story's last token, the stories right-padded into one batch.
 
         Args:
-            story: str, nonempty
+            stories: list (B) of str, each nonempty
 
         Returns:
-            (D,) float32
+            (B, D) float32
         """
-        input_ids = self.tokenizer(story, return_tensors="pt").input_ids
-        return self.model(input_ids).last_hidden_state[0, -1]
+        inputs = self.tokenizer(stories, return_tensors="pt", padding=True, padding_side="right")
+        last_hidden_state = self.model(**inputs).last_hidden_state
+        return last_hidden_state[torch.arange(len(stories)), inputs.attention_mask.sum(1) - 1]
 
-    def evaluate(self, responses: list[str]) -> torch.Tensor:
-        """Evaluates the responses one by one.
+    def evaluate(self, responses: list[str]) -> list[float]:
+        """Evaluates the responses' stories, concurrency per forward pass.
 
         Args:
             responses: list (N) of str, each holding a code block
 
         Returns:
-            (N,) float64, the negative Euclidean distance between each response's story's hidden state and
+            list (N) of float, the negative Euclidean distance between each response's story's hidden state and
             TARGET_STORY's, 0 for a perfect match; -inf without a story
         """
         stories = [self.extract_story(response) for response in responses]
-        rewards = [-torch.dist(self.hidden_state(story), self.hidden_state_target).item() if story else -math.inf for story in stories]
-        return torch.tensor(rewards, dtype=torch.float64)
+        stories_valid = [story for story in stories if story]
+        distances = []
+        for b in range(0, len(stories_valid), self.concurrency):
+            hidden_states = self.hidden_states(stories_valid[b:b + self.concurrency])
+            distances += torch.linalg.vector_norm(hidden_states - self.hidden_state_target, dim=-1).tolist()
+        distances = iter(distances)
+        return [-next(distances) if story else -math.inf for story in stories]
 
 
 TASKS_CLS = {
@@ -486,9 +504,10 @@ TASKS_CLS = {
     "story": Story,
 }
 
-def get_reward_fn(task_name: str):
+def get_reward_fn(task_name: str, concurrency: int):
     """
     Args:
         task_name: str, a TASKS_CLS name, e.g. "circle-packing-26"
+        concurrency: int, the task's evaluations at once
     """
-    return TASKS_CLS[task_name]()
+    return TASKS_CLS[task_name](concurrency=concurrency)

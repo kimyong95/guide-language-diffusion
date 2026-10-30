@@ -1,11 +1,11 @@
-"""Runs SimpleTES on config.task's seed program with config.model.name inside vLLM, in synchronous steps.
+"""Runs SimpleTES on config.task.name's seed program with config.model.name inside vLLM, in synchronous steps.
 
-config.task names a tasks.py SimpleTES task, e.g. "circle-packing-26", whose seed program, SimpleTES generator, for
-prompts, and EvaluatorWorker, built as SimpleTES's engine builds them, the trainer takes. A response's code is the seed with its
-EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's extract_code_detailed; the EvaluatorWorker runs it in a
-fresh subprocess, EngineConfig's eval_concurrency at a time, killed after its eval_timeout, and its error is truncated
-to DEFAULT_METRICS_ERROR_MAX_CHARS. The seed is evaluated EngineConfig.init_eval_repeats times at once, keeping the
-best metrics.
+config.task.name names a tasks.py SimpleTES task, e.g. "circle-packing-26", whose seed program, SimpleTES generator, for
+prompts, and EvaluatorWorker, built as SimpleTES's engine builds them, the trainer takes. A response's code is the seed
+with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's extract_code_detailed. The task's evaluate, its
+evaluate_one replaced by the trainer's to return metrics, runs each code's EvaluatorWorker in a fresh subprocess,
+config.task.concurrency at a time, killed after EngineConfig's eval_timeout, and its error is truncated to
+DEFAULT_METRICS_ERROR_MAX_CHARS. The seed is evaluated EngineConfig.init_eval_repeats times, keeping the best metrics.
 
 Every one of config.L steps samples each of config.C chains once. SimpleTES's RPUCG policy, at EngineConfig's puct_c and
 rpucg_gamma as SimpleTES's engine passes them, picks up to config.N of the chain's nodes, the generator's prompt holds
@@ -41,7 +41,6 @@ from simpletes.policies.rpucg import RpucgPolicy
 from simpletes.utils.code_extract import extract_code_detailed
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, extract_approach_insight, metrics_to_text, truncate_error_in_metrics
 
-import tasks
 from base import BaseTrainer
 
 FLAGS = flags.FLAGS
@@ -62,21 +61,16 @@ class Trainer(BaseTrainer):
         )
 
     def setup_task(self):
-        """Takes config.task's seed program, EVOLVE-BLOCK context, generator and EvaluatorWorker from its tasks.py task."""
-        task = tasks.get_reward_fn(self.config.task)
-        self.init_program, self.evolve_context = task.init_program, task.evolve_context
-        self.generator, self.evaluator = task.generator, task.evaluator
-
-    def evaluate(self, codes, eval_concurrency):
-        semaphore = asyncio.Semaphore(eval_concurrency)
-
-        async def evaluate_async():
-            return await asyncio.gather(*(self.evaluate_one(code, semaphore) for code in codes))
-
-        return asyncio.run(evaluate_async())
+        """Builds config.task.name's tasks.py task with evaluate_one replaced, taking its seed program, EVOLVE-BLOCK
+        context, generator and EvaluatorWorker."""
+        super().setup_task()
+        self.task.evaluate_one = self.evaluate_one
+        self.init_program, self.evolve_context = self.task.init_program, self.task.evolve_context
+        self.generator, self.evaluator = self.task.generator, self.task.evaluator
 
     async def evaluate_one(self, code, semaphore):
-        """SimpleTES's engine's _evaluate_code, holding the semaphore during the evaluation."""
+        """SimpleTES's engine's _evaluate_code, holding the semaphore during the evaluation; the task's evaluate_one,
+        so that its evaluate returns each code's metrics."""
         async with semaphore:
             try:
                 metrics = (await self.evaluator.evaluate(code)).metrics
@@ -115,7 +109,7 @@ class Trainer(BaseTrainer):
     def run(self):
         """Runs config.L steps of SimpleTES from the seed program."""
         L, C, K, N = self.config.L, self.config.C, self.config.K, self.config.N
-        init_metrics = max(self.evaluate([self.init_program] * EngineConfig.init_eval_repeats, EngineConfig.init_eval_repeats), key=score_from_metrics)
+        init_metrics = max(self.task.evaluate([self.init_program] * EngineConfig.init_eval_repeats), key=score_from_metrics)
         self.db.add(Node(id=uuid.uuid4().hex, code=self.init_program, metrics=init_metrics, score=score_from_metrics(init_metrics), status=Status.DONE))
         for l in range(L):
             selections = []
@@ -134,7 +128,7 @@ class Trainer(BaseTrainer):
                     pendings.append(self.selector.on_generation_failed(gen_ids[c]))
                 else:
                     nodes.append(Node(id=uuid.uuid4().hex, code=code, parent_ids=[node.id for node in all_inspirations[c]], gen_id=gen_ids[c], chain_idx=chain_idxs[c], status=Status.EVAL_PENDING, llm_input=prompts[c]))
-            for node, metrics in zip(nodes, self.evaluate([node.code for node in nodes], EngineConfig.eval_concurrency)):
+            for node, metrics in zip(nodes, self.task.evaluate([node.code for node in nodes])):
                 node.metrics, node.score, node.status = metrics, score_from_metrics(metrics), Status.DONE
                 try:
                     self.db.add(node)

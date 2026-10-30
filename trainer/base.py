@@ -25,7 +25,7 @@ class BaseTrainer:
         wandb.init(project="guide-language-diffusion", name=self.config.run_name, config=self.config.to_dict())
 
     def setup_task(self):
-        self.task = tasks.get_reward_fn(self.config.task)
+        self.task = tasks.get_reward_fn(self.config.task.name, concurrency=self.config.task.concurrency)
 
     def setup_pipeline(self, **kwargs):
         """Builds config.model's vLLM pipeline; kwargs go to vllm.LLM."""

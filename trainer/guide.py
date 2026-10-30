@@ -1,20 +1,16 @@
-"""Mutates config.task's SimpleTES seed program toward a higher reward by sampling config.model.name inside vLLM, each
-response anchored on one buffer program and guided by every buffer program's weight, no training.
+"""Mutates config.task.name's SimpleTES seed program toward a higher reward by sampling config.model.name inside vLLM, each
+response anchored on the best buffer program and guided by every buffer program's weight, no training.
 
 The buffer starts as the task's seed program alone, taken as a response, so there is no initial generation. Every one
-of config.L iterations samples config.N new responses over the buffer's G responses, response i anchored on response
-j = i mod G, under log p_j + Σ_k w_jk log p_k, its thinking included; p_k is the model under the task's prompts of
-response k, SimpleTES's generation prompt in tasks.py's templates with its code as the one reference, thinking at
-config.model.reasoning_effort when
-config.model.enable_thinking, scoring response i after its own prompt. A response's answer is what follows its </think>
-when thinking, empty when its thinking never ends, and the whole response otherwise. The weights follow
-config.algo_mode. "A" pulls
-program j toward the programs above it and pushes it from those below in proportion to the reward gap d_jk = r_k - r_j,
-each side normalised by its gap sum, D⁺_j = Σ_{d_jk > 0} d_jk and D⁻_j = Σ_{d_jk < 0} |d_jk|, so the positive weights sum
-to 1 and the negative to -1; j fills its own empty side, w_jj = 1 as the best and -1 as the worst, and ties get 0. "B"
-gives every anchor the same weights w_k = (r̃_k - r̄) / (G r̄ (1 - r̄)), r̃ the rewards min-max normalised to [0, 1] and
-r̄ their mean, so they sum to 0. Each response's weights 1[k = j] + w_jk thus sum to 1; all rewards tied gives w = 0,
-each response sampling from its anchor alone.
+of config.L iterations samples config.N new responses independently over the buffer's G responses, sorted by reward,
+each under Σ_k W_k log p_k with W_k = 1[k = 0] + w_k, anchored on the best response 0, its thinking included; p_k is the
+model under the task's prompts of response k, SimpleTES's generation prompt in tasks.py's templates with its code as the
+one reference, thinking at config.model.reasoning_effort when config.model.enable_thinking, scoring the response after
+its own prompt. A response's answer is what follows its </think> when thinking, empty when its thinking never ends, and
+the whole response otherwise. The weights push the best program from those below it in proportion to the reward gap
+d_k = r_k - r_0, normalised by the gap sum D = Σ_k |d_k|, so they sum to -1, and the best fills its own empty side,
+w_0 = 1; W thus sums to 1, 2 on the best, and ties get 0. All rewards tied gives w = 0, each response sampling from the
+best alone.
 
 All N responses are sampled together by one llm.generate call of N × G vLLM requests, request (i, k) holding prompt k
 and response i as group i, so every response's G guides run in parallel. GuideLogitsProcessor, a vLLM batch-level
@@ -30,11 +26,10 @@ step. Every request gets vLLM's default budget, config.model.max_total_tokens mi
 it ends one request before the rest of its group. apply raises when a group is split, as by that or by a preemption once
 the KV cache runs out, or its outputs differ in length.
 
-Each response's reward r is the task's evaluate; a response without an EVOLVE-BLOCK or one whose code the evaluator
-rejects scores -inf and is dropped. The buffer then keeps the N
-highest-reward responses among the new ones and itself, the new ones first on ties. Each iteration logs every reward
-and response to wandb, -inf and "" included, and a bar chart of the breakthroughs so far, the new responses the buffer
-kept, counted by their anchor's rank in the buffer they were sampled from, 0 the best.
+Each response's reward r is the task's evaluate, config.task.concurrency at a time; a response without an EVOLVE-BLOCK
+or one whose code the evaluator rejects scores -inf and is dropped. The buffer then keeps the N highest-reward responses
+among the new ones and itself, the new ones first on ties. Each iteration logs every reward and response to wandb, -inf
+and "" included.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/guide.py --config config/guide.py
 """
@@ -58,45 +53,22 @@ FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/guide.py", "Guidance configuration.")
 
 
-def guide_weights_a(rewards):
-    """Each anchor's weights over the buffer programs, its reward gaps to them normalised per side.
+def guide_weights(rewards):
+    """Each guide's weight, the best program pushed from those below it by its reward gaps to them.
 
     Args:
-        rewards: list (G) of float
+        rewards: list (G) of float, in descending order
 
     Returns:
-        list (G) of list (G) of float, w[j][k] for anchor j and guide k: d_jk / D⁺_j for d_jk > 0 and d_jk / D⁻_j for
-        d_jk < 0, with d_jk = r_k - r_j and D⁺_j, D⁻_j the sums of j's positive and absolute negative gaps;
-        w[j][j] = 1[D⁺_j = 0] - 1[D⁻_j = 0]; 0 for ties
+        list (G) of float, W_k = 1[k = 0] + w_k summing to 1: w_k = d_k / D for k > 0, with d_k = r_k - r_0 and
+        D = Σ_k |d_k|, and w_0 = 1[D > 0]; so W_0 = 2, or 1 when all rewards tie
     """
     rewards = torch.tensor(rewards, dtype=torch.float64)
-    gaps = rewards[None, :] - rewards[:, None]
-    gaps_positive, gaps_negative = gaps.clamp(min=0), gaps.clamp(max=0)
-    gap_sums_positive, gap_sums_negative = gaps_positive.sum(1), -gaps_negative.sum(1)
-    weights = torch.nan_to_num(gaps_positive / gap_sums_positive[:, None]) + torch.nan_to_num(gaps_negative / gap_sums_negative[:, None])
-    return (weights + torch.diag((gap_sums_positive == 0).double() - (gap_sums_negative == 0).double())).tolist()
-
-
-def guide_weights_b(rewards):
-    """Every anchor's same weights over the buffer programs, its normalised rewards centred on their mean.
-
-    Args:
-        rewards: list (G) of float
-
-    Returns:
-        list (G) of list (G) of float, w[j][k] = (r̃_k - r̄) / (G r̄ (1 - r̄)) for every anchor j, r̃ the rewards
-        min-max normalised to [0, 1] and r̄ their mean; 0 when all rewards tie
-    """
-    rewards = torch.tensor(rewards, dtype=torch.float64)
-    G = len(rewards)
-    if rewards.min() == rewards.max():
-        return torch.zeros(G, G, dtype=torch.float64).tolist()
-    rewards_normalized = (rewards - rewards.min()) / (rewards.max() - rewards.min())
-    reward_mean = rewards_normalized.mean()
-    return ((rewards_normalized - reward_mean) / (G * reward_mean * (1 - reward_mean))).expand(G, G).tolist()
-
-
-GUIDE_WEIGHTS = {"A": guide_weights_a, "B": guide_weights_b}
+    gaps = rewards - rewards[0]
+    gap_sum = -gaps.sum()
+    weights = torch.nan_to_num(gaps / gap_sum)
+    weights[0] = 1 + (gap_sum > 0).double()
+    return weights.tolist()
 
 
 class GuideLogitsProcessor(LogitsProcessor):
@@ -165,14 +137,14 @@ class Trainer(BaseTrainer):
         )
 
     def guided_generate(self, prompts, weights, N):
-        """Samples N responses together, response i under log p_j + Σ_k w_jk log p_k with j = i mod G, p_k being the
-        model under prompts[k], thinking at config.model.reasoning_effort when config.model.enable_thinking.
+        """Samples N responses together, each independently under Σ_k W_k log p_k, p_k being the model under prompts[k],
+        thinking at config.model.reasoning_effort when config.model.enable_thinking.
 
         All responses are one llm.generate call of N × G requests, request (i, k) holding prompts[k] and response i.
 
         Args:
             prompts: list (G) of str, the guides' prompts
-            weights: list (G) of list (G) of float, w_jk for anchor j and guide k
+            weights: list (G) of float, W_k for guide k, summing to 1
             N: int, number of responses
 
         Returns:
@@ -183,32 +155,23 @@ class Trainer(BaseTrainer):
         prompt_tokens = self.pipeline.texts_to_tokens(prompts, enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort)
         assert N * sum(map(len, prompt_tokens)) < cfg.max_total_tokens, f"{N} copies of prompts of {sum(map(len, prompt_tokens))} tokens together exceed max_num_batched_tokens"
         G = len(prompts)
-        sampling_extra_args = [{"guide_group": i, "guide_weight": float(k == i % G) + weight, "guide_size": G} for i in range(N) for k, weight in enumerate(weights[i % G])]
+        sampling_extra_args = [{"guide_group": i, "guide_weight": weight, "guide_size": G} for i in range(N) for weight in weights]
         return self.pipeline.generate(prompt_tokens * N, sampling_extra_args, enable_thinking=cfg.enable_thinking).texts[::G]
 
     def run(self):
         """Runs config.L iterations of guided sampling, evaluation and buffer update from the seed program."""
         task, L, N = self.task, self.config.L, self.config.N
-        buffer = [{"response": task.init_program, "reward": task.evaluate([task.init_program]).item()}]
-        breakthroughs = [0] * N
+        buffer = [{"response": task.init_program, "reward": task.evaluate([task.init_program])[0]}]
         for l in range(L):
-            G = len(buffer)
             prompts = task.prompts([data_i["response"] for data_i in buffer])
-            weights = GUIDE_WEIGHTS[self.config.algo_mode]([data_i["reward"] for data_i in buffer])
+            weights = guide_weights([data_i["reward"] for data_i in buffer])
             responses = self.guided_generate(prompts, weights, N)
-            rewards = task.evaluate(responses)
-            data = []
-            for i, (response, reward) in enumerate(zip(responses, rewards.tolist())):
-                if math.isfinite(reward):
-                    data.append({"response": response, "reward": reward, "l": l, "parent-i": i % G})
+            rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
+            data = [{"response": response, "reward": reward} for response, reward in zip(responses, rewards.tolist()) if math.isfinite(reward)]
             buffer = sorted(data + buffer, key=lambda data_i: data_i["reward"], reverse=True)[:N]
-            for data_i in buffer:
-                if data_i.get("l") == l:
-                    breakthroughs[data_i["parent-i"]] += 1
 
             objective_evaluations = (l + 1) * N
-            breakthroughs_table = wandb.Table(data=list(enumerate(breakthroughs)), columns=["anchor", "breakthroughs"])
-            extra = {"best": buffer[0]["reward"], "breakthroughs": wandb.plot.bar(breakthroughs_table, "anchor", "breakthroughs", title="Breakthroughs per anchor rank")}
+            extra = {"best": buffer[0]["reward"]}
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards, extra=extra)
             self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=responses)
 
