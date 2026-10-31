@@ -144,8 +144,7 @@ class Trainer(BaseTrainer):
             num_failed = len(responses) - len(nodes)
             rewards = torch.tensor([node.score for node in nodes] + [-math.inf] * num_failed, dtype=torch.float64)
             objective_evaluations = (l + 1) * C * K
-            extra = {"best": self.db.best().score}
-            self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards, extra=extra)
+            self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
             self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=[node.code for node in nodes] + [""] * num_failed)
 
         wandb.finish()

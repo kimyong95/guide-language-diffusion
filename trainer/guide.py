@@ -75,7 +75,7 @@ class Trainer(BaseTrainer):
             buffer = dict(sorted(buffer.items(), reverse=True)[:G])
 
             objective_evaluations = (l + 1) * N
-            self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards, extra={"best": max(buffer)})
+            self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
             self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=responses)
 
         wandb.finish()

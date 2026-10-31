@@ -45,12 +45,15 @@ class BaseTrainer:
         wandb.run.log_code(".", include_fn=lambda path: path in imported_py_files)
 
     def log_rewards(self, objective_evaluations, rewards, extra={}):
-        self.best_reward = max(self.best_reward, rewards.max().item())
+        rewards_finite = rewards[rewards.isfinite()]
+        reward_best = rewards_finite.max().item() if len(rewards_finite) else -math.inf
+        self.best_reward = max(self.best_reward, reward_best)
         log_dict = {
             "objective-evaluations": objective_evaluations,
-            "rewards": rewards.mean().item(),
-            "rewards-best": rewards.max().item(),
-            "best-so-far": self.best_reward,
+            "rewards": rewards_finite.mean().item(),
+            "reward-finite-ratio": len(rewards_finite) / len(rewards),
+            "rewards-best": reward_best,
+            "rewards-best-so-far": self.best_reward,
             **extra,
         }
         wandb.log(log_dict)
