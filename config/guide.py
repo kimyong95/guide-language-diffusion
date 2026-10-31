@@ -11,6 +11,8 @@ def get_config():
 
     config.L = 100
     config.N = 5
+    config.G = 5
+    config.M = 3
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"

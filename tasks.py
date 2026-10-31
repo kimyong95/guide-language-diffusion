@@ -302,7 +302,7 @@ class SimpletesTask:
             prompts.append(self.PROMPT_TEMPLATE(in_context_text=in_context_text))
         return prompts
 
-    def prompts_with_experience(self, responses: list[str], scores: list[float]) -> str:
+    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
         """Every response's code as an in-context inspiration of one prompt, PROMPT_TEMPLATE's in_context_text
         by LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 by
         score, highest first.
@@ -441,7 +441,7 @@ class Story:
             prompts.append(self.PROMPT_TEMPLATE.format(in_context_text=in_context_text))
         return prompts
 
-    def prompts_with_experience(self, responses: list[str], scores: list[float]) -> str:
+    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
         """Every response's story as a reference of one prompt, PROMPT_TEMPLATE's in_context_text, each by
         LABELLED_IN_CONTEXT_TEMPLATE with its score, numbered from 1 in the given order.
 
