@@ -12,7 +12,7 @@ def get_config():
     config.L = 100
     config.C = 32
     config.K = 16
-    config.N = 3
+    config.N = 5
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"
