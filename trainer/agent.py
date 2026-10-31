@@ -1,10 +1,10 @@
 """Mutates config.task.name's seed program toward a higher reward by in-context sampling of config.model.name inside
-vLLM, in config.C independent chains, no guidance and no training.
+SGLang, in config.C independent chains, no guidance and no training.
 
 Each chain's buffer holds up to config.N responses with distinct rewards, best first, starting as the task's seed
 program alone, taken as a response. Every one of config.L steps samples config.K new responses per chain
 independently, each under the task's prompts_with_scores of the chain's buffer with their rewards, thinking at
-config.model.reasoning_effort when config.model.enable_thinking; all C × K responses come from one llm.generate call. A
+config.model.reasoning_effort when config.model.enable_thinking; all C × K responses come from one generate call. A
 response's answer is what follows its </think> when thinking, empty when its thinking never ends, and the whole response
 otherwise.
 
@@ -32,28 +32,14 @@ config_flags.DEFINE_config_file("config", "config/agent.py", "Agent configuratio
 
 class Trainer(BaseTrainer):
 
-    def generate(self, prompts):
-        """Samples config.K responses per prompt, thinking at config.model.reasoning_effort when
-        config.model.enable_thinking.
-
-        Args:
-            prompts: list (C) of str, each chain's prompt
-
-        Returns:
-            list (C × K) of str, chain c's response k at c × K + k, each its answer: after its </think> when thinking,
-            empty when its thinking never ends; the whole response otherwise
-        """
-        cfg, K = self.config.model, self.config.K
-        prompt_tokens = self.pipeline.texts_to_tokens(prompts, enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort)
-        return self.pipeline.generate([tokens for tokens in prompt_tokens for _ in range(K)], enable_thinking=cfg.enable_thinking).texts
-
     def run(self):
         """Runs config.L steps of in-context sampling, evaluation and buffer update in each chain from the seed program."""
         task, L, C, K, N = self.task, self.config.L, self.config.C, self.config.K, self.config.N
         init_reward = task.evaluate([task.init_program])[0]
         buffers = [{init_reward: task.init_program} for _ in range(C)]  # reward -> response, best first
         for l in range(L):
-            responses = self.generate([task.prompts_with_scores(list(buffer.values()), list(buffer)) for buffer in buffers])
+            prompts = [task.prompts_with_scores(list(buffer.values()), list(buffer)) for buffer in buffers]
+            responses = self.pipeline.generate([prompt for prompt in prompts for _ in range(K)])
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
             for i, (response, reward) in enumerate(zip(responses, rewards.tolist())):
                 if math.isfinite(reward):

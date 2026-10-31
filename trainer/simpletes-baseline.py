@@ -1,4 +1,4 @@
-"""Runs SimpleTES on config.task.name's seed program with config.model.name inside vLLM, in synchronous steps.
+"""Runs SimpleTES on config.task.name's seed program with config.model.name inside SGLang, in synchronous steps.
 
 config.task.name names a tasks.py SimpleTES task, e.g. "circle-packing-26", whose seed program, SimpleTES generator, for
 prompts, and EvaluatorWorker, built as SimpleTES's engine builds them, the trainer takes. A response's code is the seed
@@ -91,19 +91,16 @@ class Trainer(BaseTrainer):
             responses: list (C × K) of str, chain c's response k at c × K + k, each its answer: after its </think> when
                 thinking, empty when its thinking never ends; the whole response otherwise
         """
-        cfg, K = self.config.model, self.config.K
+        K = self.config.K
         prompts = [self.generator.build_prompt(inspirations, failure_patterns) for inspirations, failure_patterns in zip(all_inspirations, all_failure_patterns)]
-        prompt_tokens = self.pipeline.texts_to_tokens(prompts, enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort)
-        responses = self.pipeline.generate([tokens for tokens in prompt_tokens for _ in range(K)], enable_thinking=cfg.enable_thinking).texts
+        responses = self.pipeline.generate([prompt for prompt in prompts for _ in range(K)])
         return prompts, responses
 
     def reflect(self, nodes):
         """Sets each node's reflection from the model's answer to SimpleTES's reflection prompt over its llm_input, code
         and metrics, sampled as for generation."""
-        cfg = self.config.model
         reflection_prompts = [self.selector.REFLECTION_TEMPLATE.format(llm_input=node.llm_input, code=node.code, metrics=metrics_to_text(node.metrics)) for node in nodes]
-        reflection_prompt_tokens = self.pipeline.texts_to_tokens(reflection_prompts, enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort)
-        for node, text in zip(nodes, self.pipeline.generate(reflection_prompt_tokens, enable_thinking=cfg.enable_thinking).texts):
+        for node, text in zip(nodes, self.pipeline.generate(reflection_prompts)):
             node.reflection = extract_approach_insight(text)[:_MAX_REFLECTION_OUTPUT_CHARS].rstrip()
 
     def run(self):

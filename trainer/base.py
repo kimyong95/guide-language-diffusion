@@ -2,7 +2,7 @@ import math
 import os
 import sys
 import wandb
-from pipeline_vllm import Pipeline
+from pipeline import Pipeline
 import tasks
 
 
@@ -28,8 +28,9 @@ class BaseTrainer:
         self.task = tasks.get_reward_fn(self.config.task.name, concurrency=self.config.task.concurrency)
 
     def setup_pipeline(self, **kwargs):
-        """Builds config.model's vLLM pipeline; kwargs go to vllm.LLM."""
-        self.pipeline = Pipeline(self.config.model.name, self.config.model.max_total_tokens, seed=self.config.seed, **kwargs)
+        """Builds config.model's SGLang pipeline; kwargs go to sglang.Engine."""
+        cfg = self.config.model
+        self.pipeline = Pipeline(cfg.name, cfg.max_total_tokens, enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort, seed=self.config.seed, **kwargs)
 
     def log_code(self):
         cwd = os.path.abspath(os.getcwd())

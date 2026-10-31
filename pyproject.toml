@@ -1,85 +1,48 @@
 # git clone https://github.com/wq-will/SimpleTES packages/SimpleTES
-# conda create -n cu129 cuda-toolkit=12.9.2 "gxx<14" "gcc<14"
-# conda activate cu129
-# MAX_JOBS=4 uv sync
+# pixi install
+# pixi shell
 
 [project]
 name = "guide-language-diffusion"
 version = "0.1.0"
 requires-python = "==3.12.*"
 dependencies = [
-    "torch==2.11.*",
-    "torchvision==0.26.*",
-    "torchaudio==2.11.*",
-    "transformers==5.18.*",
-    "diffusers==0.38.*",
-    "huggingface-hub",
-    "accelerate==1.14.*",
-    "sentencepiece==0.2.1",
-    "datasets",
-    "compressed-tensors",
-    "einops",
+    "sglang==0.5.23",
+    "flash-attn-4>=4.0.0b18",  # sglang requires a pre-release of it
+    "transformers==5.19.*",
     "wandb",
     "ml-collections",
+    "pandas",
     "matplotlib",
-    "openevolve",
-    "vllm==0.24.0",
-    "lm_eval[api,hf,vllm]==0.4.12",
-    "peft==0.19.*",
-    "math-verify==0.9.*",
-    "bm25s==0.2.12",
-    "pystemmer==2.2.0.3",
-    "diskcache",
-    "flash-attn==2.8.*",
-    "flash-linear-attention[cuda]",
-    "causal-conv1d==1.7.*",
-    "cma",
-    "botorch",
-    "gpytorch",
-    "apply-edit-block==0.1.0",
-    "openai>=2.44.0",
-    "anthropic>=0.116.0",
-    "google-generativeai>=0.8.6",
-    "boto3>=1.43.108",
-    "litellm>=1.104.0",
-    "platformdirs>=4.10.0",
-    "tenacity>=9.1.4",
-    "simpletes",
-    "qwen-agent",
-    "soundfile>=0.14.0",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+
+    # SimpleTES
+    "litellm==1.83.*",
+    "rich",
+    "cvxpy",
+    "psutil",
+
+    # Blender
     "trimesh",
     "shapely",
-    "rtree",
-    "cvxpy>=1.9.3",
 ]
 
-[tool.uv]
-python-preference = "only-managed"
-environments = ["sys_platform == 'linux'"]
-no-build-isolation-package = ["flash-attn", "causal-conv1d"]
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = [{ platform = "linux-64", glibc = "2.34" }]
 
-[tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]
-causal-conv1d = ["torch"]
+[tool.pixi.dependencies]
+cuda-toolkit = "13.3.*"
+cuda-compat = "13.3.*"
+gcc = "<14"
+gxx = "<14"
 
-[tool.uv.sources]
-torch = [{ index = "pytorch-cu129" }]
-torchvision = [{ index = "pytorch-cu129" }]
-torchaudio = [{ index = "pytorch-cu129" }]
-vllm = [{ index = "vllm" }]
-simpletes = { path = "packages/SimpleTES", editable = true }
+[tool.pixi.pypi-dependencies]
+torch = { version = "==2.14.*", index = "https://download.pytorch.org/whl/cu132" }
+torchvision = { version = "==0.29.*", index = "https://download.pytorch.org/whl/cu132" }
 
-[[tool.uv.dependency-metadata]]
-name = "simpletes"
-version = "1.0.0"
-requires-dist = []
-
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
-
-[[tool.uv.index]]
-name = "vllm"
-url = "https://wheels.vllm.ai/0.24.0/cu129"
-explicit = true
+[tool.pixi.activation.env]
+LD_LIBRARY_PATH = "$CONDA_PREFIX/cuda-compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+PYTHONPATH = "$PIXI_WORKSPACE_ROOT:$PIXI_WORKSPACE_ROOT/packages/SimpleTES"
