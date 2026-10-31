@@ -43,6 +43,11 @@ gxx = "<14"
 torch = { version = "==2.14.*", index = "https://download.pytorch.org/whl/cu132" }
 torchvision = { version = "==0.29.*", index = "https://download.pytorch.org/whl/cu132" }
 
+# drop torchaudio because no cuda 13.2 build exists
+# https://github.com/Comfy-Org/ComfyUI/issues/14232
+[tool.pixi.pypi-options.dependency-overrides]
+torchaudio = { version = "*", env-markers = "sys_platform == 'never'" }
+
 [tool.pixi.activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/cuda-compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 PYTHONPATH = "$PIXI_WORKSPACE_ROOT:$PIXI_WORKSPACE_ROOT/packages/SimpleTES"
