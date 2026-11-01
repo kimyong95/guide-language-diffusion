@@ -10,9 +10,8 @@ def get_config():
     config.task.concurrency = 64
 
     config.L = 100
-    config.N = 5
-    config.G = 5
-    config.mode = "A"  # or "B", "C"
+    config.C = 4
+    config.K = 16
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"
