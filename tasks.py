@@ -410,6 +410,11 @@ class Story:
         {story}
     """)
     LABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
+        {item}
+
+        Write the new story to improve the score (higher is better).
+    """)
+    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
         Reference {index} (score={score:.2f}):
         {story}
     """)
@@ -442,8 +447,9 @@ class Story:
         return prompts
 
     def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's story as a reference of one prompt, PROMPT_TEMPLATE's in_context_text, each by
-        LABELLED_IN_CONTEXT_TEMPLATE with its score, numbered from 1 in the given order.
+        """Every response's story as a reference of one prompt, PROMPT_TEMPLATE's in_context_text by
+        LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the
+        given order.
 
         Args:
             responses: list (G) of str, each holding a code block
@@ -452,10 +458,11 @@ class Story:
         Returns:
             str
         """
-        references = []
+        in_contexts = []
         for i, (score, response) in enumerate(zip(scores, responses), 1):
-            references.append(self.LABELLED_IN_CONTEXT_TEMPLATE.format(index=i, score=score, story=self.extract_story(response)))
-        return self.PROMPT_TEMPLATE.format(in_context_text="\n\n".join(references))
+            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, story=self.extract_story(response)))
+        in_context_text = self.LABELLED_IN_CONTEXT_TEMPLATE.format(item="\n\n".join(in_contexts))
+        return self.PROMPT_TEMPLATE.format(in_context_text=in_context_text)
 
     def extract_story(self, response: str) -> str | None:
         """The response's last code block, of any language, stripped, its closing fence optional at the end; None
