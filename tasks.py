@@ -384,14 +384,14 @@ class CirclePacking32(SimpletesTask):
 
 
 class Story:
-    """A story pulled toward the hidden TARGET_STORY, scored by the distance between their hidden states.
+    """A story pulled toward the hidden TARGET_STORY, scored by the cosine similarity of their embeddings.
 
-    A response's story is its last code block's, of any language. A story's hidden state is MODEL_NAME's last-layer
-    hidden state of its last token, the story tokenized without a chat template, computed on CPU in batches of
-    concurrency stories.
+    A response's story is its last code block's, of any language. A story's embedding is MODEL_NAME's last-layer hidden
+    state of its last token, the <|endoftext|> its tokenizer appends, L2-normalised; the story is tokenized without a
+    chat template or instruction, and embedded on CPU in batches of concurrency stories.
     """
 
-    MODEL_NAME = "Qwen/Qwen3-0.6B"
+    MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
     TARGET_STORY = "A playful puppy and a sleepy bear chased each other through the forest, then shared a pot of yummy honey."
     init_program = inspect.cleandoc("""
         ```text
@@ -403,11 +403,13 @@ class Story:
 
         {in_context_text}
 
-        Write the new story within a text block.
+        Write the new story within a ```text block.
     """)
     UNLABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
         Reference:
+        ```text
         {story}
+        ```
     """)
     LABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
         {item}
@@ -416,7 +418,9 @@ class Story:
     """)
     LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
         Reference {index} (score={score:.2f}):
+        ```text
         {story}
+        ```
     """)
     STORY_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
 
@@ -428,7 +432,7 @@ class Story:
         self.concurrency = concurrency
         self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
         self.model = AutoModel.from_pretrained(self.MODEL_NAME, dtype=torch.float32)
-        self.hidden_state_target = self.hidden_states([self.TARGET_STORY])[0]
+        self.embedding_target = self.embeddings([self.TARGET_STORY])[0]
 
     def prompts(self, responses: list[str]) -> list[str]:
         """Each response's story as the one reference of its own prompt, PROMPT_TEMPLATE's in_context_text by
@@ -471,18 +475,19 @@ class Story:
         return (stories[-1].strip() or None) if stories else None
 
     @torch.no_grad()
-    def hidden_states(self, stories: list[str]) -> torch.Tensor:
-        """MODEL_NAME's last-layer hidden state of each story's last token, the stories right-padded into one batch.
+    def embeddings(self, stories: list[str]) -> torch.Tensor:
+        """MODEL_NAME's L2-normalised last-layer hidden state of each story's last token, the stories right-padded into
+        one batch.
 
         Args:
             stories: list (B) of str, each nonempty
 
         Returns:
-            (B, D) float32
+            (B, D) float32, unit norm
         """
         inputs = self.tokenizer(stories, return_tensors="pt", padding=True, padding_side="right")
         last_hidden_state = self.model(**inputs).last_hidden_state
-        return last_hidden_state[torch.arange(len(stories)), inputs.attention_mask.sum(1) - 1]
+        return torch.nn.functional.normalize(last_hidden_state[torch.arange(len(stories)), inputs.attention_mask.sum(1) - 1], dim=-1)
 
     def evaluate(self, responses: list[str]) -> list[float]:
         """Evaluates the responses' stories, concurrency per forward pass.
@@ -491,17 +496,17 @@ class Story:
             responses: list (N) of str, each holding a code block
 
         Returns:
-            list (N) of float, the negative Euclidean distance between each response's story's hidden state and
-            TARGET_STORY's, 0 for a perfect match; -inf without a story
+            list (N) of float, the cosine similarity between each response's story's embedding and TARGET_STORY's, in
+            [-1, 1] and 1 for a perfect match; -inf without a story
         """
         stories = [self.extract_story(response) for response in responses]
         stories_valid = [story for story in stories if story]
-        distances = []
+        similarities = []
         for b in range(0, len(stories_valid), self.concurrency):
-            hidden_states = self.hidden_states(stories_valid[b:b + self.concurrency])
-            distances += torch.linalg.vector_norm(hidden_states - self.hidden_state_target, dim=-1).tolist()
-        distances = iter(distances)
-        return [-next(distances) if story else -math.inf for story in stories]
+            embeddings = self.embeddings(stories_valid[b:b + self.concurrency])
+            similarities += (embeddings @ self.embedding_target).tolist()
+        similarities = iter(similarities)
+        return [next(similarities) if story else -math.inf for story in stories]
 
 
 TASKS_CLS = {
