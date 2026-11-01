@@ -398,26 +398,25 @@ class Story:
         A small boat drifted slowly across the quiet lake at dawn.
         ```
     """)
-    PROMPT_TEMPLATE = inspect.cleandoc("""
+    PLAIN_PROMPT_TEMPLATE = inspect.cleandoc("""
         With reference to the following story, create a new story in one sentence.
 
-        {in_context_text}
-
-        Write the new story within a ```text block.
-    """)
-    UNLABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
         Reference:
         ```text
         {story}
         ```
+
+        Write the new story within a ```text block.
     """)
-    LABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
+    LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
+        With reference to the following story, create a new story in one sentence.
+
         {item}
 
-        Write the new story to improve the score (higher is better).
+        The score is the similarity to a hidden target story. Analyze the references with their scores, then write a new story (different from the references) to improve the score, within a ```text block.
     """)
     LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
-        Reference {index} (score={score:.2f}):
+        Reference {index} (score={score:.3f}):
         ```text
         {story}
         ```
@@ -435,8 +434,7 @@ class Story:
         self.embedding_target = self.embeddings([self.TARGET_STORY])[0]
 
     def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's story as the one reference of its own prompt, PROMPT_TEMPLATE's in_context_text by
-        UNLABELLED_IN_CONTEXT_TEMPLATE.
+        """Each response's story as the one reference of its own PLAIN_PROMPT_TEMPLATE.
 
         Args:
             responses: list (G) of str, each holding a code block, e.g. [init_program]
@@ -444,16 +442,11 @@ class Story:
         Returns:
             list (G) of str
         """
-        prompts = []
-        for response in responses:
-            in_context_text = self.UNLABELLED_IN_CONTEXT_TEMPLATE.format(story=self.extract_story(response))
-            prompts.append(self.PROMPT_TEMPLATE.format(in_context_text=in_context_text))
-        return prompts
+        return [self.PLAIN_PROMPT_TEMPLATE.format(story=self.extract_story(response)) for response in responses]
 
     def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's story as a reference of one prompt, PROMPT_TEMPLATE's in_context_text by
-        LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the
-        given order.
+        """Every response's story as a reference of one LABELLED_PROMPT_TEMPLATE, each by
+        LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the given order.
 
         Args:
             responses: list (G) of str, each holding a code block
@@ -465,8 +458,7 @@ class Story:
         in_contexts = []
         for i, (score, response) in enumerate(zip(scores, responses), 1):
             in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, story=self.extract_story(response)))
-        in_context_text = self.LABELLED_IN_CONTEXT_TEMPLATE.format(item="\n\n".join(in_contexts))
-        return self.PROMPT_TEMPLATE.format(in_context_text=in_context_text)
+        return self.LABELLED_PROMPT_TEMPLATE.format(item="\n\n".join(in_contexts))
 
     def extract_story(self, response: str) -> str | None:
         """The response's last code block, of any language, stripped, its closing fence optional at the end; None
