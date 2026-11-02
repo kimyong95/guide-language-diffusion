@@ -1,5 +1,5 @@
 """Mutates config.task.name's seed program toward a higher reward by guided sampling of config.model.name inside SGLang,
-its guides picked by agent.py's RPUCG over config.C chains, no training.
+its guides picked by selector.py's RPUCG over config.C chains, no training.
 
 Every one of config.L steps samples each chain once: RPUCG picks up to N = 3 of the chain's nodes as its inspirations,
 best first, and config.K new responses are sampled independently under a weighted sum of log-probabilities over them,
@@ -9,11 +9,10 @@ when config.model.enable_thinking, scoring the response after its own prompt. A 
 every response is sampled under log p_2 + log p_1 - log p_3, the middle inspiration the pivot, pulled toward the best and
 pushed from the worst; with fewer, as the seed alone, under log p_1, the best alone.
 
-The C × K responses are sampled together
-by the pipeline's group_generate, each as one group of requests, one per guide. Each token of a response is sampled from
-the softmax of its weighted sum at the model's generation config's temperature, with no top-k, top-p or repetition
-penalty, and given to all of the group's requests, so its guides advance and stop together; a response fills
-config.model.max_total_tokens with its group's longest prompt at most.
+The C × K responses are sampled together by the pipeline's group_generate, each as one group of requests, one per guide.
+Each token of a response is sampled from the softmax of its weighted sum at the model's generation config's temperature,
+with no top-k, top-p or repetition penalty, and given to all of the group's requests, so its guides advance and stop
+together; a response fills config.model.max_total_tokens with its group's longest prompt at most.
 
 Each response's reward r is the task's evaluate, config.task.concurrency at a time, and RPUCG is updated as in agent.py.
 Each step logs every reward and response to wandb, -inf and "" included.
@@ -28,8 +27,8 @@ import wandb
 from absl import flags
 from ml_collections import config_flags
 
-from agent import RPUCG
 from base import BaseTrainer
+from selector import RPUCG
 
 FLAGS = flags.FLAGS
 
