@@ -13,11 +13,12 @@ def get_config():
     config.C = 32
     config.K = 16
     config.N = 3
+    config.selector = "rpucg"
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"
     config.model.max_total_tokens = 100000
     config.model.enable_thinking = False
-    config.model.reasoning_effort = None
+    config.model.reasoning_effort = "medium"
 
     return config

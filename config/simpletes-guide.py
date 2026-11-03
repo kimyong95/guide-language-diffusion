@@ -18,6 +18,6 @@ def get_config():
     config.model.name = "qwen-coder-next"
     config.model.max_total_tokens = 100000
     config.model.enable_thinking = False
-    config.model.reasoning_effort = None
+    config.model.reasoning_effort = "medium"
 
     return config

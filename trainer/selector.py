@@ -1,4 +1,4 @@
-"""SimpleTES's RPUCG policy, picking each chain's inspirations from one population of responses."""
+"""Inspiration selectors over C chains of responses: SimpleTES's RPUCG policy and Top, each chain's best."""
 
 import collections
 import math
@@ -105,3 +105,60 @@ class RPUCG:
                 self.histories[c].append(max(children, key=self.rewards.__getitem__))
             self.visits[c].update(inspirations)
             self.expansions[c] += 1
+
+
+class Top:
+    """C chains, each over its own population of responses rooted at the seed, its inspirations its N best of distinct
+    rewards.
+
+    Attributes:
+        responses: list (S) of str, every chain's population
+        rewards: list (S) of float, finite
+        populations: list (C) of list of int, each chain's nodes
+    """
+
+    def __init__(self, response, reward, C):
+        """
+        Args:
+            response: str, the seed
+            reward: float, finite, the seed's
+            C: int, chains
+        """
+        self.responses, self.rewards = [response], [reward]
+        self.populations = [[0] for _ in range(C)]
+
+    def select(self, N):
+        """Each chain's inspirations.
+
+        Args:
+            N: int, inspirations per chain at most
+
+        Returns:
+            list (C) of list of int, each chain's best of distinct rewards, best first
+        """
+        all_inspirations = []
+        for population in self.populations:
+            inspirations, rewards = [], set()
+            for s in sorted(population, key=self.rewards.__getitem__, reverse=True):
+                if len(inspirations) == N:
+                    break
+                if self.rewards[s] not in rewards:
+                    inspirations.append(s)
+                    rewards.add(self.rewards[s])
+            all_inspirations.append(inspirations)
+        return all_inspirations
+
+    def update(self, all_inspirations, all_responses, all_rewards):
+        """Adds each chain's responses with a finite reward to its population.
+
+        Args:
+            all_inspirations: list (C) of list of int, from select
+            all_responses: list (C) of list (K) of str
+            all_rewards: list (C) of list (K) of float
+        """
+        for population, responses, rewards in zip(self.populations, all_responses, all_rewards):
+            for response, reward in zip(responses, rewards):
+                if math.isfinite(reward):
+                    population.append(len(self.responses))
+                    self.responses.append(response)
+                    self.rewards.append(reward)

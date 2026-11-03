@@ -1,16 +1,16 @@
 """Mutates config.task.name's seed program toward a higher reward by in-context sampling of config.model.name inside
-SGLang, its in-context examples picked by selector.py's RPUCG over config.C chains, no guidance and no training.
+SGLang, its in-context examples picked over config.C chains by config.selector, a SELECTORS name of selector.py's
+selectors, no guidance and no training.
 
 The population holds every response with a finite reward, starting as the task's seed program alone, taken as a
-response, the root of every chain. Every one of config.L steps samples each chain once: RPUCG picks up to config.N of the
-chain's nodes, and config.K new responses are sampled independently under the task's prompts_with_scores of them with
-their rewards, best first, thinking at config.model.reasoning_effort when config.model.enable_thinking; all C × K
-responses come from one generate call. A response's answer is what follows its </think> when thinking, empty when its
-thinking never ends, and the whole response otherwise.
+response, the root of every chain. Every one of config.L steps samples each chain once: the selector picks up to
+config.N of the chain's nodes, and config.K new responses are sampled independently under the task's prompts_with_scores
+of them with their rewards, best first, thinking at config.model.reasoning_effort when config.model.enable_thinking;
+all C × K responses come from one generate call. A response's answer is what follows its </think> when thinking, empty
+when its thinking never ends, and the whole response otherwise.
 
 Each response's reward r is the task's evaluate, config.task.concurrency at a time. A response with a finite reward joins
-the population as a child of its prompt's nodes, and the chain's best of them joins its history. Each step logs every
-reward and response to wandb, -inf and "" included.
+the population by the selector's update. Each step logs every reward and response to wandb, -inf and "" included.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/agent.py --config config/agent.py
 """
@@ -23,23 +23,24 @@ from absl import flags
 from ml_collections import config_flags
 
 from base import BaseTrainer
-from selector import RPUCG
+from selector import RPUCG, TopGroup
 
 FLAGS = flags.FLAGS
+SELECTORS = {"rpucg": RPUCG, "top-group": TopGroup}
 
 
 class Trainer(BaseTrainer):
 
     def run(self):
-        """Runs config.L steps of RPUCG selection, in-context sampling, evaluation and update from the seed program."""
+        """Runs config.L steps of selection, in-context sampling, evaluation and update from the seed program."""
         task, L, C, K, N = self.task, self.config.L, self.config.C, self.config.K, self.config.N
-        rpucg = RPUCG(task.init_program, task.evaluate([task.init_program])[0], C)
+        selector = SELECTORS[self.config.selector](task.init_program, task.evaluate([task.init_program])[0], C)
         for l in range(L):
-            all_inspirations = rpucg.select(N)
-            prompts = [task.prompts_with_scores([rpucg.responses[s] for s in inspirations], [rpucg.rewards[s] for s in inspirations]) for inspirations in all_inspirations]
+            all_inspirations = selector.select(N)
+            prompts = [task.prompts_with_scores([selector.responses[s] for s in inspirations], [selector.rewards[s] for s in inspirations]) for inspirations in all_inspirations]
             responses = self.pipeline.generate([prompt for prompt in prompts for _ in range(K)])
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
-            rpucg.update(all_inspirations, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
+            selector.update(all_inspirations, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
 
             objective_evaluations = (l + 1) * C * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
