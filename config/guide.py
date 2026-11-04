@@ -10,7 +10,7 @@ def get_config():
     config.task.concurrency = 64
 
     config.L = 100
-    config.C = 4
+    config.C = 1
     config.K = 16
     config.G = 3
 

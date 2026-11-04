@@ -1,8 +1,8 @@
 """Mutates config.task.name's seed program toward a higher reward by guided sampling of config.model.name inside SGLang,
-its guides picked by selector.py's Top over config.C chains, no training.
+its guides picked by selector.py's Rpucg over config.C chains, no training.
 
-Every one of config.L steps samples each chain once: Top picks up to config.G of the chain's population as its
-inspirations, its best of distinct rewards, best first, and config.K new responses are sampled independently under a weighted sum of log-probabilities over them,
+Every one of config.L steps samples each chain once: Rpucg picks up to config.G of the chain's nodes as its
+inspirations, best first, and config.K new responses are sampled independently under a weighted sum of log-probabilities over them,
 p_i being the model under the task's prompts of inspiration i alone. Every guide thinks at config.model.reasoning_effort
 when config.model.enable_thinking, scoring the response after its own prompt. A response's answer is what follows its
 </think> when thinking, empty when its thinking never ends, and the whole response otherwise. Every response is
@@ -14,8 +14,8 @@ Each token of a response is sampled from the softmax of its weighted sum at the 
 with no top-k, top-p or repetition penalty, and given to all of the group's requests, so its guides advance and stop
 together; a response fills config.model.max_total_tokens with its group's longest prompt at most.
 
-Each response's reward r is the task's evaluate, config.task.concurrency at a time, and each chain's responses with a finite
-reward join its population.
+Each response's reward r is the task's evaluate, config.task.concurrency at a time, and every response joins the population
+by Rpucg's update, one with a non-finite reward never an inspiration.
 Each step logs every reward and response to wandb, -inf and "" included.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/guide.py --config config/guide.py
@@ -30,7 +30,7 @@ from absl import flags
 from ml_collections import config_flags
 
 from base import BaseTrainer
-from selector import Top
+from selector import Rpucg
 
 FLAGS = flags.FLAGS
 
@@ -75,18 +75,18 @@ def rms_weights(rewards):
 class Trainer(BaseTrainer):
 
     def run(self):
-        """Runs config.L steps of Top selection, guided sampling, evaluation and update from the seed program."""
+        """Runs config.L steps of Rpucg selection, guided sampling, evaluation and update from the seed program."""
         task, L, C, K, G = self.task, self.config.L, self.config.C, self.config.K, self.config.G
-        top = Top(task.init_program, task.evaluate([task.init_program])[0], C)
+        selector = Rpucg(task.init_program, task.evaluate([task.init_program])[0], C)
         for l in range(L):
-            all_guides = top.select(G, N=1)
+            all_inspirations = selector.select(G)
             all_prompts, all_weights = [], []
-            for guides in all_guides:
-                all_prompts += [task.prompts([top.responses[s] for [s] in guides])] * K
-                all_weights += [rms_weights([top.rewards[s] for [s] in guides])] * K
+            for inspirations in all_inspirations:
+                all_prompts += [task.prompts([selector.responses[s] for s in inspirations])] * K
+                all_weights += [rms_weights([selector.rewards[s] for s in inspirations])] * K
             responses = self.pipeline.group_generate(all_prompts, all_weights)
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
-            top.update(all_guides, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
+            selector.update(all_inspirations, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
 
             objective_evaluations = (l + 1) * C * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
