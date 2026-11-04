@@ -3,12 +3,17 @@
 generate samples one response per prompt. group_generate samples one response per group of prompts, one request per
 prompt, through extend_sglang: each token is drawn from Σ_k W_k log p_k over the group's requests and given to all of
 them, so they advance and stop together.
+
+SGLang holds its KV cache only while generating, released through torch_memory_saver between generations, so that the
+task's evaluation has that GPU memory.
 """
 
+import functools
 import os
 import uuid
 
 import torch
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.utils.common import get_device_sm
 
 from extend_sglang import GroupEngine, GroupLogitProcessor
@@ -41,8 +46,27 @@ def model_path(model_name):
     return MODELS[model_name]["nvfp4" if sm >= 100 else "fp8" if sm >= 89 else "int4"]
 
 
+def kv_cache(generate):
+    """Decorates a Pipeline method to hold SGLang's KV cache over the call, releasing it after.
+
+    Args:
+        generate: a method of Pipeline
+
+    Returns:
+        the method, holding the KV cache
+    """
+    @functools.wraps(generate)
+    def generate_with_kv_cache(self, *args, **kwargs):
+        self.engine.resume_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
+        outputs = generate(self, *args, **kwargs)
+        self.engine.release_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
+        return outputs
+
+    return generate_with_kv_cache
+
+
 class Pipeline:
-    """Generation with SGLang, tensor parallel over every visible GPU."""
+    """Generation with SGLang, tensor parallel over every visible GPU, its KV cache held only while generating."""
 
     def __init__(self, model_name, max_total_tokens, enable_thinking=False, reasoning_effort=None, seed=0, **kwargs):
         """Loads the model and its generation config's sampling parameters.
@@ -68,8 +92,10 @@ class Pipeline:
             disable_radix_cache=True,
             cuda_graph_max_bs_decode=256,
             disable_custom_all_reduce=os.environ.get("NCCL_P2P_DISABLE") == "1",
+            enable_memory_saver=True,
             **kwargs,
         )
+        self.engine.release_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
         self.tokenizer = self.engine.tokenizer_manager.tokenizer
         self.sampling_params = self.engine.tokenizer_manager.model_config.get_default_sampling_params()
         assert enable_thinking or "enable_thinking" in self.tokenizer.chat_template or "<think>" not in self.tokenizer.chat_template, "chat template does not support enable_thinking=False"
@@ -96,6 +122,7 @@ class Pipeline:
         _, think_end, answer = response.partition("</think>")
         return answer if think_end else ""
 
+    @kv_cache
     def generate(self, prompts):
         """Samples one response per prompt under the model's generation config, each filling max_total_tokens with its
         prompt at most.
@@ -113,6 +140,7 @@ class Pipeline:
         )
         return [self.strip_thinking(output["text"]) for output in outputs]
 
+    @kv_cache
     def group_generate(self, all_prompts, all_weights):
         """Samples one response per group of prompts, each token from Σ_k W_k log p_k at the generation config's
         temperature, p_k the model under the group's prompt k, with no top-k, top-p or repetition penalty, each response

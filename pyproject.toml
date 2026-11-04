@@ -27,6 +27,13 @@ dependencies = [
     # Blender
     "trimesh",
     "shapely",
+
+    # Docking
+    "PyTDC",
+    "rdkit",
+    "meeko",
+    "gemmi",  # meeko imports it without depending on it
+    "vina",
 ]
 
 [tool.pixi.workspace]
@@ -51,3 +58,14 @@ torchaudio = { version = "*", env-markers = "sys_platform == 'never'" }
 [tool.pixi.activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/cuda-compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 PYTHONPATH = "$PIXI_WORKSPACE_ROOT:$PIXI_WORKSPACE_ROOT/packages/SimpleTES"
+
+# Uni-Dock gets its own environment because conda-forge builds it for CUDA 12 only.
+[tool.pixi.feature.unidock.dependencies]
+unidock = "1.2.*"
+cuda-compat = "12.9.*"
+
+[tool.pixi.feature.unidock.activation.env]
+LD_LIBRARY_PATH = "$CONDA_PREFIX/cuda-compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+[tool.pixi.environments]
+unidock = { features = ["unidock"], no-default-feature = true }

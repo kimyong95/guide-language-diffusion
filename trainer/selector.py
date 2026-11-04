@@ -11,19 +11,19 @@ GAMMA = 0.8
 
 class RPUCG:
     """SimpleTES's RPUCG policy: C chains over one population of responses, each chain's history rooted at the seed and
-    holding its best response of every batch.
+    holding its best response of every batch whose reward is finite.
 
     A chain's inspirations are up to N of its history's nodes s by Q(s) + PUCT_C P(s) √(1 + T) / (1 + n(s)), picked
     greedily, each pick excluding its parents and children from the rest. P and Q are the percentile ranks, over the
-    population, of the reward r and of V(s) = max(r(s), GAMMA max_children V); T is the chain's batches so far and n(s)
-    the times s was among its inspirations.
+    population, non-finite rewards included, of the reward r and of V(s) = max(r(s), GAMMA max_children V); T is the
+    chain's batches so far and n(s) the times s was among its inspirations.
 
     Attributes:
         responses: list (S) of str, the population, each child after its parents
-        rewards: list (S) of float, finite
+        rewards: list (S) of float
         parents: list (S) of list of int
         children: list (S) of list of int
-        histories: list (C) of list of int, each chain's nodes
+        histories: list (C) of list of int, each chain's nodes, of finite reward
         visits: list (C) of collections.Counter, each chain's n
         expansions: list (C) of int, each chain's T
     """
@@ -82,8 +82,8 @@ class RPUCG:
         return all_inspirations
 
     def update(self, all_inspirations, all_responses, all_rewards):
-        """Adds each chain's responses with a finite reward to the population as children of its inspirations, appends
-        its best of them to its history and counts the batch.
+        """Adds each chain's responses to the population as children of its inspirations, appends its best of them to
+        its history when that reward is finite and counts the batch.
 
         Args:
             all_inspirations: list (C) of list of int, from select
@@ -93,16 +93,16 @@ class RPUCG:
         for c, (inspirations, responses, rewards) in enumerate(zip(all_inspirations, all_responses, all_rewards)):
             children = []
             for response, reward in zip(responses, rewards):
-                if math.isfinite(reward):
-                    children.append(len(self.responses))
-                    self.responses.append(response)
-                    self.rewards.append(reward)
-                    self.parents.append(inspirations)
-                    self.children.append([])
-                    for parent in inspirations:
-                        self.children[parent].append(children[-1])
-            if children:
-                self.histories[c].append(max(children, key=self.rewards.__getitem__))
+                children.append(len(self.responses))
+                self.responses.append(response)
+                self.rewards.append(reward)
+                self.parents.append(inspirations)
+                self.children.append([])
+                for parent in inspirations:
+                    self.children[parent].append(children[-1])
+            best = max(children, key=self.rewards.__getitem__)
+            if math.isfinite(self.rewards[best]):
+                self.histories[c].append(best)
             self.visits[c].update(inspirations)
             self.expansions[c] += 1
 

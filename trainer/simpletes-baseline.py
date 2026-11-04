@@ -3,7 +3,7 @@
 config.task.name names a tasks.py SimpleTES task, e.g. "circle-packing-26", whose seed program, SimpleTES generator, for
 prompts, and EvaluatorWorker, built as SimpleTES's engine builds them, the trainer takes. A response's code is the seed
 with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's extract_code_detailed. The task's evaluate, its
-evaluate_one replaced by the trainer's to return metrics, runs each code's EvaluatorWorker in a fresh subprocess,
+evaluate_one_async replaced by the trainer's to return metrics, runs each code's EvaluatorWorker in a fresh subprocess,
 config.task.concurrency at a time, killed after EngineConfig's eval_timeout, and its error is truncated to
 DEFAULT_METRICS_ERROR_MAX_CHARS. The seed is evaluated EngineConfig.init_eval_repeats times, keeping the best metrics.
 
@@ -61,15 +61,15 @@ class Trainer(BaseTrainer):
         )
 
     def setup_task(self):
-        """Builds config.task.name's tasks.py task with evaluate_one replaced, taking its seed program, EVOLVE-BLOCK
+        """Builds config.task.name's tasks.py task with evaluate_one_async replaced, taking its seed program, EVOLVE-BLOCK
         context, generator and EvaluatorWorker."""
         super().setup_task()
-        self.task.evaluate_one = self.evaluate_one
+        self.task.evaluate_one_async = self.evaluate_one_async
         self.init_program, self.evolve_context = self.task.init_program, self.task.evolve_context
         self.generator, self.evaluator = self.task.generator, self.task.evaluator
 
-    async def evaluate_one(self, code, semaphore):
-        """SimpleTES's engine's _evaluate_code, holding the semaphore during the evaluation; the task's evaluate_one,
+    async def evaluate_one_async(self, code, semaphore):
+        """SimpleTES's engine's _evaluate_code, holding the semaphore during the evaluation; the task's evaluate_one_async,
         so that its evaluate returns each code's metrics."""
         async with semaphore:
             try:

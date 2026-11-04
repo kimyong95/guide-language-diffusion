@@ -1,7 +1,7 @@
 """Mutates config.task.name's seed program toward a higher reward by guided sampling of config.model.name inside SGLang,
 its guides picked by selector.py's Top over config.C chains, no training.
 
-Every one of config.L steps samples each chain once: Top picks up to N = 3 of the chain's population as its
+Every one of config.L steps samples each chain once: Top picks up to config.N of the chain's population as its
 inspirations, its best of distinct rewards, best first, and config.K new responses are sampled independently under a weighted sum of log-probabilities over them,
 p_i being the model under the task's prompts of inspiration i alone. Every guide thinks at config.model.reasoning_effort
 when config.model.enable_thinking, scoring the response after its own prompt. A response's answer is what follows its
@@ -34,7 +34,6 @@ from selector import Top
 
 FLAGS = flags.FLAGS
 
-N = 3
 BOUND = 1.0
 
 
@@ -77,7 +76,7 @@ class Trainer(BaseTrainer):
 
     def run(self):
         """Runs config.L steps of Top selection, guided sampling, evaluation and update from the seed program."""
-        task, L, C, K = self.task, self.config.L, self.config.C, self.config.K
+        task, L, C, K, N = self.task, self.config.L, self.config.C, self.config.K, self.config.N
         top = Top(task.init_program, task.evaluate([task.init_program])[0], C)
         for l in range(L):
             all_inspirations = top.select(N)

@@ -13,7 +13,6 @@ def get_config():
     config.C = 32
     config.K = 16
     config.N = 3
-    config.selector = "rpucg"
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"

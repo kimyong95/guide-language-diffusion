@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import functools
 import glob
 import inspect
@@ -48,7 +49,7 @@ async def subprocess_run(args, **kwargs):
 class OpenFOAM:
     """Drag coefficient of a car, simulated with OpenFOAM v14 (Foundation) following its official drivaerFastback case.
 
-    evaluate_one builds the car by running the response's bpy script in headless Blender and exporting the scene to STL,
+    evaluate_one_async builds the car by running the response's bpy script in headless Blender and exporting the scene to STL,
     BLENDER_SCRIPT as execute-blender.py does before rendering. It then runs IMAGE, microfluidica's docker image of the
     Foundation's own packages, on a copy of the image's tutorials/incompressibleFluid/drivaerFastback. OPENFOAM_COMMAND changes
     only the entries tagged by their source: [DrivAerNet++] following Elrefaie et al. (NeurIPS 2024), [ours] otherwise.
@@ -108,9 +109,9 @@ class OpenFOAM:
         return self.PROMPT_TEMPLATE
 
     def evaluate(self, responses: list[str]) -> list[float | None]:
-        """Evaluates the responses with evaluate_one, concurrency at a time, blocking until all are done.
+        """Evaluates the responses with evaluate_one_async, concurrency at a time, blocking until all are done.
 
-        Ctrl+C cancels every evaluate_one, each removing its container and temporary directory, then raises
+        Ctrl+C cancels every evaluate_one_async, each removing its container and temporary directory, then raises
         KeyboardInterrupt.
 
         Args:
@@ -122,11 +123,11 @@ class OpenFOAM:
         semaphore = asyncio.Semaphore(self.concurrency)
 
         async def evaluate_async():
-            return await asyncio.gather(*(self.evaluate_one(response, semaphore) for response in responses))
+            return await asyncio.gather(*(self.evaluate_one_async(response, semaphore) for response in responses))
 
         return asyncio.run(evaluate_async())
 
-    async def evaluate_one(self, response: str, semaphore: asyncio.Semaphore) -> float | None:
+    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float | None:
         """Builds the response's car in Blender, simulates it in a docker container and reads its drag coefficient.
 
         Every file lives in one temporary directory, removed with the container on any exception or cancellation.
@@ -158,7 +159,7 @@ class OpenFOAM:
                     header = [line for line in lines if line.startswith("#")][-1].lstrip("#").split()
                     Cd = float(np.loadtxt(lines, comments="#")[-self.AVERAGE_LAST:, header.index("Cd")].mean())
                 except Exception as exception:
-                    print(f"OpenFOAM.evaluate_one failed: {exception!r}", file=sys.stderr)
+                    print(f"OpenFOAM.evaluate_one_async failed: {exception!r}", file=sys.stderr)
                     return None
                 finally:
                     subprocess.run(f"docker rm -f {name}".split(), capture_output=True)
@@ -327,24 +328,24 @@ class SimpletesTask:
         return code and code.strip()
 
     def evaluate(self, responses: list[str]) -> list:
-        """Evaluates the responses with evaluate_one, concurrency at a time, blocking until all are done.
+        """Evaluates the responses with evaluate_one_async, concurrency at a time, blocking until all are done.
 
-        Ctrl+C cancels every evaluate_one, the EvaluatorWorker killing its subprocess, then raises KeyboardInterrupt.
+        Ctrl+C cancels every evaluate_one_async, the EvaluatorWorker killing its subprocess, then raises KeyboardInterrupt.
 
         Args:
             responses: list (N) of str, each holding the EVOLVE-BLOCK markers, preferably within a code block
 
         Returns:
-            list (N), each response's evaluate_one
+            list (N), each response's evaluate_one_async
         """
         semaphore = asyncio.Semaphore(self.concurrency)
 
         async def evaluate_async():
-            return await asyncio.gather(*(self.evaluate_one(response, semaphore) for response in responses))
+            return await asyncio.gather(*(self.evaluate_one_async(response, semaphore) for response in responses))
 
         return asyncio.run(evaluate_async())
 
-    async def evaluate_one(self, response: str, semaphore: asyncio.Semaphore) -> float:
+    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float:
         """Extracts the response's code and evaluates it as SimpleTES's engine's _evaluate_code does.
 
         Args:
@@ -388,7 +389,8 @@ class Story:
 
     A response's story is its last code block's, of any language. A story's embedding is MODEL_NAME's last-layer hidden
     state of its last token, the <|endoftext|> its tokenizer appends, L2-normalised; the story is tokenized without a
-    chat template or instruction, and embedded on CPU in batches of concurrency stories.
+    chat template or instruction, and embedded in batches of concurrency stories on the first visible GPU, where
+    MODEL_NAME is loaded at construction.
     """
 
     MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
@@ -430,7 +432,7 @@ class Story:
         """
         self.concurrency = concurrency
         self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
-        self.model = AutoModel.from_pretrained(self.MODEL_NAME, dtype=torch.float32)
+        self.model = AutoModel.from_pretrained(self.MODEL_NAME, dtype=torch.float32).cuda()
         self.embedding_target = self.embeddings([self.TARGET_STORY])[0]
 
     def prompts(self, responses: list[str]) -> list[str]:
@@ -477,7 +479,7 @@ class Story:
         Returns:
             (B, D) float32, unit norm
         """
-        inputs = self.tokenizer(stories, return_tensors="pt", padding=True, padding_side="right")
+        inputs = self.tokenizer(stories, return_tensors="pt", padding=True, padding_side="right").to(self.model.device)
         last_hidden_state = self.model(**inputs).last_hidden_state
         return torch.nn.functional.normalize(last_hidden_state[torch.arange(len(stories)), inputs.attention_mask.sum(1) - 1], dim=-1)
 
@@ -501,11 +503,243 @@ class Story:
         return [next(similarities) if story else -math.inf for story in stories]
 
 
+class Docking:
+    """Binding of a molecule to the protein of PDB entry PDB_ID, scored by Uni-Dock under the vina scoring function
+    and negated, so that higher is better.
+
+    A response's molecule is the SMILES of its last code block, canonicalised by RDKit. It is docked into TDC's
+    receptor for PDB_ID, over TDC's own search box for it, after being embedded in 3D, MMFF-optimised and prepared by
+    Meeko, concurrency molecules at a time; its score is minus the best of N_POSES poses' affinity, the search Uni-Dock's
+    SEARCH_MODE preset. Every molecule is docked once and kept in scores, docking being by far the task's cost; each
+    evaluate's molecules are split over the visible GPUs, one Uni-Dock batch per GPU, all at once, each sized by
+    Uni-Dock to its GPU's free memory.
+
+    Uni-Dock runs in pixi's unidock environment, its conda-forge build needing CUDA 12. TDC, RDKit and Meeko are
+    imported in the class body, so they are reached through self.
+    """
+
+    import tdc.metadata
+    import tdc.utils
+    from meeko import MoleculePreparation, PDBQTWriterLegacy
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    PDB_ID = None
+    PROTEIN = None
+    RECEPTOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "docking")
+    UNIDOCK = ["pixi", "run", "--manifest-path", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyproject.toml"), "--frozen", "--environment", "unidock", "unidock"]
+    SEARCH_MODE = "detail"
+    N_POSES = 10
+    init_program = inspect.cleandoc("""
+        ```smiles
+        CC(C)(C)c1ccc2occ(CC(=O)Nc3ccccc3F)c2c1
+        ```
+    """)
+    PLAIN_PROMPT_TEMPLATE = inspect.cleandoc("""
+        With reference to the following molecule, propose a new molecule that binds {protein} more strongly.
+
+        Reference:
+        ```smiles
+        {molecule}
+        ```
+
+        Write the new molecule's SMILES within a ```smiles block.
+    """)
+    LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
+        With reference to the following molecules, propose a new molecule that binds {protein} more strongly.
+
+        {item}
+
+        The score is minus the AutoDock Vina docking score against {protein}, in kcal/mol, so a higher score is a more strongly bound molecule. Analyze the references with their scores, then write a new molecule (different from the references), either by crossover and mutation of the references or from your own chemical knowledge, within a ```smiles block.
+    """)
+    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        Reference {index} (score={score:.2f}):
+        ```smiles
+        {molecule}
+        ```
+    """)
+    MOLECULE_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
+
+    def __init__(self, concurrency: int):
+        """Downloads TDC's receptor for PDB_ID into RECEPTOR_DIR, keeping a local copy for later runs.
+
+        Args:
+            concurrency: int, molecules prepared at once
+        """
+        self.concurrency = concurrency
+        self.scores = {}
+        self.box = self.tdc.metadata.docking_target_info[self.PDB_ID]
+        self.tdc.utils.receptor_load(self.PDB_ID, path=self.RECEPTOR_DIR)
+
+    def prompts(self, responses: list[str]) -> list[str]:
+        """Each response's molecule as the one reference of its own PLAIN_PROMPT_TEMPLATE.
+
+        Args:
+            responses: list (G) of str, each holding a code block, e.g. [init_program]
+
+        Returns:
+            list (G) of str
+        """
+        return [self.PLAIN_PROMPT_TEMPLATE.format(protein=self.PROTEIN, molecule=self.extract_molecule(response)) for response in responses]
+
+    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
+        """Every response's molecule as a reference of one LABELLED_PROMPT_TEMPLATE, each by
+        LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the given order.
+
+        Args:
+            responses: list (G) of str, each holding a code block
+            scores: list (G) of float
+
+        Returns:
+            str
+        """
+        in_contexts = []
+        for i, (score, response) in enumerate(zip(scores, responses), 1):
+            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, molecule=self.extract_molecule(response)))
+        return self.LABELLED_PROMPT_TEMPLATE.format(protein=self.PROTEIN, item="\n\n".join(in_contexts))
+
+    def extract_molecule(self, response: str) -> str | None:
+        """The canonical SMILES of the response's last code block, of any language, its closing fence optional at the
+        end; None without one or when RDKit cannot parse it."""
+        molecules = self.MOLECULE_BLOCK.findall(response)
+        if not molecules:
+            return None
+        molecule = self.Chem.MolFromSmiles(molecules[-1].strip())
+        return self.Chem.MolToSmiles(molecule) if molecule is not None else None
+
+    def prepare(self, molecule: str) -> str | None:
+        """The molecule's ligand PDBQT, embedded in 3D, MMFF-optimised and prepared by Meeko; None, the failure printed
+        to stderr, when any of them fails.
+
+        Args:
+            molecule: str, a canonical SMILES
+        """
+        try:
+            conformer = self.Chem.AddHs(self.Chem.MolFromSmiles(molecule))
+            if self.AllChem.EmbedMolecule(conformer) != 0:
+                raise ValueError(f"no 3D conformer of {molecule}")
+            self.AllChem.MMFFOptimizeMolecule(conformer)
+            pdbqt, success, error = self.PDBQTWriterLegacy.write_string(self.MoleculePreparation().prepare(conformer)[0])
+            if not success:
+                raise ValueError(error)
+        except Exception as exception:
+            print(f"{type(self).__name__}.prepare failed: {exception!r}", file=sys.stderr)
+            return None
+        return pdbqt
+
+    def dock(self, pdbqts: list[str]) -> list[float]:
+        """Docks the ligands into the receptor, split round-robin over the visible GPUs, one dock_one_async batch per GPU, all
+        at once.
+
+        Args:
+            pdbqts: list (N) of str, each a ligand's PDBQT
+
+        Returns:
+            list (N) of float, minus each ligand's best pose's affinity in kcal/mol, positive for a ligand that binds;
+            -inf, printed to stderr, for a ligand Uni-Dock gives no pose
+
+        Raises:
+            subprocess.CalledProcessError: a Uni-Dock exits non-zero
+        """
+        devices = os.environ.get("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(torch.cuda.device_count())))).split(",")
+        with tempfile.TemporaryDirectory() as directory:
+            ligands = [os.path.join(directory, f"{i}.pdbqt") for i in range(len(pdbqts))]
+            for ligand, pdbqt in zip(ligands, pdbqts):
+                with open(ligand, "w") as f:
+                    f.write(pdbqt)
+            batches = [(device, ligands[g::len(devices)]) for g, device in enumerate(devices)]
+
+            async def dock_async():
+                return await asyncio.gather(*(self.dock_one_async(device, batch, directory) for device, batch in batches if batch))
+
+            asyncio.run(dock_async())
+            return [self.read_score(ligand.removesuffix(".pdbqt") + "_out.pdbqt") for ligand in ligands]
+
+    async def dock_one_async(self, device: str, ligands: list[str], directory: str) -> None:
+        """Runs one Uni-Dock over the ligands on one GPU, over the receptor's search box under the vina scoring
+        function, writing each ligand's poses beside it.
+
+        Args:
+            device: str, the CUDA device index the GPU is visible as
+            ligands: list (M) of str, paths of ligand PDBQTs, nonempty
+            directory: str, where the poses and the ligand index go
+
+        Raises:
+            subprocess.CalledProcessError: Uni-Dock exits non-zero
+        """
+        ligand_index = os.path.join(directory, f"ligands-{device}.txt")
+        with open(ligand_index, "w") as f:
+            f.write("\n".join(ligands))
+        await subprocess_run([
+            *self.UNIDOCK,
+            "--receptor", os.path.join(self.RECEPTOR_DIR, f"{self.PDB_ID}.pdbqt"),
+            *(option for axis, center, size in zip("xyz", self.box["center"], self.box["size"]) for option in (f"--center_{axis}", str(center), f"--size_{axis}", str(size))),
+            "--scoring", "vina",
+            "--search_mode", self.SEARCH_MODE,
+            "--num_modes", str(self.N_POSES),
+            "--verbosity", "0",
+            "--ligand_index", ligand_index,
+            "--dir", directory,
+        ], env=os.environ | {"CUDA_VISIBLE_DEVICES": device}, stdout=subprocess.DEVNULL)
+
+    def read_score(self, path: str) -> float:
+        """Minus the best pose's affinity in Uni-Dock's output, the first REMARK VINA RESULT; -inf, printed to stderr,
+        when it has none."""
+        try:
+            with open(path) as f:
+                return -float(next(line for line in f if line.startswith("REMARK VINA RESULT:")).split()[3])
+        except (OSError, StopIteration) as exception:
+            print(f"{type(self).__name__}.read_score failed: {exception!r} for {path}", file=sys.stderr)
+            return -math.inf
+
+    def evaluate(self, responses: list[str]) -> list[float]:
+        """Prepares the responses' molecules that scores is missing, concurrency at a time, docks them, then reads every
+        score from it.
+
+        Args:
+            responses: list (N) of str, each holding a code block
+
+        Returns:
+            list (N) of float, minus each response's molecule's docking score in kcal/mol, higher for a molecule bound
+            more strongly and about 10 for the strongest binders of these proteins; -inf without a molecule RDKit
+            parses or when its preparation or docking fails
+        """
+        molecules = [self.extract_molecule(response) for response in responses]
+        molecules_todo = list({molecule for molecule in molecules if molecule and molecule not in self.scores})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            pdbqts = dict(zip(molecules_todo, executor.map(self.prepare, molecules_todo)))
+        molecules_prepared = [molecule for molecule in molecules_todo if pdbqts[molecule]]
+        self.scores.update(dict.fromkeys(molecules_todo, -math.inf))
+        self.scores.update(zip(molecules_prepared, self.dock([pdbqts[molecule] for molecule in molecules_prepared])))
+        return [self.scores[molecule] if molecule else -math.inf for molecule in molecules]
+
+
+class DockingDRD3(Docking):
+
+    PDB_ID = "3pbl"
+    PROTEIN = "the dopamine receptor D3 (DRD3)"
+
+
+class DockingEGFR(Docking):
+
+    PDB_ID = "2rgp"
+    PROTEIN = "the epidermal growth factor receptor (EGFR)"
+
+
+class DockingAdenosineA2A(Docking):
+
+    PDB_ID = "3eml"
+    PROTEIN = "the adenosine A2A receptor"
+
+
 TASKS_CLS = {
     "openfoam": OpenFOAM,
     "circle-packing-26": CirclePacking26,
     "circle-packing-32": CirclePacking32,
     "story": Story,
+    "docking-drd3": DockingDRD3,
+    "docking-egfr": DockingEGFR,
+    "docking-adenosine-a2a": DockingAdenosineA2A,
 }
 
 def get_reward_fn(task_name: str, concurrency: int):
