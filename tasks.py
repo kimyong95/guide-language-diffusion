@@ -4,6 +4,7 @@ import functools
 import glob
 import inspect
 import math
+import multiprocessing
 import os
 import re
 import subprocess
@@ -523,18 +524,16 @@ class Story:
 
 
 class Docking:
-    """Binding of a molecule to the protein of PDB entry PDB_ID, scored by Uni-Dock under the vina scoring function
-    and negated, so that higher is better.
+    """Scores molecules by negated AutoDock Vina affinity against TDC's receptor and search box.
 
-    A response's molecule is the SMILES of its last code block, canonicalised by RDKit. It is docked into TDC's
-    receptor for PDB_ID, over TDC's own search box for it, after being embedded in 3D, MMFF-optimised and prepared by
-    Meeko, concurrency molecules at a time; its score is minus the best of N_POSES poses' affinity, the search Uni-Dock's
-    SEARCH_MODE preset. Every molecule is docked once and kept in scores, docking being by far the task's cost; each
-    evaluate's molecules are split over the visible GPUs, one Uni-Dock batch per GPU, all at once, each sized by
-    Uni-Dock to its GPU's free memory.
+    Each response's last code block supplies a SMILES, canonicalized before caching. Workers embed it in 3D,
+    converge MMFF optimization within 1,000 iterations, prepare it with Meeko, and return minus the best docked
+    pose's energy in kcal/mol.
+    RDKit and Vina use the same fixed positive SEED. Reproducibility also requires fixed dependency versions.
 
-    Uni-Dock runs in pixi's unidock environment, its conda-forge build needing CUDA 12. TDC, RDKit and Meeko are
-    imported in the class body, so they are reached through self.
+    A persistent pool prepares and docks up to concurrency molecules at once, each on N_CPUS CPUs. Each worker
+    builds its affinity maps once. Errors propagate; a failed batch leaves the score cache unchanged. Call close()
+    when discarding the task to release its workers.
     """
 
     import tdc.metadata
@@ -546,9 +545,10 @@ class Docking:
     PDB_ID = None
     PROTEIN = None
     RECEPTOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "docking")
-    UNIDOCK = ["pixi", "run", "--manifest-path", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyproject.toml"), "--frozen", "--environment", "unidock", "unidock"]
-    SEARCH_MODE = "detail"
+    N_CPUS = 1
+    EXHAUSTIVENESS = 8
     N_POSES = 10
+    SEED = 1
     init_program = inspect.cleandoc("""
         ```smiles
         CC(C)(C)c1ccc2occ(CC(=O)Nc3ccccc3F)c2c1
@@ -580,15 +580,33 @@ class Docking:
     MOLECULE_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
 
     def __init__(self, concurrency: int):
-        """Downloads TDC's receptor for PDB_ID into RECEPTOR_DIR, keeping a local copy for later runs.
+        """Loads TDC's receptor and creates a pool that starts workers on the first evaluation.
 
         Args:
-            concurrency: int, molecules prepared at once
+            concurrency: Maximum simultaneous molecules, each docking on N_CPUS CPUs.
         """
         self.concurrency = concurrency
         self.scores = {}
-        self.box = self.tdc.metadata.docking_target_info[self.PDB_ID]
+        box = self.tdc.metadata.docking_target_info[self.PDB_ID]
         self.tdc.utils.receptor_load(self.PDB_ID, path=self.RECEPTOR_DIR)
+        self.executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=concurrency, mp_context=multiprocessing.get_context("spawn"), initializer=self.init_worker,
+            initargs=(os.path.join(self.RECEPTOR_DIR, f"{self.PDB_ID}.pdbqt"), box, self.N_CPUS, self.SEED),
+        )
+
+    def close(self) -> None:
+        """Waits for pending docking jobs and releases the worker processes."""
+        self.executor.shutdown()
+
+    @classmethod
+    def init_worker(cls, receptor: str, box: dict, cpu: int, seed: int) -> None:
+        """Initializes this worker's Vina and affinity maps before processing any ligands."""
+        from vina import Vina
+
+        cls.seed = seed
+        cls.vina = Vina(sf_name="vina", cpu=cpu, seed=seed, verbosity=0)
+        cls.vina.set_receptor(rigid_pdbqt_filename=receptor)
+        cls.vina.compute_vina_maps(center=list(box["center"]), box_size=list(box["size"]))
 
     def prompts(self, responses: list[str]) -> list[str]:
         """Each response's molecule as the one reference of its own PLAIN_PROMPT_TEMPLATE.
@@ -617,120 +635,49 @@ class Docking:
             in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, molecule=self.extract_molecule(response)))
         return self.LABELLED_PROMPT_TEMPLATE.format(protein=self.PROTEIN, item="\n\n".join(in_contexts))
 
-    def extract_molecule(self, response: str) -> str | None:
-        """The canonical SMILES of the response's last code block, of any language, its closing fence optional at the
-        end; None without one or when RDKit cannot parse it."""
-        molecules = self.MOLECULE_BLOCK.findall(response)
-        if not molecules:
-            return None
-        molecule = self.Chem.MolFromSmiles(molecules[-1].strip())
-        return self.Chem.MolToSmiles(molecule) if molecule is not None else None
+    def extract_molecule(self, response: str) -> str:
+        """Returns canonical SMILES from the last code block, raising for missing or invalid molecules."""
+        smiles = self.MOLECULE_BLOCK.findall(response)[-1].strip()
+        molecule = self.Chem.MolFromSmiles(smiles)
+        if molecule is None or molecule.GetNumAtoms() == 0:
+            raise ValueError(f"Invalid SMILES: {smiles}")
+        return self.Chem.MolToSmiles(molecule)
 
-    def prepare(self, molecule: str) -> str | None:
-        """The molecule's ligand PDBQT, embedded in 3D, MMFF-optimised and prepared by Meeko; None, the failure printed
-        to stderr, when any of them fails.
-
-        Args:
-            molecule: str, a canonical SMILES
-        """
-        try:
-            conformer = self.Chem.AddHs(self.Chem.MolFromSmiles(molecule))
-            if self.AllChem.EmbedMolecule(conformer) != 0:
-                raise ValueError(f"no 3D conformer of {molecule}")
-            self.AllChem.MMFFOptimizeMolecule(conformer)
-            pdbqt, success, error = self.PDBQTWriterLegacy.write_string(self.MoleculePreparation().prepare(conformer)[0])
-            if not success:
-                raise ValueError(error)
-        except Exception as exception:
-            print(f"{type(self).__name__}.prepare failed: {exception!r}", file=sys.stderr)
-            return None
-        return pdbqt
-
-    def dock(self, pdbqts: list[str]) -> list[float]:
-        """Docks the ligands into the receptor, split round-robin over the visible GPUs, one dock_one_async batch per GPU, all
-        at once.
-
-        Args:
-            pdbqts: list (N) of str, each a ligand's PDBQT
-
-        Returns:
-            list (N) of float, minus each ligand's best pose's affinity in kcal/mol, positive for a ligand that binds;
-            -inf, printed to stderr, for a ligand Uni-Dock gives no pose
-
-        Raises:
-            subprocess.CalledProcessError: a Uni-Dock exits non-zero
-        """
-        devices = os.environ.get("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(torch.cuda.device_count())))).split(",")
-        with tempfile.TemporaryDirectory() as directory:
-            ligands = [os.path.join(directory, f"{i}.pdbqt") for i in range(len(pdbqts))]
-            for ligand, pdbqt in zip(ligands, pdbqts):
-                with open(ligand, "w") as f:
-                    f.write(pdbqt)
-            batches = [(device, ligands[g::len(devices)]) for g, device in enumerate(devices)]
-
-            async def dock_async():
-                return await asyncio.gather(*(self.dock_one_async(device, batch, directory) for device, batch in batches if batch))
-
-            asyncio.run(dock_async())
-            return [self.read_score(ligand.removesuffix(".pdbqt") + "_out.pdbqt") for ligand in ligands]
-
-    async def dock_one_async(self, device: str, ligands: list[str], directory: str) -> None:
-        """Runs one Uni-Dock over the ligands on one GPU, over the receptor's search box under the vina scoring
-        function, writing each ligand's poses beside it.
-
-        Args:
-            device: str, the CUDA device index the GPU is visible as
-            ligands: list (M) of str, paths of ligand PDBQTs, nonempty
-            directory: str, where the poses and the ligand index go
-
-        Raises:
-            subprocess.CalledProcessError: Uni-Dock exits non-zero
-        """
-        ligand_index = os.path.join(directory, f"ligands-{device}.txt")
-        with open(ligand_index, "w") as f:
-            f.write("\n".join(ligands))
-        await subprocess_run([
-            *self.UNIDOCK,
-            "--receptor", os.path.join(self.RECEPTOR_DIR, f"{self.PDB_ID}.pdbqt"),
-            *(option for axis, center, size in zip("xyz", self.box["center"], self.box["size"]) for option in (f"--center_{axis}", str(center), f"--size_{axis}", str(size))),
-            "--scoring", "vina",
-            "--search_mode", self.SEARCH_MODE,
-            "--num_modes", str(self.N_POSES),
-            "--verbosity", "0",
-            "--ligand_index", ligand_index,
-            "--dir", directory,
-        ], env=os.environ | {"CUDA_VISIBLE_DEVICES": device}, stdout=subprocess.DEVNULL)
-
-    def read_score(self, path: str) -> float:
-        """Minus the best pose's affinity in Uni-Dock's output, the first REMARK VINA RESULT; -inf, printed to stderr,
-        when it has none."""
-        try:
-            with open(path) as f:
-                return -float(next(line for line in f if line.startswith("REMARK VINA RESULT:")).split()[3])
-        except (OSError, StopIteration) as exception:
-            print(f"{type(self).__name__}.read_score failed: {exception!r} for {path}", file=sys.stderr)
-            return -math.inf
+    @classmethod
+    def dock_one(cls, molecule: str, exhaustiveness: int, n_poses: int) -> float:
+        """Prepares a canonical SMILES and returns its negated best-pose affinity in an initialized worker."""
+        conformer = cls.Chem.AddHs(cls.Chem.MolFromSmiles(molecule))
+        if cls.AllChem.EmbedMolecule(conformer, randomSeed=cls.seed) != 0:
+            raise ValueError(f"No 3D conformer for {molecule}")
+        status = cls.AllChem.MMFFOptimizeMolecule(conformer, maxIters=1000)
+        if status != 0:
+            raise ValueError(f"MMFF optimization failed for {molecule}: status {status}")
+        pdbqt, success, error = cls.PDBQTWriterLegacy.write_string(cls.MoleculePreparation().prepare(conformer)[0])
+        if not success:
+            raise ValueError(error)
+        cls.vina.set_ligand_from_string(pdbqt)
+        cls.vina.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
+        score = -float(cls.vina.energies(n_poses=1)[0][0])
+        if not math.isfinite(score):
+            raise ValueError(f"Non-finite docking score for {molecule}: {score}")
+        return score
 
     def evaluate(self, responses: list[str]) -> list[float]:
-        """Prepares the responses' molecules that scores is missing, concurrency at a time, docks them, then reads every
-        score from it.
+        """Scores uncached molecules in parallel and returns rewards in response order.
 
         Args:
-            responses: list (N) of str, each holding a code block
+            responses: Responses containing SMILES code blocks.
 
         Returns:
-            list (N) of float, minus each response's molecule's docking score in kcal/mol, higher for a molecule bound
-            more strongly and about 10 for the strongest binders of these proteins; -inf without a molecule RDKit
-            parses or when its preparation or docking fails
+            Negated best-pose affinities in kcal/mol. Errors propagate without caching the failed batch.
         """
         molecules = [self.extract_molecule(response) for response in responses]
-        molecules_todo = list({molecule for molecule in molecules if molecule and molecule not in self.scores})
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            pdbqts = dict(zip(molecules_todo, executor.map(self.prepare, molecules_todo)))
-        molecules_prepared = [molecule for molecule in molecules_todo if pdbqts[molecule]]
-        self.scores.update(dict.fromkeys(molecules_todo, -math.inf))
-        self.scores.update(zip(molecules_prepared, self.dock([pdbqts[molecule] for molecule in molecules_prepared])))
-        return [self.scores[molecule] if molecule else -math.inf for molecule in molecules]
+        pending = list(dict.fromkeys(molecule for molecule in molecules if molecule not in self.scores))
+        if pending:
+            dock = functools.partial(self.dock_one, exhaustiveness=self.EXHAUSTIVENESS, n_poses=self.N_POSES)
+            scores = list(self.executor.map(dock, pending))
+            self.scores.update(zip(pending, scores))
+        return [self.scores[molecule] for molecule in molecules]
 
 
 class DockingDRD3(Docking):
