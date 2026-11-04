@@ -168,8 +168,8 @@ class OpenFOAM:
 
 class SimpletesTask:
     """A SimpleTES task, its problem statement, seed program, evaluator and generation prompt taken from its directory
-    under SimpleTES's datasets; subclasses only pass that directory and the name of its score. Its generator builds
-    SimpleTES's rpucg prompt.
+    under SimpleTES's datasets; subclasses only pass that directory, the name of its score and which direction of it is
+    better. Its generator builds SimpleTES's rpucg prompt.
 
     A response's code is the seed with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's own
     extract_code_detailed, so only the code between the markers counts. Codes are evaluated as SimpleTES's engine
@@ -205,34 +205,36 @@ class SimpletesTask:
         {code}
         ```
 
-        Create an improved program with higher {metric}. Try diverse approaches to solve the problem. Think outside the box.
+        Create an improved program with {better} {metric}. Try diverse approaches to solve the problem. Think outside the box.
     """)
 
     LABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
-        In-context inspirations (sorted by score, higher is better):
+        In-context inspirations (sorted by {metric}, {better} is better):
 
         {item}
 
-        Analyze the inspirations above and create an improved program with higher {metric}. Try diverse approaches to solve the problem. Think outside the box.
+        Analyze the inspirations above and create an improved program with {better} {metric}. Try diverse approaches to solve the problem. Think outside the box.
     """)
 
     LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
         --- Inspiration {index} ---
-        Score: {score}
+        {metric} : {score}
         Code:
         ```{code_fence_tag}
         {code}
         ```
     """)
 
-    def __init__(self, task: str, metric: str, concurrency: int):
+    def __init__(self, task: str, metric: str, better: str, concurrency: int):
         """
         Args:
             task: str, the task's directory under SimpleTES's datasets, e.g. "circle_packing/circle_packing_26"
-            metric: str, the score's name in the prompts' closing instruction, e.g. "sum_radii"
+            metric: str, the score's name in the prompts, e.g. "sum_radii"
+            better: str, "higher" or "lower", the direction of metric that the prompts ask for
             concurrency: int, codes evaluated at once
         """
         self.metric = metric
+        self.better = better
         self.concurrency = concurrency
 
         # Setup paths
@@ -283,9 +285,9 @@ class SimpletesTask:
             suffix=self.evolve_context.suffix.rstrip("\n"),
             available_packages_text="\nAvailable packages from requirements.txt (these are the task-local dependencies you can use):\n" + "".join(f"- {package}\n" for package in packages) if packages else "",
         )
-        self.UNLABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.UNLABELLED_IN_CONTEXT_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag, metric=self.metric)
-        self.LABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_TEMPLATE.format, metric=self.metric)
-        self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag)
+        self.UNLABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.UNLABELLED_IN_CONTEXT_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag, metric=self.metric, better=self.better)
+        self.LABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_TEMPLATE.format, metric=self.metric, better=self.better)
+        self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag, metric=self.metric)
 
     def prompts(self, responses: list[str]) -> list[str]:
         """Each response's code as the one in-context inspiration of its own prompt, PROMPT_TEMPLATE's
@@ -303,10 +305,21 @@ class SimpletesTask:
             prompts.append(self.PROMPT_TEMPLATE(in_context_text=in_context_text))
         return prompts
 
+    def score_to_metric(self, score: float) -> float:
+        """The metric of a score, the score itself; a subclass whose score is not its metric overrides this.
+
+        Args:
+            score: float, finite, from evaluate
+
+        Returns:
+            float, shown in the prompts as the metric's value
+        """
+        return score
+
     def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
         """Every response's code as an in-context inspiration of one prompt, PROMPT_TEMPLATE's in_context_text
-        by LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 by
-        score, highest first.
+        by LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score_to_metric, numbered
+        from 1 by score, highest first.
 
         Args:
             responses: list (G) of str, each holding the EVOLVE-BLOCK markers
@@ -317,7 +330,7 @@ class SimpletesTask:
         """
         inspirations = []
         for i, (score, response) in enumerate(sorted(zip(scores, responses), key=lambda pair: pair[0], reverse=True), 1):
-            inspirations.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE(index=i, score=score, code=self.extract_code(response)))
+            inspirations.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE(index=i, score=self.score_to_metric(score), code=self.extract_code(response)))
         in_context_text = self.LABELLED_IN_CONTEXT_TEMPLATE(item="\n\n".join(inspirations))
         return self.PROMPT_TEMPLATE(in_context_text=in_context_text)
 
@@ -375,13 +388,19 @@ class SimpletesTask:
 class CirclePacking26(SimpletesTask):
 
     def __init__(self, concurrency: int):
-        super().__init__("circle_packing/circle_packing_26", metric="sum_radii", concurrency=concurrency)
+        super().__init__("circle_packing/circle_packing_26", metric="sum_radii", better="higher", concurrency=concurrency)
 
 
 class CirclePacking32(SimpletesTask):
 
     def __init__(self, concurrency: int):
-        super().__init__("circle_packing/circle_packing_32", metric="sum_radii", concurrency=concurrency)
+        super().__init__("circle_packing/circle_packing_32", metric="sum_radii", better="higher", concurrency=concurrency)
+
+
+class AutocorrelationSecond(SimpletesTask):
+
+    def __init__(self, concurrency: int):
+        super().__init__("autocorrelation/autocorrelation_second", metric="c2", better="higher", concurrency=concurrency)
 
 
 class Story:
@@ -736,6 +755,7 @@ TASKS_CLS = {
     "openfoam": OpenFOAM,
     "circle-packing-26": CirclePacking26,
     "circle-packing-32": CirclePacking32,
+    "autocorrelation-second": AutocorrelationSecond,
     "story": Story,
     "docking-drd3": DockingDRD3,
     "docking-egfr": DockingEGFR,
