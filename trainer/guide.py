@@ -1,7 +1,7 @@
 """Mutates config.task.name's seed program toward a higher reward by guided sampling of config.model.name inside SGLang,
 its guides picked by selector.py's Top over config.C chains, no training.
 
-Every one of config.L steps samples each chain once: Top picks up to config.N of the chain's population as its
+Every one of config.L steps samples each chain once: Top picks up to config.G of the chain's population as its
 inspirations, its best of distinct rewards, best first, and config.K new responses are sampled independently under a weighted sum of log-probabilities over them,
 p_i being the model under the task's prompts of inspiration i alone. Every guide thinks at config.model.reasoning_effort
 when config.model.enable_thinking, scoring the response after its own prompt. A response's answer is what follows its
@@ -42,13 +42,13 @@ def logit(r):
 
 
 def normalised(rewards):
-    """The rewards min-max normalised over themselves into [1/(2K), 1 - 1/(2K)], the extremes' rank positions.
+    """The rewards min-max normalised over themselves into [1/(2G), 1 - 1/(2G)], the extremes' rank positions.
 
     Args:
-        rewards: list (K) of float, not all equal
+        rewards: list (G) of float, not all equal
 
     Returns:
-        list (K) of float in (0, 1)
+        list (G) of float in (0, 1)
     """
     low, high = min(rewards), max(rewards)
     return [(0.5 + (len(rewards) - 1) * (r - low) / (high - low)) / len(rewards) for r in rewards]
@@ -59,10 +59,10 @@ def rms_weights(rewards):
     rewards; uniform when the rewards are all equal.
 
     Args:
-        rewards: list (K) of float, finite, each guide's inspiration's reward
+        rewards: list (G) of float, finite, each guide's reward
 
     Returns:
-        list (K) of float, 1/K plus each guide's z-score of logit r̄_i, scaled by √(K² BOUND - 1) / K
+        list (G) of float, 1/G plus each guide's z-score of logit r̄_i, scaled by √(G² BOUND - 1) / G
     """
     if min(rewards) == max(rewards):
         return [1 / len(rewards)] * len(rewards)
@@ -76,17 +76,17 @@ class Trainer(BaseTrainer):
 
     def run(self):
         """Runs config.L steps of Top selection, guided sampling, evaluation and update from the seed program."""
-        task, L, C, K, N = self.task, self.config.L, self.config.C, self.config.K, self.config.N
+        task, L, C, K, G = self.task, self.config.L, self.config.C, self.config.K, self.config.G
         top = Top(task.init_program, task.evaluate([task.init_program])[0], C)
         for l in range(L):
-            all_inspirations = top.select(N)
+            all_guides = top.select(G, N=1)
             all_prompts, all_weights = [], []
-            for inspirations in all_inspirations:
-                all_prompts += [task.prompts([top.responses[s] for s in inspirations])] * K
-                all_weights += [rms_weights([top.rewards[s] for s in inspirations])] * K
+            for guides in all_guides:
+                all_prompts += [task.prompts([top.responses[s] for [s] in guides])] * K
+                all_weights += [rms_weights([top.rewards[s] for [s] in guides])] * K
             responses = self.pipeline.group_generate(all_prompts, all_weights)
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
-            top.update(all_inspirations, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
+            top.update(all_guides, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
 
             objective_evaluations = (l + 1) * C * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)

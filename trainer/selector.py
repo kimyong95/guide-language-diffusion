@@ -1,6 +1,7 @@
 """Inspiration selectors over C chains of responses: SimpleTES's RPUCG policy and Top, each chain's best."""
 
 import collections
+import heapq
 import math
 
 import torch
@@ -108,8 +109,10 @@ class RPUCG:
 
 
 class Top:
-    """C chains, each over its own population of responses rooted at the seed, its inspirations its N best of distinct
-    rewards.
+    """C chains, each over its own population of responses rooted at the seed.
+
+    A chain's guides are its G combinations of N inspirations of distinct rewards of the highest average reward, its G
+    best when N = 1.
 
     Attributes:
         responses: list (S) of str, every chain's population
@@ -127,32 +130,41 @@ class Top:
         self.responses, self.rewards = [response], [reward]
         self.populations = [[0] for _ in range(C)]
 
-    def select(self, N):
-        """Each chain's inspirations.
+    def select(self, G, N):
+        """Each chain's guides, its combinations of the highest average reward.
+
+        A combination holds N of the chain's nodes of distinct rewards, so N = 1 gives its G best. Best-first search from
+        the N best: a successor moves one inspiration to the next reward, never raising the sum.
 
         Args:
-            N: int, inspirations per chain at most
+            G: int, guides per chain at most
+            N: int, inspirations per guide at most
 
         Returns:
-            list (C) of list of int, each chain's best of distinct rewards, best first
+            list (C) of list of list of int, each chain's guides, best first, each guide's inspirations, best first
         """
-        all_inspirations = []
+        all_guides = []
         for population in self.populations:
-            inspirations, rewards = [], set()
-            for s in sorted(population, key=self.rewards.__getitem__, reverse=True):
-                if len(inspirations) == N:
-                    break
-                if self.rewards[s] not in rewards:
-                    inspirations.append(s)
-                    rewards.add(self.rewards[s])
-            all_inspirations.append(inspirations)
-        return all_inspirations
+            nodes = sorted({self.rewards[s]: s for s in reversed(population)}.values(), key=self.rewards.__getitem__, reverse=True)
+            rewards = [self.rewards[s] for s in nodes]
+            first = tuple(range(min(N, len(nodes))))
+            heap, seen, guides = [(-sum(rewards[i] for i in first), first)], {first}, []
+            while heap and len(guides) < G:
+                _, combination = heapq.heappop(heap)
+                guides.append([nodes[i] for i in combination])
+                for j, i in enumerate(combination):
+                    successor = (*combination[:j], i + 1, *combination[j + 1:])
+                    if i + 1 < len(nodes) and i + 1 not in combination and successor not in seen:
+                        seen.add(successor)
+                        heapq.heappush(heap, (-sum(rewards[k] for k in successor), successor))
+            all_guides.append(guides)
+        return all_guides
 
-    def update(self, all_inspirations, all_responses, all_rewards):
+    def update(self, all_guides, all_responses, all_rewards):
         """Adds each chain's responses with a finite reward to its population.
 
         Args:
-            all_inspirations: list (C) of list of int, from select
+            all_guides: list (C), from select
             all_responses: list (C) of list (K) of str
             all_rewards: list (C) of list (K) of float
         """
