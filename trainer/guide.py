@@ -10,9 +10,9 @@ sampled under Σ_i w_i log p_i, the weights maximising Σ_i w_i logit r̄_i with
 BOUND, r̄_i being the inspirations' rewards min-max normalised over themselves; uniform when they are all equal.
 
 The C × K responses are sampled together by the pipeline's group_generate, each as one group of requests, one per guide.
-Each token of a response is sampled from the softmax of its weighted sum at the model's generation config's temperature,
-with no top-k, top-p or repetition penalty, and given to all of the group's requests, so its guides advance and stop
-together; a response fills config.model.max_total_tokens with its group's longest prompt at most.
+Each token of a response is sampled from its weighted sum under the model's generation config, as the pipeline's generate
+samples, and given to all of the group's requests, so its guides advance and stop together; a response fills
+config.model.max_total_tokens with its group's longest prompt at most.
 
 Each response's reward r is the task's evaluate, config.task.concurrency at a time, and every response joins the population
 by Rpucg's update, one with a non-finite reward never an inspiration.

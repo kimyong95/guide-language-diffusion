@@ -2,7 +2,7 @@
 
 generate samples one response per prompt. group_generate samples one response per group of prompts, one request per
 prompt, through extend_sglang: each token is drawn from Σ_k W_k log p_k over the group's requests and given to all of
-them, so they advance and stop together.
+them, so they advance and stop together. Both sample under the model's generation config.
 
 SGLang holds its KV cache only while generating, released through torch_memory_saver between generations, so that the
 task's evaluation has that GPU memory.
@@ -142,9 +142,10 @@ class Pipeline:
 
     @kv_cache
     def group_generate(self, all_prompts, all_weights):
-        """Samples one response per group of prompts, each token from Σ_k W_k log p_k at the generation config's
-        temperature, p_k the model under the group's prompt k, with no top-k, top-p or repetition penalty, each response
-        filling max_total_tokens with the group's longest prompt at most.
+        """Samples one response per group of prompts, each token from Σ_k W_k log p_k under the model's generation config,
+        p_k the model under the group's prompt k after its repetition penalty and the temperature, top-k, top-p and min-p
+        applying to the weighted sum as they do in generate, each response filling max_total_tokens with the group's
+        longest prompt at most.
 
         Args:
             all_prompts: list (B) of list (G_b) of str, each group's prompts
@@ -161,7 +162,7 @@ class Pipeline:
             custom_params = {"group": uuid.uuid4().hex, "size": len(prompts)}
             max_new_tokens = self.max_total_tokens - max(map(len, prompt_tokens))
             sampling_params += [
-                {**self.sampling_params, "repetition_penalty": 1.0, "max_new_tokens": max_new_tokens, "custom_params": {**custom_params, "weight": weight}}
+                {**self.sampling_params, "max_new_tokens": max_new_tokens, "custom_params": {**custom_params, "weight": weight}}
                 for weight in weights
             ]
         outputs = self.engine.generate(input_ids=input_ids, sampling_params=sampling_params, custom_logit_processor=GroupLogitProcessor.to_str())

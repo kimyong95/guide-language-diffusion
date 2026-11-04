@@ -1,5 +1,5 @@
 """SGLang 0.5.23 extended with group generation: requests sharing custom_params["group"] sample the same tokens, each
-from Σ_k W_k log p_k over the group, and are scheduled together.
+from Σ_k W_k log p_k over the group under their sampling parameters, and are scheduled together.
 
 GroupLogitProcessor samples each group's token and gives it to all of its requests. GroupEngine's scheduler keeps a
 group's requests in the same batches: GroupPrefillAdder admits them all or none, unchunked, and group_retract_decode
@@ -7,13 +7,16 @@ retracts them together.
 """
 
 import functools
+import types
 
 import torch
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler, run_scheduler_process
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
 
 def group(req):
@@ -21,9 +24,41 @@ def group(req):
     return (req.sampling_params.custom_params or {}).get("group")
 
 
+def sample_tokens(probs, all_sampling_params):
+    """One token per row, by SGLang's own Sampler._sample_from_probs.
+
+    Args:
+        probs: (G, V), each row's softmax at its temperature
+        all_sampling_params: list (G) of SamplingParams, each row's
+
+    Returns:
+        (G) int
+    """
+    top_ks = [sampling_params.top_k for sampling_params in all_sampling_params]
+    top_ps = [sampling_params.top_p for sampling_params in all_sampling_params]
+    min_ps = [sampling_params.min_p for sampling_params in all_sampling_params]
+    need_top_k_sampling = any(top_k != TOP_K_ALL for top_k in top_ks)
+    need_top_p_sampling = any(top_p != 1.0 for top_p in top_ps)
+    need_min_p_sampling = any(min_p > 0 for min_p in min_ps)
+    sampling_info = types.SimpleNamespace(
+        sampling_mask_batch_indices=None,
+        sampling_seed=None,
+        top_ks=torch.tensor(top_ks, dtype=torch.int32, device=probs.device),
+        top_ps=torch.tensor(top_ps, dtype=torch.float, device=probs.device),
+        min_ps=torch.tensor(min_ps, dtype=torch.float, device=probs.device),
+        need_top_k_sampling=need_top_k_sampling,
+        need_top_p_sampling=need_top_p_sampling,
+        need_min_p_sampling=need_min_p_sampling,
+        max_top_k=max(top_ks),
+    )
+    simple_sampling_case = not (need_top_k_sampling or need_top_p_sampling or need_min_p_sampling)
+    # _sample_from_probs uses no attribute of self.
+    return Sampler._sample_from_probs(None, probs, sampling_info, None, simple_sampling_case)[0]
+
+
 class GroupLogitProcessor(CustomLogitProcessor):
-    """Samples each group's next token from Σ_k W_k log p_k at the group's temperature and leaves it the only finite
-    logit in each of the group's rows.
+    """Samples each group's next token from Σ_k W_k log p_k under the group's sampling parameters, as SGLang's Sampler
+    samples a request's, and leaves it the only finite logit in each of the group's rows.
 
     A row's custom_params hold its group, the group's size and its weight W_k. Each row's logits are its log
     probabilities up to a constant over the vocabulary, so their weighted sum is Σ_k W_k log p_k up to a constant too.
@@ -50,11 +85,12 @@ class GroupLogitProcessor(CustomLogitProcessor):
         group_numbers = {group: g for g, group in enumerate(groups)}
         rows_group = torch.tensor([group_numbers[params["group"]] for params in custom_param_list], device=logits.device)
         weights = torch.tensor([params["weight"] for params in custom_param_list], device=logits.device)
-        temperatures = torch.tensor([members[0]["__req__"].sampling_params.temperature for members in groups.values()], device=logits.device)
+        all_sampling_params = [members[0]["__req__"].sampling_params for members in groups.values()]
+        temperatures = torch.tensor([sampling_params.temperature for sampling_params in all_sampling_params], device=logits.device)
         # Every TP rank samples on its own, so this must be deterministic.
         logits_guided = torch.nn.functional.one_hot(rows_group).T * weights @ logits.float() / temperatures[:, None]
-        tokens = torch.multinomial(logits_guided.softmax(-1), 1)[:, 0]
-        return logits.fill_(float("-inf")).scatter_(1, tokens[rows_group, None], 0)
+        tokens = sample_tokens(logits_guided.softmax(-1), all_sampling_params)
+        return logits.fill_(float("-inf")).scatter_(1, tokens[rows_group, None].long(), 0)
 
 
 class GroupPrefillAdder(PrefillAdder):
