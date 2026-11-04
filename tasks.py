@@ -545,7 +545,7 @@ class Docking:
     PDB_ID = None
     PROTEIN = None
     RECEPTOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "docking")
-    N_CPUS = 1
+    N_CPUS = 4
     EXHAUSTIVENESS = 8
     N_POSES = 10
     SEED = 1
