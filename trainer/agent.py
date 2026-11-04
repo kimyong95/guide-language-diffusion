@@ -1,5 +1,5 @@
 """Mutates config.task.name's seed program toward a higher reward by in-context sampling of config.model.name inside
-SGLang, its in-context examples picked over config.C chains by selector.py's RPUCG, no guidance and no training.
+SGLang, its in-context examples picked over config.C chains by selector.py's Rpucg, no guidance and no training.
 
 The population holds every response, starting as the task's seed program alone, taken as a response, the root of every
 chain. Every one of config.L steps samples each chain once: the selector picks up to
@@ -23,7 +23,7 @@ from absl import flags
 from ml_collections import config_flags
 
 from base import BaseTrainer
-from selector import RPUCG
+from selector import Rpucg
 
 FLAGS = flags.FLAGS
 
@@ -33,7 +33,7 @@ class Trainer(BaseTrainer):
     def run(self):
         """Runs config.L steps of selection, in-context sampling, evaluation and update from the seed program."""
         task, L, C, K, N = self.task, self.config.L, self.config.C, self.config.K, self.config.N
-        selector = RPUCG(task.init_program, task.evaluate([task.init_program])[0], C)
+        selector = Rpucg(task.init_program, task.evaluate([task.init_program])[0], C)
         for l in range(L):
             all_inspirations = selector.select(N)
             prompts = [task.prompts_with_scores([selector.responses[s] for s in inspirations], [selector.rewards[s] for s in inspirations]) for inspirations in all_inspirations]
