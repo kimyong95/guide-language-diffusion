@@ -532,8 +532,8 @@ class Docking:
     RDKit and Vina use the same fixed positive SEED. Reproducibility also requires fixed dependency versions.
 
     A persistent pool prepares and docks up to concurrency molecules at once, each on N_CPUS CPUs. Each worker
-    builds its affinity maps once. Errors propagate; a failed batch leaves the score cache unchanged. Call close()
-    when discarding the task to release its workers.
+    builds its affinity maps once. Invalid responses and molecules receive -inf. System errors propagate without
+    updating the batch's score cache. Call close() when discarding the task to release its workers.
     """
 
     import tdc.metadata
@@ -635,32 +635,48 @@ class Docking:
             in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, molecule=self.extract_molecule(response)))
         return self.LABELLED_PROMPT_TEMPLATE.format(protein=self.PROTEIN, item="\n\n".join(in_contexts))
 
-    def extract_molecule(self, response: str) -> str:
-        """Returns canonical SMILES from the last code block, raising for missing or invalid molecules."""
-        smiles = self.MOLECULE_BLOCK.findall(response)[-1].strip()
-        molecule = self.Chem.MolFromSmiles(smiles)
-        if molecule is None or molecule.GetNumAtoms() == 0:
-            raise ValueError(f"Invalid SMILES: {smiles}")
-        return self.Chem.MolToSmiles(molecule)
+    def extract_molecule(self, response: str) -> str | None:
+        """Returns canonical SMILES from the last code block, or None for missing or invalid molecules."""
+        blocks = self.MOLECULE_BLOCK.findall(response)
+        if not blocks:
+            return None
+        try:
+            molecule = self.Chem.MolFromSmiles(blocks[-1].strip())
+            if molecule is None or molecule.GetNumAtoms() == 0:
+                return None
+            return self.Chem.MolToSmiles(molecule)
+        except ValueError:
+            return None
 
     @classmethod
     def dock_one(cls, molecule: str, exhaustiveness: int, n_poses: int) -> float:
-        """Prepares a canonical SMILES and returns its negated best-pose affinity in an initialized worker."""
-        conformer = cls.Chem.AddHs(cls.Chem.MolFromSmiles(molecule))
-        if cls.AllChem.EmbedMolecule(conformer, randomSeed=cls.seed) != 0:
-            raise ValueError(f"No 3D conformer for {molecule}")
-        status = cls.AllChem.MMFFOptimizeMolecule(conformer, maxIters=1000)
-        if status != 0:
-            raise ValueError(f"MMFF optimization failed for {molecule}: status {status}")
-        pdbqt, success, error = cls.PDBQTWriterLegacy.write_string(cls.MoleculePreparation().prepare(conformer)[0])
-        if not success:
-            raise ValueError(error)
-        cls.vina.set_ligand_from_string(pdbqt)
+        """Returns negated best-pose affinity, or -inf when a molecule cannot be prepared or docked."""
+        try:
+            mol = cls.Chem.MolFromSmiles(molecule)
+            if mol is None or mol.GetNumAtoms() == 0 or len(cls.Chem.GetMolFrags(mol)) != 1:
+                return -math.inf
+            conformer = cls.Chem.AddHs(mol)
+            if cls.AllChem.EmbedMolecule(conformer, randomSeed=cls.seed) != 0:
+                return -math.inf
+            if cls.AllChem.MMFFOptimizeMolecule(conformer, maxIters=1000) != 0:
+                return -math.inf
+            pdbqt, success, error = cls.PDBQTWriterLegacy.write_string(cls.MoleculePreparation().prepare(conformer)[0])
+            if not success:
+                return -math.inf
+        except ValueError:
+            return -math.inf
+        try:
+            cls.vina.set_ligand_from_string(pdbqt)
+        except TypeError as error:
+            if "PDBQT parsing error" not in str(error):
+                raise
+            return -math.inf
         cls.vina.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
-        score = -float(cls.vina.energies(n_poses=1)[0][0])
-        if not math.isfinite(score):
-            raise ValueError(f"Non-finite docking score for {molecule}: {score}")
-        return score
+        energies = cls.vina.energies(n_poses=1)
+        if len(energies) == 0:
+            return -math.inf
+        score = -float(energies[0][0])
+        return score if math.isfinite(score) else -math.inf
 
     def evaluate(self, responses: list[str]) -> list[float]:
         """Scores uncached molecules in parallel and returns rewards in response order.
@@ -669,15 +685,16 @@ class Docking:
             responses: Responses containing SMILES code blocks.
 
         Returns:
-            Negated best-pose affinities in kcal/mol. Errors propagate without caching the failed batch.
+            Negated best-pose affinities in kcal/mol, or -inf for rejected responses and molecules.
+            System errors propagate without caching the failed batch.
         """
         molecules = [self.extract_molecule(response) for response in responses]
-        pending = list(dict.fromkeys(molecule for molecule in molecules if molecule not in self.scores))
+        pending = list(dict.fromkeys(molecule for molecule in molecules if molecule and molecule not in self.scores))
         if pending:
             dock = functools.partial(self.dock_one, exhaustiveness=self.EXHAUSTIVENESS, n_poses=self.N_POSES)
             scores = list(self.executor.map(dock, pending))
             self.scores.update(zip(pending, scores))
-        return [self.scores[molecule] for molecule in molecules]
+        return [self.scores[molecule] if molecule else -math.inf for molecule in molecules]
 
 
 class DockingDRD3(Docking):
