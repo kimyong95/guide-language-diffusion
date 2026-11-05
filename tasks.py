@@ -539,8 +539,11 @@ class Docking:
     import tdc.metadata
     import tdc.utils
     from meeko import MoleculePreparation, PDBQTWriterLegacy
-    from rdkit import Chem
+    from rdkit import Chem, RDLogger
     from rdkit.Chem import AllChem
+
+    # A rejected molecule is logged by evaluate's caller, and RDKit's own parse errors raise from its Python logger.
+    RDLogger.DisableLog("rdApp.error")
 
     PDB_ID = None
     PROTEIN = None
@@ -636,12 +639,19 @@ class Docking:
         return self.LABELLED_PROMPT_TEMPLATE.format(protein=self.PROTEIN, item="\n\n".join(in_contexts))
 
     def extract_molecule(self, response: str) -> str | None:
-        """Returns canonical SMILES from the last code block, or None for missing or invalid molecules."""
+        """Returns canonical SMILES from the last code block, or None for missing or invalid molecules.
+
+        A SMILES is ASCII, and RDKit's parser logs a byte-sliced window of its input that splits any multi-byte
+        character, raising SystemError out of the logger, so a non-ASCII block is rejected before parsing.
+        """
         blocks = self.MOLECULE_BLOCK.findall(response)
         if not blocks:
             return None
+        smiles = blocks[-1].strip()
+        if not smiles.isascii():
+            return None
         try:
-            molecule = self.Chem.MolFromSmiles(blocks[-1].strip())
+            molecule = self.Chem.MolFromSmiles(smiles)
             if molecule is None or molecule.GetNumAtoms() == 0:
                 return None
             return self.Chem.MolToSmiles(molecule)
