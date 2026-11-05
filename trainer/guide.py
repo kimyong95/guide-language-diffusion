@@ -6,8 +6,8 @@ inspirations, best first, and config.K new responses are sampled independently u
 p_i being the model under the task's prompts of inspiration i alone. Every guide thinks at config.model.reasoning_effort
 when config.model.enable_thinking, scoring the response after its own prompt. A response's answer is what follows its
 </think> when thinking, empty when its thinking never ends, and the whole response otherwise. Every response is
-sampled under Σ_i w_i log p_i, the weights maximising Σ_i w_i logit r̄_i with Σ_i w_i = 1 and the mean w_i² at most
-BOUND, r̄_i being the inspirations' rewards min-max normalised over themselves; uniform when they are all equal.
+sampled under Σ_i w_i log p_i, the weights maximising Σ_i w_i r_i with Σ_i w_i = 1 and the mean w_i² at most 1, r_i
+being the inspirations' rewards; uniform when they are all equal.
 
 The C × K responses are sampled together by the pipeline's group_generate, each as one group of requests, one per guide.
 Each token of a response is sampled from its weighted sum under the model's generation config, as the pipeline's generate
@@ -34,42 +34,23 @@ from selector import Rpucg
 
 FLAGS = flags.FLAGS
 
-BOUND = 1.0
 
-
-def logit(r):
-    return math.log(r / (1 - r))
-
-
-def normalised(rewards):
-    """The rewards min-max normalised over themselves into [1/(2G), 1 - 1/(2G)], the extremes' rank positions.
-
-    Args:
-        rewards: list (G) of float, not all equal
-
-    Returns:
-        list (G) of float in (0, 1)
-    """
-    low, high = min(rewards), max(rewards)
-    return [(0.5 + (len(rewards) - 1) * (r - low) / (high - low)) / len(rewards) for r in rewards]
-
-
-def rms_weights(rewards):
-    """The weights maximising Σ_i w_i logit r̄_i with Σ_i w_i = 1 and the mean w_i² at most BOUND, r̄_i the normalised
-    rewards; uniform when the rewards are all equal.
+def weights(rewards):
+    """The weights maximising Σ_i w_i r_i with Σ_i w_i = 1 and the mean w_i² at most 1; uniform when the rewards are all
+    equal.
 
     Args:
         rewards: list (G) of float, finite, each guide's reward
 
     Returns:
-        list (G) of float, 1/G plus each guide's z-score of logit r̄_i, scaled by √(G² BOUND - 1) / G
+        list (G) of float, 1/G + √(G - 1/G) (r_i - r̄) / √(Σ_j (r_j - r̄)²), r̄ being the rewards' mean
     """
+    G = len(rewards)
     if min(rewards) == max(rewards):
-        return [1 / len(rewards)] * len(rewards)
-    ell = [logit(r) for r in normalised(rewards)]
-    mean = sum(ell) / len(ell)
-    sd = math.sqrt(sum((l - mean) ** 2 for l in ell) / len(ell))
-    return [1 / len(ell) + math.sqrt(len(ell) ** 2 * BOUND - 1) / len(ell) * (l - mean) / sd for l in ell]
+        return [1 / G] * G
+    mean = sum(rewards) / G
+    norm = math.sqrt(sum((r - mean) ** 2 for r in rewards))
+    return [1 / G + math.sqrt(G - 1 / G) * (r - mean) / norm for r in rewards]
 
 
 class Trainer(BaseTrainer):
@@ -83,7 +64,7 @@ class Trainer(BaseTrainer):
             all_prompts, all_weights = [], []
             for inspirations in all_inspirations:
                 all_prompts += [task.prompts([selector.responses[s] for s in inspirations])] * K
-                all_weights += [rms_weights([selector.rewards[s] for s in inspirations])] * K
+                all_weights += [weights([selector.rewards[s] for s in inspirations])] * K
             responses = self.pipeline.group_generate(all_prompts, all_weights)
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
             selector.update(all_inspirations, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
