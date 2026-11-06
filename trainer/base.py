@@ -1,6 +1,9 @@
 import math
 import os
+import random
 import sys
+import numpy as np
+import torch
 import wandb
 from pipeline import Pipeline
 import tasks
@@ -14,12 +17,19 @@ class BaseTrainer:
         self.setup_wandb()
         self.setup_task()
         self.setup_pipeline()
+        self.set_seed() # after setup_pipeline to prevent random port crash across same-seed runs
         self.log_code()
         self.text_table = wandb.Table(
             columns=["objective-evaluations", "idx", "reward", "text"],
             log_mode="INCREMENTAL",
         )
         self.best_reward = -math.inf
+
+    def set_seed(self):
+        """Seeds Python's random, NumPy and torch with config.seed."""
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        torch.manual_seed(self.config.seed)
 
     def setup_wandb(self):
         wandb.init(project="guide-language-diffusion", name=self.config.run_name, config=self.config.to_dict())

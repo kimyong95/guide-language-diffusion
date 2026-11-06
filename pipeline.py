@@ -8,7 +8,7 @@ SGLang holds its KV cache only while generating, released through torch_memory_s
 task's evaluation has that GPU memory.
 """
 
-import functools
+import contextlib
 import os
 import uuid
 
@@ -46,23 +46,16 @@ def model_path(model_name):
     return MODELS[model_name]["nvfp4" if sm >= 100 else "fp8" if sm >= 89 else "int4"]
 
 
-def kv_cache(generate):
-    """Decorates a Pipeline method to hold SGLang's KV cache over the call, releasing it after.
+@contextlib.contextmanager
+def kv_cache(engine):
+    """Holds SGLang's KV cache over the block, releasing it after.
 
     Args:
-        generate: a method of Pipeline
-
-    Returns:
-        the method, holding the KV cache
+        engine: sglang.Engine
     """
-    @functools.wraps(generate)
-    def generate_with_kv_cache(self, *args, **kwargs):
-        self.engine.resume_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
-        outputs = generate(self, *args, **kwargs)
-        self.engine.release_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
-        return outputs
-
-    return generate_with_kv_cache
+    engine.resume_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
+    yield
+    engine.release_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
 
 
 class Pipeline:
@@ -122,7 +115,6 @@ class Pipeline:
         _, think_end, answer = response.partition("</think>")
         return answer if think_end else ""
 
-    @kv_cache
     def generate(self, prompts):
         """Samples one response per prompt under the model's generation config, each filling max_total_tokens with its
         prompt at most.
@@ -134,18 +126,21 @@ class Pipeline:
             list (N) of str, each response after strip_thinking
         """
         prompt_tokens = self.apply_chat_template(prompts)
-        outputs = self.engine.generate(
-            input_ids=prompt_tokens,
-            sampling_params=[{**self.sampling_params, "max_new_tokens": self.max_total_tokens - len(tokens)} for tokens in prompt_tokens],
-        )
+        with kv_cache(self.engine):
+            outputs = self.engine.generate(
+                input_ids=prompt_tokens,
+                sampling_params=[{**self.sampling_params, "max_new_tokens": self.max_total_tokens - len(tokens)} for tokens in prompt_tokens],
+            )
         return [self.strip_thinking(output["text"]) for output in outputs]
 
-    @kv_cache
     def group_generate(self, all_prompts, all_weights):
         """Samples one response per group of prompts, each token from Σ_k W_k log p_k under the model's generation config,
         p_k the model under the group's prompt k after its repetition penalty and the temperature, top-k, top-p and min-p
         applying to the weighted sum as they do in generate, each response filling max_total_tokens with the group's
         longest prompt at most.
+
+        Samples by generate when every group holds one distinct prompt: the weights sum to 1, so Σ_k W_k log p_k is that
+        prompt's own log probabilities.
 
         Args:
             all_prompts: list (B) of list (G_b) of str, each group's prompts
@@ -165,5 +160,6 @@ class Pipeline:
                 {**self.sampling_params, "max_new_tokens": max_new_tokens, "custom_params": {**custom_params, "weight": weight}}
                 for weight in weights
             ]
-        outputs = self.engine.generate(input_ids=input_ids, sampling_params=sampling_params, custom_logit_processor=GroupLogitProcessor.to_str())
+        with kv_cache(self.engine):
+            outputs = self.engine.generate(input_ids=input_ids, sampling_params=sampling_params, custom_logit_processor=GroupLogitProcessor.to_str())
         return [self.strip_thinking(outputs[group_start]["text"]) for group_start in group_starts]

@@ -26,7 +26,6 @@ Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/simpletes-baseline.p
 import asyncio
 import itertools
 import math
-import random
 import sys
 import uuid
 
@@ -50,7 +49,6 @@ class Trainer(BaseTrainer):
 
     def __init__(self, config):
         super().__init__(config)
-        random.seed(config.seed)
         self.db = NodeDatabase()
         self.selector = RpucgPolicy(
             num_chains=config.C,

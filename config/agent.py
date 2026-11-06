@@ -11,7 +11,7 @@ def get_config():
 
     config.L = 100
     config.C = 1
-    config.K = 16
+    config.K = 32
     config.N = 3
 
     config.model = ml_collections.ConfigDict()

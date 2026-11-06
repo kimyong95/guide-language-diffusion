@@ -519,6 +519,7 @@ class Story:
         for b in range(0, len(stories_valid), self.concurrency):
             embeddings = self.embeddings(stories_valid[b:b + self.concurrency])
             similarities += (embeddings @ self.embedding_target).tolist()
+        torch.cuda.empty_cache()
         similarities = iter(similarities)
         return [next(similarities) if story else -math.inf for story in stories]
 
