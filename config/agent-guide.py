@@ -14,7 +14,7 @@ def get_config():
     config.K = 32
     config.M = 10
     config.N = 3
-    config.reward_agg_fn = "mean"
+    config.reward_agg_fn = "max"
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"

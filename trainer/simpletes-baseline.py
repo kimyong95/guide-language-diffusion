@@ -40,7 +40,7 @@ from simpletes.policies.rpucg import RpucgPolicy
 from simpletes.utils.code_extract import extract_code_detailed
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, extract_approach_insight, metrics_to_text, truncate_error_in_metrics
 
-from base import BaseTrainer
+from trainer.base import BaseTrainer
 
 FLAGS = flags.FLAGS
 

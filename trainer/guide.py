@@ -29,8 +29,8 @@ import wandb
 from absl import flags
 from ml_collections import config_flags
 
-from base import BaseTrainer
-from selector import Rpucg
+from trainer.base import BaseTrainer
+from trainer.selector import Rpucg
 
 FLAGS = flags.FLAGS
 

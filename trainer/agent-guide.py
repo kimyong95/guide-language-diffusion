@@ -3,8 +3,9 @@ guide.py's guided sampling over config.C chains, no training.
 
 Every one of config.L steps samples config.K responses per chain. An agent step samples as agent.py does, and its prompt
 and finite rewards join the chain's PromptsRewards. Step l is a guide step of every chain when l is odd and every
-chain's PromptsRewards.get(config.M) holds at least 2 prompts, sampling under Σ_i w_i log p_i, p_i being the model under
-its prompt i and w_i guide.py's weights of its aggregated rewards; any other step is an agent step of every chain.
+chain's PromptsRewards.get(config.M) holds at least config.M prompts, sampling under Σ_i w_i log p_i, p_i being the
+model under its prompt i, and w_i guide.py's weights of its aggregated rewards; any other step is an agent step of every
+chain.
 
 A guide step's responses join the population by the selector's update with no parents, raising no n, and their rewards
 join no PromptsRewards. Evaluation and logging are as in agent.py.
@@ -21,9 +22,9 @@ import wandb
 from absl import flags
 from ml_collections import config_flags
 
-from base import BaseTrainer
-from guide import weights
-from selector import Rpucg
+from trainer.base import BaseTrainer
+from trainer.guide import weights
+from trainer.selector import Rpucg
 
 FLAGS = flags.FLAGS
 
@@ -77,7 +78,7 @@ class Trainer(BaseTrainer):
         all_prompts_rewards = [PromptsRewards(self.config.reward_agg_fn) for _ in range(C)]
         for l in range(L):
             all_prompts, all_rewards_aggregated = zip(*[prompts_rewards.get(M) for prompts_rewards in all_prompts_rewards])
-            guiding = l % 2 == 1 and all(len(prompts) >= 5 for prompts in all_prompts)
+            guiding = l % 2 == 1 and all(len(prompts) >= M for prompts in all_prompts)
             if guiding:
                 all_inspirations = [[] for _ in range(C)]
                 responses = self.pipeline.group_generate(
