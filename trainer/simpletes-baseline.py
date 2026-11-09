@@ -17,8 +17,8 @@ kept only when it starts with "Approach". The policy then appends that node to t
 
 A response without an EVOLVE-BLOCK is a failed generation, never evaluated, and a code with a non-finite combined_score
 is dropped; a code with an evaluator error but a finite combined_score joins the database at score -inf, its error
-counting toward the chain's failure patterns. Each step logs every reward and code to wandb, a failed generation's as
--inf and "".
+counting toward the chain's failure patterns. Each step logs every response with its reward to wandb, a failed
+generation's reward as -inf.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/simpletes-baseline.py --config config/simpletes-baseline.py
 """
@@ -76,12 +76,12 @@ class Trainer(BaseTrainer):
                 metrics = {"error": str(exception), "combined_score": -math.inf}
         return truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
 
-    def generate(self, all_inspirations, all_failure_patterns):
+    def generate(self, all_in_contexts, all_failure_patterns):
         """Samples config.K responses per chain by in-context learning: the generator's prompt holds all of the
-        chain's inspirations with their metrics and reflections and the chain's failure patterns.
+        chain's in-context examples with their metrics and reflections and the chain's failure patterns.
 
         Args:
-            all_inspirations: list (C) of list of Node, each chain's inspirations from the selector
+            all_in_contexts: list (C) of list of Node, each chain's in-context examples from the selector
             all_failure_patterns: list (C) of dict of str to float, each chain's failure patterns from the selector
 
         Returns:
@@ -90,7 +90,7 @@ class Trainer(BaseTrainer):
                 thinking, empty when its thinking never ends; the whole response otherwise
         """
         K = self.config.K
-        prompts = [self.generator.build_prompt(inspirations, failure_patterns) for inspirations, failure_patterns in zip(all_inspirations, all_failure_patterns)]
+        prompts = [self.generator.build_prompt(in_contexts, failure_patterns) for in_contexts, failure_patterns in zip(all_in_contexts, all_failure_patterns)]
         responses = self.pipeline.generate([prompt for prompt in prompts for _ in range(K)])
         return prompts, responses
 
@@ -109,21 +109,23 @@ class Trainer(BaseTrainer):
         for l in range(L):
             selections = []
             for _ in range(C):
-                inspirations, failure_patterns, chain_idx = self.selector.select(self.db, N, stats=None, eval_concurrency=0, backpressure_multiplier=0)
+                in_contexts, failure_patterns, chain_idx = self.selector.select(self.db, N, stats=None, eval_concurrency=0, backpressure_multiplier=0)
                 gen_id = self.generator.next_gen_id()
-                self.selector.register_batch(gen_id, chain_idx, [node.id for node in inspirations], K)
-                selections.append((inspirations, failure_patterns, chain_idx, gen_id))
-            all_inspirations, all_failure_patterns, chain_idxs, gen_ids = zip(*selections)
-            prompts, responses = self.generate(all_inspirations, all_failure_patterns)
+                self.selector.register_batch(gen_id, chain_idx, [node.id for node in in_contexts], K)
+                selections.append((in_contexts, failure_patterns, chain_idx, gen_id))
+            all_in_contexts, all_failure_patterns, chain_idxs, gen_ids = zip(*selections)
+            prompts, responses = self.generate(all_in_contexts, all_failure_patterns)
 
-            nodes, pendings = [], []
+            nodes, pendings = [], []  # nodes: each response's node, None without an EVOLVE-BLOCK
             for (c, _), response in zip(itertools.product(range(C), range(K)), responses):
                 code, _ = extract_code_detailed(response, self.evolve_context)
                 if code is None:
                     pendings.append(self.selector.on_generation_failed(gen_ids[c]))
+                    nodes.append(None)
                 else:
-                    nodes.append(Node(id=uuid.uuid4().hex, code=code, parent_ids=[node.id for node in all_inspirations[c]], gen_id=gen_ids[c], chain_idx=chain_idxs[c], status=Status.EVAL_PENDING, llm_input=prompts[c]))
-            for node, metrics in zip(nodes, self.task.evaluate([node.code for node in nodes])):
+                    nodes.append(Node(id=uuid.uuid4().hex, code=code, parent_ids=[node.id for node in all_in_contexts[c]], gen_id=gen_ids[c], chain_idx=chain_idxs[c], status=Status.EVAL_PENDING, llm_input=prompts[c]))
+            nodes_evaluated = [node for node in nodes if node is not None]
+            for node, metrics in zip(nodes_evaluated, self.task.evaluate([node.code for node in nodes_evaluated])):
                 node.metrics, node.score, node.status = metrics, score_from_metrics(metrics), Status.DONE
                 try:
                     self.db.add(node)
@@ -139,11 +141,10 @@ class Trainer(BaseTrainer):
             for pending in pendings:
                 asyncio.run(self.selector.finalize_batch(pending, self.db))
 
-            num_failed = len(responses) - len(nodes)
-            rewards = torch.tensor([node.score for node in nodes] + [-math.inf] * num_failed, dtype=torch.float64)
+            rewards = torch.tensor([-math.inf if node is None else node.score for node in nodes], dtype=torch.float64)
             objective_evaluations = (l + 1) * C * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
-            self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=[node.code for node in nodes] + [""] * num_failed)
+            self.log_responses(objective_evaluations=objective_evaluations, rewards=rewards, responses=responses)
 
         wandb.finish()
 

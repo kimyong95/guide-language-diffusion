@@ -12,7 +12,7 @@ def get_config():
     config.L = 100
     config.C = 1
     config.K = 32
-    config.M = 10
+    config.M = 5
     config.N = 3
     config.reward_agg_fn = "max"
 

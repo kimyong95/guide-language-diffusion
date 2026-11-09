@@ -3,9 +3,8 @@ guide.py's guided sampling over config.C chains, no training.
 
 Every one of config.L steps samples config.K responses per chain. An agent step samples as agent.py does, and its prompt
 and finite rewards join the chain's PromptsRewards. Step l is a guide step of every chain when l is odd and every
-chain's PromptsRewards.get(config.M) holds at least config.M prompts, sampling under Σ_i w_i log p_i, p_i being the
-model under its prompt i, and w_i guide.py's weights of its aggregated rewards; any other step is an agent step of every
-chain.
+chain's PromptsRewards.get(config.M) holds at least config.M prompts, sampling as guide.py does over those prompts and
+their utilities, p_i being the model under prompt i. Any other step is an agent step of every chain.
 
 A guide step's responses join the population by the selector's update with no parents, raising no n, and their rewards
 join no PromptsRewards. Evaluation and logging are as in agent.py.
@@ -23,7 +22,6 @@ from absl import flags
 from ml_collections import config_flags
 
 from trainer.base import BaseTrainer
-from trainer.guide import weights
 from trainer.selector import Rpucg
 
 FLAGS = flags.FLAGS
@@ -39,7 +37,7 @@ class PromptsRewards:
     def __init__(self, reward_agg_fn):
         """
         Args:
-            reward_agg_fn: str, "mean" or "max", a prompt's aggregated reward over its rewards
+            reward_agg_fn: str, "mean" or "max", a prompt's utility over its rewards
         """
         self.reward_agg_fn = reward_agg_fn
         self.data = []
@@ -54,19 +52,19 @@ class PromptsRewards:
         self.data += [(prompt, reward) for reward in rewards if math.isfinite(reward)]
 
     def get(self, M):
-        """The latest M prompts of distinct aggregated rewards, each tie first reduced to a uniformly picked prompt.
+        """The latest M prompts of distinct utilities, each tie first reduced to a uniformly picked prompt.
 
         Args:
             M: int, prompts at most
 
         Returns:
-            list (at most M) of str, the prompts, latest last; list (at most M) of float, their aggregated rewards
+            list (at most M) of str, the prompts, latest last; list (at most M) of float, their utilities
         """
         data = pd.DataFrame(self.data, columns=["prompt", "reward"]).reset_index()
-        data = data.groupby("prompt").agg(latest=("index", "max"), reward=("reward", self.reward_agg_fn))
+        data = data.groupby("prompt").agg(latest=("index", "max"), utility=("reward", self.reward_agg_fn))
         # Shuffled, so that drop_duplicates keeps a uniform pick of each tie.
-        data = data.sample(frac=1).drop_duplicates("reward").sort_values("latest").tail(M)
-        return data.index.tolist(), data["reward"].tolist()
+        data = data.sample(frac=1).drop_duplicates("utility").sort_values("latest").tail(M)
+        return data.index.tolist(), data["utility"].tolist()
 
 
 class Trainer(BaseTrainer):
@@ -77,21 +75,18 @@ class Trainer(BaseTrainer):
         selector = Rpucg(task.init_program, task.evaluate([task.init_program])[0], C)
         all_prompts_rewards = [PromptsRewards(self.config.reward_agg_fn) for _ in range(C)]
         for l in range(L):
-            all_prompts, all_rewards_aggregated = zip(*[prompts_rewards.get(M) for prompts_rewards in all_prompts_rewards])
+            all_prompts, all_utilities = zip(*[prompts_rewards.get(M) for prompts_rewards in all_prompts_rewards])
             guiding = l % 2 == 1 and all(len(prompts) >= M for prompts in all_prompts)
             if guiding:
-                all_inspirations = [[] for _ in range(C)]
-                responses = self.pipeline.group_generate(
-                    [prompts for prompts in all_prompts for _ in range(K)],
-                    [weights(rewards_aggregated) for rewards_aggregated in all_rewards_aggregated for _ in range(K)],
-                )
+                all_in_contexts = [[] for _ in range(C)]
+                responses = self.pipeline.group_generate([prompts for prompts in all_prompts for _ in range(K)], [utilities for utilities in all_utilities for _ in range(K)])
             else:
-                all_inspirations = selector.select(N)
-                prompts = [task.prompts_with_scores([selector.responses[s] for s in inspirations], [selector.rewards[s] for s in inspirations]) for inspirations in all_inspirations]
+                all_in_contexts = selector.select(N)
+                prompts = [task.prompts_with_scores([selector.responses[s] for s in in_contexts], [selector.rewards[s] for s in in_contexts]) for in_contexts in all_in_contexts]
                 responses = self.pipeline.generate([prompt for prompt in prompts for _ in range(K)])
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
             all_rewards = rewards.view(C, K).tolist()
-            selector.update(all_inspirations, [responses[c * K:(c + 1) * K] for c in range(C)], all_rewards)
+            selector.update(all_in_contexts, [responses[c * K:(c + 1) * K] for c in range(C)], all_rewards)
 
             if not guiding:
                 for c, prompts_rewards in enumerate(all_prompts_rewards):
@@ -99,7 +94,7 @@ class Trainer(BaseTrainer):
 
             objective_evaluations = (l + 1) * C * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
-            self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=responses)
+            self.log_responses(objective_evaluations=objective_evaluations, rewards=rewards, responses=responses)
 
         wandb.finish()
 

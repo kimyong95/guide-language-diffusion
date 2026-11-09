@@ -16,6 +16,8 @@ import shapely
 import simpletes
 import torch
 import trimesh
+from datasets import load_dataset
+from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
 from simpletes.config import EngineConfig, resolve_eval_python, task_dir_from_evaluator_path
 from simpletes.evaluator import EvaluatorWorker
 from simpletes.generator import Generator
@@ -23,7 +25,7 @@ from simpletes.node import score_from_metrics
 from simpletes.utils.code_extract import EvolveBlockContext, extract_code_detailed
 from simpletes.utils.task_prep import load_task_requirements
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, truncate_error_in_metrics
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 async def subprocess_run(args, **kwargs):
@@ -291,7 +293,7 @@ class SimpletesTask:
         self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag, metric=self.metric)
 
     def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's code as the one in-context inspiration of its own prompt, PROMPT_TEMPLATE's
+        """Each response's code as the one in-context example of its own prompt, PROMPT_TEMPLATE's
         in_context_text by UNLABELLED_IN_CONTEXT_TEMPLATE.
 
         Args:
@@ -318,7 +320,7 @@ class SimpletesTask:
         return score
 
     def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's code as an in-context inspiration of one prompt, PROMPT_TEMPLATE's in_context_text
+        """Every response's code as an in-context example of one prompt, PROMPT_TEMPLATE's in_context_text
         by LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score_to_metric, numbered
         from 1 by score, highest first.
 
@@ -329,10 +331,10 @@ class SimpletesTask:
         Returns:
             str
         """
-        inspirations = []
+        in_contexts = []
         for i, (score, response) in enumerate(sorted(zip(scores, responses), key=lambda pair: pair[0], reverse=True), 1):
-            inspirations.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE(index=i, score=self.score_to_metric(score), code=self.extract_code(response)))
-        in_context_text = self.LABELLED_IN_CONTEXT_TEMPLATE(item="\n\n".join(inspirations))
+            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE(index=i, score=self.score_to_metric(score), code=self.extract_code(response)))
+        in_context_text = self.LABELLED_IN_CONTEXT_TEMPLATE(item="\n\n".join(in_contexts))
         return self.PROMPT_TEMPLATE(in_context_text=in_context_text)
 
     def extract_code(self, response: str) -> str | None:
@@ -405,16 +407,16 @@ class AutocorrelationSecond(SimpletesTask):
 
 
 class Story:
-    """A story pulled toward the hidden TARGET_STORY, scored by the cosine similarity of their embeddings.
+    """A story pulled toward a higher score of REWARD_MODEL_NAME as the reply to USER_PROMPT.
 
-    A response's story is its last code block's, of any language. A story's embedding is MODEL_NAME's last-layer hidden
-    state of its last token, the <|endoftext|> its tokenizer appends, L2-normalised; the story is tokenized without a
-    chat template or instruction, and embedded in batches of concurrency stories on the first visible GPU, where
-    MODEL_NAME is loaded at construction.
+    A response's story is its last code block's, of any language. A story's reward is REWARD_MODEL_NAME's score of the
+    chat of USER_PROMPT and the story as the assistant's reply, in its chat template without a system turn as its model
+    card recommends; REWARD_MODEL_NAME is loaded on the first visible GPU at construction and scores concurrency stories
+    per forward pass.
     """
 
-    MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
-    TARGET_STORY = "A playful puppy and a sleepy bear chased each other through the forest, then shared a pot of yummy honey."
+    REWARD_MODEL_NAME = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+    USER_PROMPT = "Write a story in one sentence."
     init_program = inspect.cleandoc("""
         ```text
         A small boat drifted slowly across the quiet lake at dawn.
@@ -428,14 +430,14 @@ class Story:
         {story}
         ```
 
-        Write the new story within a ```text block.
+        Write a new story (different from the references) in a ``` block.
     """)
     LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
-        With reference to the following story, create a new story in one sentence.
+        With reference to the following story with their scores, create a new story in one sentence.
 
         {item}
 
-        The score is the similarity to a hidden target story. Analyze the references with their scores, then write a new story (different from the references) to improve the score, within a ```text block.
+        The score is the similarity to a hidden target story. Write a new story (different from the references) to improve the score. Write within a ```text block.
     """)
     LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
         Reference {index} (score={score:.3f}):
@@ -446,14 +448,14 @@ class Story:
     STORY_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
 
     def __init__(self, concurrency: int):
-        """
+        """Loads REWARD_MODEL_NAME on the first visible GPU.
+
         Args:
-            concurrency: int, stories per forward pass
+            concurrency: int, stories per forward pass of REWARD_MODEL_NAME
         """
         self.concurrency = concurrency
-        self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
-        self.model = AutoModel.from_pretrained(self.MODEL_NAME, dtype=torch.float32).cuda()
-        self.embedding_target = self.embeddings([self.TARGET_STORY])[0]
+        self.tokenizer = AutoTokenizer.from_pretrained(self.REWARD_MODEL_NAME)
+        self.reward_model = AutoModelForSequenceClassification.from_pretrained(self.REWARD_MODEL_NAME, dtype=torch.bfloat16, num_labels=1).cuda().eval()
 
     def prompts(self, responses: list[str]) -> list[str]:
         """Each response's story as the one reference of its own PLAIN_PROMPT_TEMPLATE.
@@ -489,39 +491,173 @@ class Story:
         return (stories[-1].strip() or None) if stories else None
 
     @torch.no_grad()
-    def embeddings(self, stories: list[str]) -> torch.Tensor:
-        """MODEL_NAME's L2-normalised last-layer hidden state of each story's last token, the stories right-padded into
-        one batch.
+    def judge(self, stories: list[str]) -> list[float]:
+        """REWARD_MODEL_NAME's score of each story as the reply to USER_PROMPT, concurrency stories per forward pass.
 
         Args:
             stories: list (B) of str, each nonempty
 
         Returns:
-            (B, D) float32, unit norm
+            list (B) of float, unbounded, higher is better
         """
-        inputs = self.tokenizer(stories, return_tensors="pt", padding=True, padding_side="right").to(self.model.device)
-        last_hidden_state = self.model(**inputs).last_hidden_state
-        return torch.nn.functional.normalize(last_hidden_state[torch.arange(len(stories)), inputs.attention_mask.sum(1) - 1], dim=-1)
+        chats = []
+        for story in stories:
+            chat = self.tokenizer.apply_chat_template([{"role": "user", "content": self.USER_PROMPT}, {"role": "assistant", "content": story}], tokenize=False)
+            chats.append(chat.removeprefix(self.tokenizer.bos_token or ""))  # Tokenizing adds the BOS again.
+        rewards = []
+        for b in range(0, len(chats), self.concurrency):
+            inputs = self.tokenizer(chats[b:b + self.concurrency], return_tensors="pt", padding=True).to(self.reward_model.device)
+            rewards += self.reward_model(**inputs).logits[:, 0].float().tolist()
+        torch.cuda.empty_cache()
+        return rewards
 
     def evaluate(self, responses: list[str]) -> list[float]:
-        """Evaluates the responses' stories, concurrency per forward pass.
+        """Evaluates the responses' stories, concurrency per forward pass of REWARD_MODEL_NAME.
 
         Args:
             responses: list (N) of str, each holding a code block
 
         Returns:
-            list (N) of float, the cosine similarity between each response's story's embedding and TARGET_STORY's, in
-            [-1, 1] and 1 for a perfect match; -inf without a story
+            list (N) of float, REWARD_MODEL_NAME's score of each response's story as the reply to USER_PROMPT,
+            unbounded, higher is better; -inf without a story
         """
         stories = [self.extract_story(response) for response in responses]
         stories_valid = [story for story in stories if story]
-        similarities = []
-        for b in range(0, len(stories_valid), self.concurrency):
-            embeddings = self.embeddings(stories_valid[b:b + self.concurrency])
-            similarities += (embeddings @ self.embedding_target).tolist()
-        torch.cuda.empty_cache()
-        similarities = iter(similarities)
-        return [next(similarities) if story else -math.inf for story in stories]
+        rewards = iter(self.judge(stories_valid) if stories_valid else [])
+        return [next(rewards) if story else -math.inf for story in stories]
+
+
+class GepaAime2025:
+    r"""A system prompt pulled toward a higher accuracy of the pipeline's own model on AIME 2025, as in GEPA's AIME
+    example but with scores only and the answer in \boxed{}.
+
+    A response's instruction is its last code block's, of any language. An instruction's reward is the fraction of data the model
+    answers correctly under it: each question answered once, greedily, with the instruction followed by ANSWER_FORMAT as
+    the system turn and the question as the user turn, as GEPA's DefaultAdapter asks. An assistant response is graded by math_verify, its
+    answer parsed with EXTRACTION_CONFIG, \boxed{} first, and verified against the ground truth. Every assistant
+    response comes from one generate call of the pipeline.
+
+    The prompts are GEPA's InstructionProposalSignature.default_prompt_template, its inputs, assistant responses and
+    feedback replaced by a description of the task and its score.
+
+    Attributes:
+        pipeline: pipeline.Pipeline, whose model answers; set by the trainer before the first evaluate
+        data: list (P) of dict, MathArena's AIME 2025: "question" the problem, "answer" its integer answer as str
+    """
+
+    EXTRACTION_CONFIG = [LatexExtractionConfig(boxed_match_priority=0), ExprExtractionConfig()]
+    INSTRUCTION_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
+    ANSWER_FORMAT = r"Put your final answer in \boxed{}."
+
+    init_program = inspect.cleandoc("""
+        ```
+        You are a helpful assistant. Answer the question.
+        ```
+    """)
+    PLAIN_PROMPT_TEMPLATE = inspect.cleandoc("""
+        Here is a system prompt for an assistant that solves math problems:
+        ```
+        {instruction}
+        ```
+
+        Write an improved system prompt, different from the above, that helps the assistant solve more problems correctly. Write the new system prompt in a ``` block.
+    """)
+    LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
+        Here are several system prompts for an assistant that solves math problems, each shown with its score:
+
+        {item}
+
+        Write an improved system prompt, different from the above, that helps the assistant solve more problems correctly. Write the new system prompt in a ``` block.
+    """)
+    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        System prompt {index} (score={score:.3f}):
+        ```
+        {instruction}
+        ```
+    """)
+
+    def __init__(self, concurrency: int):
+        """Loads AIME 2025.
+
+        Args:
+            concurrency: int, unused, the engine batching every assistant response itself
+        """
+        self.pipeline = None
+        dataset = load_dataset("MathArena/aime_2025", split="train")
+        self.data = [{'question': x, 'answer': str(y)} for x, y in zip(dataset['problem'], dataset['answer'])]
+
+    def prompts(self, responses: list[str]) -> list[str]:
+        """Each response's instruction as the one instruction of its own PLAIN_PROMPT_TEMPLATE.
+
+        Args:
+            responses: list (G) of str, each holding an instruction, e.g. [init_program]
+
+        Returns:
+            list (G) of str
+        """
+        return [self.PLAIN_PROMPT_TEMPLATE.format(instruction=self.extract_instruction(response)) for response in responses]
+
+    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
+        """Every response's instruction as an instruction of one LABELLED_PROMPT_TEMPLATE, each by
+        LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the given order.
+
+        Args:
+            responses: list (G) of str, each holding an instruction
+            scores: list (G) of float
+
+        Returns:
+            str
+        """
+        in_contexts = []
+        for i, (score, response) in enumerate(zip(scores, responses), 1):
+            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, instruction=self.extract_instruction(response)))
+        return self.LABELLED_PROMPT_TEMPLATE.format(item="\n\n".join(in_contexts))
+
+    def extract_instruction(self, response: str) -> str | None:
+        """The response's last code block, of any language, stripped, its closing fence optional at the end; None
+        without one or when it is empty."""
+        instructions = self.INSTRUCTION_BLOCK.findall(response)
+        return (instructions[-1].strip() or None) if instructions else None
+
+    def is_correct(self, data_id: int, assistant_response: str) -> bool:
+        """Whether math_verify verifies the assistant response's answer against data[data_id]'s, both parsed with
+        EXTRACTION_CONFIG."""
+        answer = parse(assistant_response, extraction_config=self.EXTRACTION_CONFIG)
+        ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
+        return verify(ground_truth, answer)
+
+    def accuracies(self, instructions: list[str]) -> list[float]:
+        """The fraction of data the pipeline's model answers correctly under each instruction.
+
+        Args:
+            instructions: list (B) of str, each nonempty
+
+        Returns:
+            list (B) of float, in [0, 1], a multiple of 1 / P
+        """
+        P = len(self.data)
+        assistant_responses = self.pipeline.generate(
+            [data_i["question"] for _ in instructions for data_i in self.data],
+            system_prompts=[f"{instruction}\n\n{self.ANSWER_FORMAT}" for instruction in instructions for _ in self.data],
+            sampling_params={"temperature": 0},
+        )
+        corrects = torch.tensor([self.is_correct(i % P, assistant_response) for i, assistant_response in enumerate(assistant_responses)], dtype=torch.float64)
+        return corrects.view(len(instructions), P).mean(1).tolist()
+
+    def evaluate(self, responses: list[str]) -> list[float]:
+        """Evaluates the responses' instructions in one generate call of the pipeline.
+
+        Args:
+            responses: list (N) of str, each holding an instruction
+
+        Returns:
+            list (N) of float, the fraction of data the pipeline's model answers correctly under each response's
+            instruction, in [0, 1]; -inf without an instruction
+        """
+        instructions = [self.extract_instruction(response) for response in responses]
+        instructions_valid = [instruction for instruction in instructions if instruction]
+        rewards = iter(self.accuracies(instructions_valid) if instructions_valid else [])
+        return [next(rewards) if instruction else -math.inf for instruction in instructions]
 
 
 class Docking:
@@ -732,6 +868,7 @@ TASKS_CLS = {
     "circle-packing-32": CirclePacking32,
     "autocorrelation-second": AutocorrelationSecond,
     "story": Story,
+    "gepa-aime-2025": GepaAime2025,
     "docking-drd3": DockingDRD3,
     "docking-egfr": DockingEGFR,
     "docking-adenosine-a2a": DockingAdenosineA2A,

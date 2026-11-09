@@ -9,7 +9,7 @@ all C × K responses come from one generate call. A response's answer is what fo
 when its thinking never ends, and the whole response otherwise.
 
 Each response's reward r is the task's evaluate, config.task.concurrency at a time. Every response joins the population
-by the selector's update, one with a non-finite reward never an inspiration but counted in the ranks. Each step logs
+by the selector's update, one with a non-finite reward never an in-context example but counted in the ranks. Each step logs
 every reward and response to wandb, -inf and "" included.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/agent.py --config config/agent.py
@@ -35,15 +35,15 @@ class Trainer(BaseTrainer):
         task, L, C, K, N = self.task, self.config.L, self.config.C, self.config.K, self.config.N
         selector = Rpucg(task.init_program, task.evaluate([task.init_program])[0], C)
         for l in range(L):
-            all_inspirations = selector.select(N)
-            prompts = [task.prompts_with_scores([selector.responses[s] for s in inspirations], [selector.rewards[s] for s in inspirations]) for inspirations in all_inspirations]
+            all_in_contexts = selector.select(N)
+            prompts = [task.prompts_with_scores([selector.responses[s] for s in in_contexts], [selector.rewards[s] for s in in_contexts]) for in_contexts in all_in_contexts]
             responses = self.pipeline.generate([prompt for prompt in prompts for _ in range(K)])
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
-            selector.update(all_inspirations, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
+            selector.update(all_in_contexts, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
 
             objective_evaluations = (l + 1) * C * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
-            self.log_texts(objective_evaluations=objective_evaluations, rewards=rewards, texts=responses)
+            self.log_responses(objective_evaluations=objective_evaluations, rewards=rewards, responses=responses)
 
         wandb.finish()
 

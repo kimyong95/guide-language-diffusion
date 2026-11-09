@@ -1,4 +1,4 @@
-"""Inspiration selector over C chains of responses: Rpucg for SimpleTES's RPUCG."""
+"""Selector of in-context examples over C chains of responses: Rpucg for SimpleTES's RPUCG."""
 
 import collections
 import math
@@ -13,18 +13,18 @@ class Rpucg:
     """SimpleTES's RPUCG policy: C chains over one population of responses, each chain's history rooted at the seed and
     holding its best response of every batch whose reward is finite.
 
-    A chain's inspirations are up to N of its history's nodes s by Q(s) + PUCT_C P(s) √(1 + T) / (1 + n(s)), picked
-    greedily, each pick excluding its parents and children from the rest. P and Q are the percentile ranks, over the
-    population, non-finite rewards included, of the reward r and of V(s) = max(r(s), GAMMA max_children V); T is the
-    chain's batches so far and n(s) the times s was among its inspirations.
+    A chain's in-context examples are up to N of its history's nodes s by Q(s) + PUCT_C P(s) √(1 + T) / (1 + n(s)),
+    picked greedily, each pick excluding its parents and children from the rest. P and Q are the percentile ranks, over
+    the population, non-finite rewards included, of the reward r and of V(s) = max(r(s), GAMMA max_children V); T is the
+    chain's batches so far and n(s) the times s was among its in-context examples.
 
     Attributes:
         responses: list (S) of str, the population, each child after its parents
         rewards: list (S) of float
-        parents: list (S) of list of int
-        children: list (S) of list of int
+        all_parents: list (S) of list of int, each response's parents
+        all_children: list (S) of list of int, each response's children
         histories: list (C) of list of int, each chain's nodes, of finite reward
-        visits: list (C) of collections.Counter, each chain's n
+        all_visits: list (C) of collections.Counter, each chain's n
         expansions: list (C) of int, each chain's T
     """
 
@@ -35,9 +35,9 @@ class Rpucg:
             reward: float, finite, the seed's
             C: int, chains
         """
-        self.responses, self.rewards, self.parents, self.children = [response], [reward], [[]], [[]]
+        self.responses, self.rewards, self.all_parents, self.all_children = [response], [reward], [[]], [[]]
         self.histories = [[0] for _ in range(C)]
-        self.visits = [collections.Counter() for _ in range(C)]
+        self.all_visits = [collections.Counter() for _ in range(C)]
         self.expansions = [0] * C
 
     @staticmethod
@@ -53,55 +53,55 @@ class Rpucg:
         return torch.searchsorted(values.sort().values, values) / len(values)
 
     def select(self, N):
-        """Each chain's inspirations.
+        """Each chain's in-context examples.
 
         Args:
-            N: int, inspirations per chain at most
+            N: int, in-context examples per chain at most
 
         Returns:
-            list (C) of list of int, each chain's inspirations, best first
+            list (C) of list of int, each chain's in-context examples, best first
         """
         values = list(self.rewards)
         for s in reversed(range(len(values))):
-            for child in self.children[s]:
+            for child in self.all_children[s]:
                 values[s] = max(values[s], GAMMA * values[child])
         Q = self.percentile_ranks(torch.tensor(values, dtype=torch.float64)).tolist()
         P = self.percentile_ranks(torch.tensor(self.rewards, dtype=torch.float64)).tolist()
 
-        all_inspirations = []
-        for history, visits, T in zip(self.histories, self.visits, self.expansions):
+        all_in_contexts = []
+        for history, visits, T in zip(self.histories, self.all_visits, self.expansions):
             scores = {s: Q[s] + PUCT_C * P[s] * math.sqrt(1 + T) / (1 + visits[s]) for s in history}
-            inspirations, excluded = [], set()
+            in_contexts, excluded = [], set()
             for s in sorted(history, key=scores.get, reverse=True):
-                if len(inspirations) == N:
+                if len(in_contexts) == N:
                     break
                 if s not in excluded:
-                    inspirations.append(s)
-                    excluded.update([s, *self.parents[s], *self.children[s]])
-            all_inspirations.append(sorted(inspirations, key=self.rewards.__getitem__, reverse=True))
-        return all_inspirations
+                    in_contexts.append(s)
+                    excluded.update([s, *self.all_parents[s], *self.all_children[s]])
+            all_in_contexts.append(sorted(in_contexts, key=self.rewards.__getitem__, reverse=True))
+        return all_in_contexts
 
-    def update(self, all_inspirations, all_responses, all_rewards):
-        """Adds each chain's responses to the population as children of its inspirations, appends its best of them to
-        its history when that reward is finite and counts the batch.
+    def update(self, all_in_contexts, all_responses, all_rewards):
+        """Adds each chain's responses to the population as children of its in-context examples, appends its best of them
+        to its history when that reward is finite and counts the batch.
 
         Args:
-            all_inspirations: list (C) of list of int, from select
+            all_in_contexts: list (C) of list of int, from select
             all_responses: list (C) of list (K) of str
             all_rewards: list (C) of list (K) of float
         """
-        for c, (inspirations, responses, rewards) in enumerate(zip(all_inspirations, all_responses, all_rewards)):
+        for c, (in_contexts, responses, rewards) in enumerate(zip(all_in_contexts, all_responses, all_rewards)):
             children = []
             for response, reward in zip(responses, rewards):
                 children.append(len(self.responses))
                 self.responses.append(response)
                 self.rewards.append(reward)
-                self.parents.append(inspirations)
-                self.children.append([])
-                for parent in inspirations:
-                    self.children[parent].append(children[-1])
+                self.all_parents.append(in_contexts)
+                self.all_children.append([])
+                for parent in in_contexts:
+                    self.all_children[parent].append(children[-1])
             best = max(children, key=self.rewards.__getitem__)
             if math.isfinite(self.rewards[best]):
                 self.histories[c].append(best)
-            self.visits[c].update(inspirations)
+            self.all_visits[c].update(in_contexts)
             self.expansions[c] += 1

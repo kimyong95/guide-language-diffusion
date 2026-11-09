@@ -19,8 +19,8 @@ class BaseTrainer:
         self.setup_pipeline()
         self.set_seed() # after setup_pipeline to prevent random port crash across same-seed runs
         self.log_code()
-        self.text_table = wandb.Table(
-            columns=["objective-evaluations", "idx", "reward", "text"],
+        self.response_table = wandb.Table(
+            columns=["objective-evaluations", "idx", "reward", "response"],
             log_mode="INCREMENTAL",
         )
         self.best_reward = -math.inf
@@ -41,6 +41,7 @@ class BaseTrainer:
         """Builds config.model's SGLang pipeline; kwargs go to sglang.Engine."""
         cfg = self.config.model
         self.pipeline = Pipeline(cfg.name, cfg.max_total_tokens, enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort, seed=self.config.seed, **kwargs)
+        self.task.pipeline = self.pipeline
 
     def log_code(self):
         cwd = os.path.abspath(os.getcwd())
@@ -68,12 +69,20 @@ class BaseTrainer:
         }
         wandb.log(log_dict)
 
-    def log_texts(self, objective_evaluations, rewards, texts, extra={}):
-        for idx, (text, reward) in enumerate(zip(texts, rewards)):
-            self.text_table.add_data(objective_evaluations, idx, reward.item(), text)
+    def log_responses(self, objective_evaluations, rewards, responses, extra={}):
+        """Logs each response with its reward to the incremental "responses" table.
+
+        Args:
+            objective_evaluations: int
+            rewards: (N) float64
+            responses: list (N) of str
+            extra: dict, further entries of the same wandb.log
+        """
+        for idx, (response, reward) in enumerate(zip(responses, rewards)):
+            self.response_table.add_data(objective_evaluations, idx, reward.item(), response)
         log_dict = {
             "objective-evaluations": objective_evaluations,
-            "texts": self.text_table,
+            "responses": self.response_table,
             **extra,
         }
         wandb.log(log_dict)
