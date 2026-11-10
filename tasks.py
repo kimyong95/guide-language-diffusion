@@ -430,7 +430,7 @@ class Story:
         {story}
         ```
 
-        Write a new story (different from the references) in a ``` block.
+        Write a new story (different from the references) in a ```text block.
     """)
     LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
         With reference to the following story with their scores, create a new story in one sentence.

@@ -1,8 +1,10 @@
-"""Selector of in-context examples over C chains of responses: Rpucg for SimpleTES's RPUCG."""
+"""Selectors over C chains of responses: Rpucg of in-context examples, for SimpleTES's RPUCG, and PromptsRewards of a
+chain's guide prompts."""
 
 import collections
 import math
 
+import pandas as pd
 import torch
 
 PUCT_C = 0.5
@@ -105,3 +107,43 @@ class Rpucg:
                 self.histories[c].append(best)
             self.all_visits[c].update(in_contexts)
             self.expansions[c] += 1
+
+
+class PromptsRewards:
+    """A chain's prompts, each with all its finite rewards.
+
+    Attributes:
+        data: list (S) of tuple of str and float, each finite reward with its prompt, latest last
+    """
+
+    def __init__(self, reward_agg_fn):
+        """
+        Args:
+            reward_agg_fn: str, "mean" or "max", a prompt's utility over its rewards
+        """
+        self.reward_agg_fn = reward_agg_fn
+        self.data = []
+
+    def set(self, prompt, rewards):
+        """Adds a prompt's finite rewards, any of them making it the latest prompt.
+
+        Args:
+            prompt: str
+            rewards: list of float
+        """
+        self.data += [(prompt, reward) for reward in rewards if math.isfinite(reward)]
+
+    def get(self, M):
+        """The latest M prompts of distinct utilities, each tie first reduced to a uniformly picked prompt.
+
+        Args:
+            M: int, prompts at most
+
+        Returns:
+            list (at most M) of str, the prompts, latest last; list (at most M) of float, their utilities
+        """
+        data = pd.DataFrame(self.data, columns=["prompt", "reward"]).reset_index()
+        data = data.groupby("prompt").agg(latest=("index", "max"), utility=("reward", self.reward_agg_fn))
+        # Shuffled, so that drop_duplicates keeps a uniform pick of each tie.
+        data = data.sample(frac=1).drop_duplicates("utility").sort_values("latest").tail(M)
+        return data.index.tolist(), data["utility"].tolist()

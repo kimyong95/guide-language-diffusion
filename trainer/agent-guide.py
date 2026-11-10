@@ -2,9 +2,9 @@
 guide.py's guided sampling over config.C chains, no training.
 
 Every one of config.L steps samples config.K responses per chain. An agent step samples as agent.py does, and its prompt
-and finite rewards join the chain's PromptsRewards. Step l is a guide step of every chain when l is odd and every
-chain's PromptsRewards.get(config.M) holds at least config.M prompts, sampling as guide.py does over those prompts and
-their utilities, p_i being the model under prompt i. Any other step is an agent step of every chain.
+and finite rewards join the chain's PromptsRewards. Step l is a guide step of every chain when l is odd and above
+config.M, sampling as guide.py does over the chain's PromptsRewards.get(config.M) prompts and their utilities, p_i being
+the model under prompt i. Any other step is an agent step of every chain.
 
 A guide step's responses join the population by the selector's update with no parents, raising no n, and their rewards
 join no PromptsRewards. Evaluation and logging are as in agent.py.
@@ -12,59 +12,17 @@ join no PromptsRewards. Evaluation and logging are as in agent.py.
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/agent-guide.py --config config/agent-guide.py
 """
 
-import math
 import sys
 
-import pandas as pd
 import torch
 import wandb
 from absl import flags
 from ml_collections import config_flags
 
 from trainer.base import BaseTrainer
-from trainer.selector import Rpucg
+from trainer.selector import PromptsRewards, Rpucg
 
 FLAGS = flags.FLAGS
-
-
-class PromptsRewards:
-    """A chain's agent prompts, each with all its finite rewards.
-
-    Attributes:
-        data: list (S) of tuple of str and float, each finite reward with its prompt, latest last
-    """
-
-    def __init__(self, reward_agg_fn):
-        """
-        Args:
-            reward_agg_fn: str, "mean" or "max", a prompt's utility over its rewards
-        """
-        self.reward_agg_fn = reward_agg_fn
-        self.data = []
-
-    def set(self, prompt, rewards):
-        """Adds a prompt's finite rewards, any of them making it the latest prompt.
-
-        Args:
-            prompt: str
-            rewards: list of float
-        """
-        self.data += [(prompt, reward) for reward in rewards if math.isfinite(reward)]
-
-    def get(self, M):
-        """The latest M prompts of distinct utilities, each tie first reduced to a uniformly picked prompt.
-
-        Args:
-            M: int, prompts at most
-
-        Returns:
-            list (at most M) of str, the prompts, latest last; list (at most M) of float, their utilities
-        """
-        data = pd.DataFrame(self.data, columns=["prompt", "reward"]).reset_index()
-        data = data.groupby("prompt").agg(latest=("index", "max"), utility=("reward", self.reward_agg_fn))
-        # Shuffled, so that drop_duplicates keeps a uniform pick of each tie.
-        data = data.sample(frac=1).drop_duplicates("utility").sort_values("latest").tail(M)
-        return data.index.tolist(), data["utility"].tolist()
 
 
 class Trainer(BaseTrainer):
@@ -76,7 +34,7 @@ class Trainer(BaseTrainer):
         all_prompts_rewards = [PromptsRewards(self.config.reward_agg_fn) for _ in range(C)]
         for l in range(L):
             all_prompts, all_utilities = zip(*[prompts_rewards.get(M) for prompts_rewards in all_prompts_rewards])
-            guiding = l % 2 == 1 and all(len(prompts) >= M for prompts in all_prompts)
+            guiding = l % 2 == 1 and l > M
             if guiding:
                 all_in_contexts = [[] for _ in range(C)]
                 responses = self.pipeline.group_generate([prompts for prompts in all_prompts for _ in range(K)], [utilities for utilities in all_utilities for _ in range(K)])

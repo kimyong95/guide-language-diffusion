@@ -101,11 +101,57 @@ class Trainer(BaseTrainer):
         for node, text in zip(nodes, self.pipeline.generate(reflection_prompts)):
             node.reflection = extract_approach_insight(text)[:_MAX_REFLECTION_OUTPUT_CHARS].rstrip()
 
+    def add_init_program(self):
+        """Adds the seed program to the database at the best of its EngineConfig.init_eval_repeats metrics."""
+        init_metrics = max(self.task.evaluate([self.init_program] * EngineConfig.init_eval_repeats), key=score_from_metrics)
+        self.db.add(Node(id=uuid.uuid4().hex, code=self.init_program, metrics=init_metrics, score=score_from_metrics(init_metrics), status=Status.DONE))
+
+    def commit(self, all_in_contexts, chain_idxs, gen_ids, prompts, responses):
+        """Evaluates each response's code as a node of its chain's batch, reflects on each batch's best node and commits
+        the batches to their chains.
+
+        Args:
+            all_in_contexts: list (C) of list of Node, each chain's in-context examples, its nodes' parents
+            chain_idxs: list (C) of int, each chain's index
+            gen_ids: list (C) of int, each chain's batch, registered with the selector
+            prompts: list (C) of str, each chain's prompt, its nodes' llm_input
+            responses: list (C × K) of str, chain c's response k at c × K + k
+
+        Returns:
+            (C × K) float64, each response's reward: its node's score, -inf without an EVOLVE-BLOCK
+        """
+        C, K = self.config.C, self.config.K
+        nodes, pendings = [], []  # nodes: each response's node, None without an EVOLVE-BLOCK
+        for (c, _), response in zip(itertools.product(range(C), range(K)), responses):
+            code, _ = extract_code_detailed(response, self.evolve_context)
+            if code is None:
+                pendings.append(self.selector.on_generation_failed(gen_ids[c]))
+                nodes.append(None)
+            else:
+                nodes.append(Node(id=uuid.uuid4().hex, code=code, parent_ids=[node.id for node in all_in_contexts[c]], gen_id=gen_ids[c], chain_idx=chain_idxs[c], status=Status.EVAL_PENDING, llm_input=prompts[c]))
+        nodes_evaluated = [node for node in nodes if node is not None]
+        for node, metrics in zip(nodes_evaluated, self.task.evaluate([node.code for node in nodes_evaluated])):
+            node.metrics, node.score, node.status = metrics, score_from_metrics(metrics), Status.DONE
+            try:
+                self.db.add(node)
+            except ValueError:
+                pendings.append(self.selector.on_generation_failed(node.gen_id))
+            else:
+                pendings.append(self.selector.on_child_done(node, [self.db.nodes[parent_id] for parent_id in node.parent_ids]))
+        pendings = [pending for pending in pendings if pending is not None]
+
+        best_nodes = [node for node in (self.selector._find_best_node(self.db, pending.children) for pending in pendings) if node is not None]
+        if best_nodes:
+            self.reflect(best_nodes)
+        for pending in pendings:
+            asyncio.run(self.selector.finalize_batch(pending, self.db))
+
+        return torch.tensor([-math.inf if node is None else node.score for node in nodes], dtype=torch.float64)
+
     def run(self):
         """Runs config.L steps of SimpleTES from the seed program."""
         L, C, K, N = self.config.L, self.config.C, self.config.K, self.config.N
-        init_metrics = max(self.task.evaluate([self.init_program] * EngineConfig.init_eval_repeats), key=score_from_metrics)
-        self.db.add(Node(id=uuid.uuid4().hex, code=self.init_program, metrics=init_metrics, score=score_from_metrics(init_metrics), status=Status.DONE))
+        self.add_init_program()
         for l in range(L):
             selections = []
             for _ in range(C):
@@ -115,33 +161,8 @@ class Trainer(BaseTrainer):
                 selections.append((in_contexts, failure_patterns, chain_idx, gen_id))
             all_in_contexts, all_failure_patterns, chain_idxs, gen_ids = zip(*selections)
             prompts, responses = self.generate(all_in_contexts, all_failure_patterns)
+            rewards = self.commit(all_in_contexts, chain_idxs, gen_ids, prompts, responses)
 
-            nodes, pendings = [], []  # nodes: each response's node, None without an EVOLVE-BLOCK
-            for (c, _), response in zip(itertools.product(range(C), range(K)), responses):
-                code, _ = extract_code_detailed(response, self.evolve_context)
-                if code is None:
-                    pendings.append(self.selector.on_generation_failed(gen_ids[c]))
-                    nodes.append(None)
-                else:
-                    nodes.append(Node(id=uuid.uuid4().hex, code=code, parent_ids=[node.id for node in all_in_contexts[c]], gen_id=gen_ids[c], chain_idx=chain_idxs[c], status=Status.EVAL_PENDING, llm_input=prompts[c]))
-            nodes_evaluated = [node for node in nodes if node is not None]
-            for node, metrics in zip(nodes_evaluated, self.task.evaluate([node.code for node in nodes_evaluated])):
-                node.metrics, node.score, node.status = metrics, score_from_metrics(metrics), Status.DONE
-                try:
-                    self.db.add(node)
-                except ValueError:
-                    pendings.append(self.selector.on_generation_failed(node.gen_id))
-                else:
-                    pendings.append(self.selector.on_child_done(node, [self.db.nodes[parent_id] for parent_id in node.parent_ids]))
-            pendings = [pending for pending in pendings if pending is not None]
-
-            best_nodes = [node for node in (self.selector._find_best_node(self.db, pending.children) for pending in pendings) if node is not None]
-            if best_nodes:
-                self.reflect(best_nodes)
-            for pending in pendings:
-                asyncio.run(self.selector.finalize_batch(pending, self.db))
-
-            rewards = torch.tensor([-math.inf if node is None else node.score for node in nodes], dtype=torch.float64)
             objective_evaluations = (l + 1) * C * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
             self.log_responses(objective_evaluations=objective_evaluations, rewards=rewards, responses=responses)
