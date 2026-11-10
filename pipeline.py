@@ -2,7 +2,8 @@
 
 generate samples one response per prompt. group_generate samples one response per group of prompts, one request per
 prompt, through extend_sglang: each token is drawn from the group's guided log probabilities over its requests and
-given to all of them, so they advance and stop together. Both sample under the model's generation config.
+given to all of them, so they advance and stop together. Both sample under the model's SAMPLING_PARAMS of its mode,
+thinking or instruct.
 
 SGLang holds its KV cache only while generating, released through torch_memory_saver between generations, so that the
 task's evaluation has that GPU memory.
@@ -18,7 +19,7 @@ from sglang.srt.utils.common import get_device_sm
 
 from extend_sglang import GroupEngine, GroupLogitProcessor
 
-MODELS = {
+QUANT_MODELS = {
     "qwen-coder-next": {
         "int4": "inference-optimization/Qwen3-Coder-Next.w4a16",
         "fp8": "Qwen/Qwen3-Coder-Next-FP8",
@@ -46,14 +47,33 @@ MODELS = {
     },
 }
 
+# Qwen's recommended sampling parameters for general tasks, from each model's card on Hugging Face.
+SAMPLING_PARAMS = {
+    "qwen-coder-next": {
+        "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 40},
+    },
+    "qwen-next-instruct": {
+        "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0},
+    },
+    "qwen-next-thinking": {
+        "thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0},
+    },
+    "qwen3.8-27b": {
+        "thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0},
+        "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+    },
+    "qwen3.5-4b": {
+        "thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+        "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+    },
+}
+
 
 def model_path(model_name):
-    """The Hugging Face repo of a MODELS name in the visible GPU's best format: NVFP4 from Blackwell (sm100), FP8 from
-    Ada and Hopper (sm89), INT4 below; any other name as is."""
-    if model_name not in MODELS:
-        return model_name
+    """The Hugging Face repo of a QUANT_MODELS name in the visible GPU's best format: NVFP4 from Blackwell (sm100), FP8
+    from Ada and Hopper (sm89), INT4 below."""
     sm = get_device_sm()
-    return MODELS[model_name]["nvfp4" if sm >= 100 else "fp8" if sm >= 89 else "int4"]
+    return QUANT_MODELS[model_name]["nvfp4" if sm >= 100 else "fp8" if sm >= 89 else "int4"]
 
 
 @contextlib.contextmanager
@@ -72,20 +92,24 @@ class Pipeline:
     """Generation with SGLang, tensor parallel over every visible GPU, its KV cache held only while generating."""
 
     def __init__(self, model_name, max_total_tokens, enable_thinking=False, reasoning_effort=None, seed=0, **kwargs):
-        """Loads the model and its generation config's sampling parameters.
+        """Loads the model, sampling under its SAMPLING_PARAMS of the mode enable_thinking picks.
 
         Args:
-            model_name: str, a MODELS name or a Hugging Face repo
+            model_name: str, a QUANT_MODELS and SAMPLING_PARAMS name
             max_total_tokens: int, bound on a prompt and its response together
             enable_thinking: bool, Qwen's chat-template switch; False raises for thinking-only templates that ignore it
             reasoning_effort: str | None, Qwen's chat-template thinking budget, e.g. "medium"; None leaves the
                 template's default
             seed: int
             **kwargs: passed to sglang.Engine, such as mem_fraction_static
+
+        Raises:
+            KeyError: SAMPLING_PARAMS has no such model, or not its mode
         """
         self.max_total_tokens = max_total_tokens
         self.enable_thinking = enable_thinking
         self.reasoning_effort = reasoning_effort
+        self.sampling_params = SAMPLING_PARAMS[model_name]["thinking" if enable_thinking else "instruct"]
         self.engine = GroupEngine(
             model_path=model_path(model_name),
             tp_size=torch.cuda.device_count(),
@@ -100,7 +124,6 @@ class Pipeline:
         )
         self.engine.release_memory_occupation([GPU_MEMORY_TYPE_KV_CACHE])
         self.tokenizer = self.engine.tokenizer_manager.tokenizer
-        self.sampling_params = self.engine.tokenizer_manager.model_config.get_default_sampling_params()
         assert enable_thinking or "enable_thinking" in self.tokenizer.chat_template or "<think>" not in self.tokenizer.chat_template, "chat template does not support enable_thinking=False"
 
     def apply_chat_template(self, prompts, enable_thinking=None, reasoning_effort=None, system_prompts=None):
@@ -139,14 +162,13 @@ class Pipeline:
         return answer if think_end else ""
 
     def generate(self, prompts, system_prompts=None, sampling_params=None):
-        """Samples one response per prompt under the model's generation config, each filling max_total_tokens with its
+        """Samples one response per prompt under the pipeline's sampling_params, each filling max_total_tokens with its
         prompt at most.
 
         Args:
             prompts: list (N) of str
             system_prompts: list (N) of str | None, each chat's system turn; None for no system turn
-            sampling_params: dict | None, SGLang sampling parameters overriding the generation config's, e.g.
-                {"temperature": 0}
+            sampling_params: dict | None, SGLang sampling parameters overriding the pipeline's, e.g. {"temperature": 0}
 
         Returns:
             list (N) of str, each response after strip_thinking
@@ -161,10 +183,10 @@ class Pipeline:
 
     def group_generate(self, all_prompts, all_utilities):
         """Samples one response per group of prompts, each token from log p_B + max(Σ_{g_k > 0} g_k Δ_k, 0) +
-        min(Σ_{g_k < 0} g_k Δ_k, 0) under the model's generation config, each response filling max_total_tokens with
+        min(Σ_{g_k < 0} g_k Δ_k, 0) under the pipeline's sampling_params, each response filling max_total_tokens with
         the group's longest prompt at most.
 
-        Over a group of G prompts, p_k is the model under prompt k after its repetition penalty, the base
+        Over a group of G prompts, p_k is the model under prompt k after its repetition and presence penalties, the base
         log p_B = (1/G) Σ_k log p_k, Δ_k = log p_k - log p_B and g_k = W_k - 1/G, W being extend_sglang's weights of the
         prompts' utilities. The temperature, top-k, top-p and min-p apply to it as they do in generate, so a group of one
         prompt samples as generate does.
