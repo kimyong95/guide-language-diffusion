@@ -182,7 +182,7 @@ class Pipeline:
         return [self.strip_thinking(output["text"]) for output in outputs]
 
     def group_generate(self, all_prompts, all_utilities):
-        """Samples one response per group of prompts, each token from log p_B + max(Σ_{g_k > 0} g_k Δ_k, 0) +
+        """Samples one response per group of prompts, each token from log p_B + Σ_{g_k > 0} g_k Δ_k +
         min(Σ_{g_k < 0} g_k Δ_k, 0) under the pipeline's sampling_params, each response filling max_total_tokens with
         the group's longest prompt at most.
 

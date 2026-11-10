@@ -7,9 +7,9 @@ log-probabilities over them, p_i being the model under the task's prompts of in-
 thinks at config.model.reasoning_effort when config.model.enable_thinking, scoring the response after its own prompt. A
 response's answer is what follows its </think> when thinking, empty when its thinking never ends, and the whole
 response otherwise. Every response is sampled under the uniform mix (1/G) Σ_i log p_i of its G guides as base, guided
-by g_i = w_i - 1/G, its positive and its negative guidance each summed then clipped: w being extend_sglang's weights of
-the guides' utilities u_i, maximising Σ_i w_i u_i with Σ_i w_i = 1 and the mean w_i² at most 1, a guide's utility its
-in-context example's reward.
+by g_i = w_i - 1/G, its negative guidance summed then clipped to lower probabilities only: w being extend_sglang's
+weights of the guides' utilities u_i, maximising Σ_i w_i u_i with Σ_i w_i = 1 and the mean w_i² at most 1, a guide's
+utility its in-context example's reward.
 
 The C × K responses are sampled together by the pipeline's group_generate, each as one group of requests, one per guide.
 Each token of a response is sampled from its guided log probabilities under the model's generation config, as the

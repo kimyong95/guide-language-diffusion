@@ -80,7 +80,7 @@ class GroupLogitProcessor(CustomLogitProcessor):
     """Samples each group's next token from its guided log probabilities under the group's sampling parameters, as
     SGLang's Sampler samples a request's, and leaves it the only finite logit in each of the group's rows.
 
-    The guided log probabilities are log p_B + max(Σ_{g_k > 0} g_k Δ_k, 0) + min(Σ_{g_k < 0} g_k Δ_k, 0): p_k the model
+    The guided log probabilities are log p_B + Σ_{g_k > 0} g_k Δ_k + min(Σ_{g_k < 0} g_k Δ_k, 0): p_k the model
     under the group's request k, the base log p_B = (1/G) Σ_k log p_k over its G requests, Δ_k = log p_k - log p_B and
     g_k = W_k - 1/G, W being weights of the requests' utilities. A row's custom_params hold its group, the group's size
     G and its request's utility.
@@ -123,7 +123,7 @@ class GroupLogitProcessor(CustomLogitProcessor):
         log_p_base = groups_rows @ log_p / groups_rows.sum(1, keepdim=True)
         # Σ_k g_k Δ_k as Σ_k g_k log p_k - (Σ_k g_k) log p_B, over the positive and over the negative g_k.
         guidance_positive, guidance_negative = (g @ log_p - g.sum(1, keepdim=True) * log_p_base for g in (guidance.clamp(min=0), guidance.clamp(max=0)))
-        log_p_guided = (log_p_base + guidance_positive.clamp(min=0) + guidance_negative.clamp(max=0)) / temperatures[:, None]
+        log_p_guided = (log_p_base + guidance_positive + guidance_negative.clamp(max=0)) / temperatures[:, None]
         tokens = sample_tokens(log_p_guided.softmax(-1), all_sampling_params)
         logits[rows] = torch.full_like(logits[rows], float("-inf")).scatter_(1, tokens[rows_group, None].long(), 0)
         return logits
