@@ -3,7 +3,7 @@
 generate samples one response per prompt. group_generate samples one response per group of prompts, one request per
 prompt, through extend_sglang: each token is drawn from the group's guided log probabilities over its requests and
 given to all of them, so they advance and stop together. Both sample under the model's SAMPLING_PARAMS of its mode,
-thinking or instruct.
+thinking or instruct. log_probs scores responses after prompts.
 
 SGLang holds its KV cache only while generating, released through torch_memory_saver between generations, so that the
 task's evaluation has that GPU memory.
@@ -180,6 +180,31 @@ class Pipeline:
                 sampling_params=[{**self.sampling_params, **(sampling_params or {}), "max_new_tokens": self.max_total_tokens - len(tokens)} for tokens in prompt_tokens],
             )
         return [self.strip_thinking(output["text"]) for output in outputs]
+
+    def log_probs(self, prompts, responses):
+        """Each response's log probability under the model at temperature 1 after each prompt, the response being its
+        tokens and the EOS right after the prompt's chat template.
+
+        Args:
+            prompts: list (N) of str
+            responses: list (M) of str
+
+        Returns:
+            (N, M) float64, the sum of the response's token log probabilities after the prompt; (M) int64, each
+            response's tokens with its EOS
+        """
+        prompt_tokens = self.apply_chat_template(prompts, enable_thinking=self.enable_thinking, reasoning_effort=self.reasoning_effort)
+        response_tokens = [self.tokenizer(response, add_special_tokens=False).input_ids + [self.tokenizer.eos_token_id] for response in responses]
+        with kv_cache(self.engine):
+            outputs = self.engine.generate(
+                input_ids=[tokens + response for tokens in prompt_tokens for response in response_tokens],
+                sampling_params={"max_new_tokens": 0},
+                return_logprob=True,
+                logprob_start_len=[len(tokens) - 1 for tokens in prompt_tokens for _ in response_tokens],
+            )
+        # Each list starts at the prompt's last token, whose entry is None.
+        log_P = [sum(logprob for logprob, _, _ in output["meta_info"]["input_token_logprobs"][1:]) for output in outputs]
+        return torch.tensor(log_P, dtype=torch.float64).view(len(prompts), len(responses)), torch.tensor([len(response) for response in response_tokens])
 
     def group_generate(self, all_prompts, all_utilities):
         """Samples one response per group of prompts, each token from log p_B + Σ_{g_k > 0} g_k Δ_k +

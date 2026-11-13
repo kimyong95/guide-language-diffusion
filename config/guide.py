@@ -10,9 +10,10 @@ def get_config():
     config.task.concurrency = 64
 
     config.L = 100
-    config.C = 1
-    config.K = 16
-    config.G = 5
+
+    config.N = 5    # number of distributions
+    config.M = 100   # dataset size
+    config.K = 32   # number of new samples
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"

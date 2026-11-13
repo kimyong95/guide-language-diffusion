@@ -1,28 +1,25 @@
 """Mutates config.task.name's seed program toward a higher reward by guided sampling of config.model.name inside SGLang,
-its guides picked by selector.py's Rpucg over config.C chains, no training.
+no training.
 
-Every one of config.L steps samples each chain once: Rpucg picks up to config.G of the chain's nodes as its
-in-context examples, best first, and config.K new responses are sampled independently under a weighted sum of
-log-probabilities over them, p_i being the model under the task's prompts of in-context example i alone. Every guide
-thinks at config.model.reasoning_effort when config.model.enable_thinking, scoring the response after its own prompt. A
-response's answer is what follows its </think> when thinking, empty when its thinking never ends, and the whole
-response otherwise. Every response is sampled under the uniform mix (1/G) Σ_i log p_i of its G guides as base, guided
-by g_i = w_i - 1/G, its negative guidance summed then clipped to lower probabilities only: w being extend_sglang's
-weights of the guides' utilities u_i, maximising Σ_i w_i u_i with Σ_i w_i = 1 and the mean w_i² at most 1, a guide's
-utility its in-context example's reward.
+Of the responses so far of finite reward, the seed at the start, the best config.M are the data D, responses x_j with
+rewards r_j. Every one of config.L steps samples config.K responses guided by up to config.N responses drawn uniformly
+from D without replacement, p_i being the model under the task's prompts of response i alone. With P_ij = p_i(x_j)
+normalized by the T_j tokens of x_j and the base the mixture (1/N) Σ_k p_k, guide-algorithm.md's β is
 
-The C × K responses are sampled together by the pipeline's group_generate, each as one group of requests, one per guide.
-Each token of a response is sampled from its guided log probabilities under the model's generation config, as the
-pipeline's generate samples, and given to all of the group's requests, so its guides advance and stop together; a
-response fills config.model.max_total_tokens with its group's longest prompt at most.
+    log q_ij = log P_ij / T_j - log Σ_k P_kj^(1/T_j), normalized over j,
+    β_i = (r - r̄)⁺ log q_i,
 
-Each response's reward r is the task's evaluate, config.task.concurrency at a time, and every response joins the population
-by Rpucg's update, one with a non-finite reward never an in-context example.
+⁺ being the Moore–Penrose pseudoinverse: β_i is the least-squares slope of log q_ij on r_j, 0 when the rewards are all
+equal. The pipeline's group_generate samples each response with β as the guides' utilities, so under extend_sglang's
+weights(β), its negative guidance clipped. The first step, of N = M = 1, samples the seed's prompt alone.
+
 Each step logs every reward and response to wandb, -inf and "" included.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/guide.py --config config/guide.py
 """
 
+import math
+import random
 import sys
 
 import torch
@@ -31,7 +28,6 @@ from absl import flags
 from ml_collections import config_flags
 
 from trainer.base import BaseTrainer
-from trainer.selector import Rpucg
 
 FLAGS = flags.FLAGS
 
@@ -39,20 +35,26 @@ FLAGS = flags.FLAGS
 class Trainer(BaseTrainer):
 
     def run(self):
-        """Runs config.L steps of Rpucg selection, guided sampling, evaluation and update from the seed program."""
-        task, L, C, K, G = self.task, self.config.L, self.config.C, self.config.K, self.config.G
-        selector = Rpucg(task.init_program, task.evaluate([task.init_program])[0], C)
+        """Runs config.L steps of drawing the guides from D, estimating β, guided sampling and evaluation."""
+        task, L, K, M, N = self.task, self.config.L, self.config.K, self.config.M, self.config.N
+        all_responses, all_rewards = [task.init_program], task.evaluate([task.init_program])
         for l in range(L):
-            all_in_contexts = selector.select(G)
-            all_prompts, all_utilities = [], []
-            for in_contexts in all_in_contexts:
-                all_prompts += [task.prompts([selector.responses[s] for s in in_contexts])] * K
-                all_utilities += [[selector.rewards[s] for s in in_contexts]] * K
-            responses = self.pipeline.group_generate(all_prompts, all_utilities)
-            rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
-            selector.update(all_in_contexts, [responses[c * K:(c + 1) * K] for c in range(C)], rewards.view(C, K).tolist())
+            D = sorted(range(len(all_rewards)), key=all_rewards.__getitem__, reverse=True)[:M]
+            prompts = task.prompts([all_responses[s] for s in random.sample(D, min(N, len(D)))])
+            log_P, T = self.pipeline.log_probs(prompts, [all_responses[s] for s in D])
+            log_P = log_P / T
+            log_q = (log_P - log_P.logsumexp(0)).log_softmax(1)
+            r = torch.tensor([all_rewards[s] for s in D], dtype=torch.float64)
+            beta = (torch.linalg.pinv((r - r.mean())[:, None]) @ log_q.T)[0]
 
-            objective_evaluations = (l + 1) * C * K
+            responses = self.pipeline.group_generate([prompts] * K, [beta.tolist()] * K)
+            rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
+            for response, reward in zip(responses, rewards.tolist()):
+                if math.isfinite(reward):
+                    all_responses.append(response)
+                    all_rewards.append(reward)
+
+            objective_evaluations = (l + 1) * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
             self.log_responses(objective_evaluations=objective_evaluations, rewards=rewards, responses=responses)
 
