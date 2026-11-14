@@ -1,18 +1,18 @@
 """Mutates config.task.name's seed program toward a higher reward by in-context sampling of config.model.name inside
 SGLang, its in-context examples picked over config.C chains by selector.py's Rpucg, no guidance and no training.
 
-The population holds every response, starting as the task's seed program alone, taken as a response, the root of every
-chain. Every one of config.L steps samples each chain once: the selector picks up to
-config.N of the chain's nodes, and config.K new responses are sampled independently under the task's prompts_with_scores
+The population holds every response of finite reward, starting as the task's seed program alone, taken as a response,
+the root of every chain. Every one of config.L steps samples each chain once: the selector picks up to config.N of the
+chain's nodes, and config.K new responses are sampled independently under the task's prompts_with_scores
 of them with their rewards, best first, thinking at config.model.reasoning_effort when config.model.enable_thinking;
 all C × K responses come from one generate call. A response's answer is what follows its </think> when thinking, empty
 when its thinking never ends, and the whole response otherwise.
 
-Each response's reward r is the task's evaluate, config.task.concurrency at a time. Every response joins the population
-by the selector's update, one with a non-finite reward never an in-context example but counted in the ranks. Each step logs
-every reward and response to wandb, -inf and "" included.
+Each response's reward r is the task's evaluate, config.task.concurrency at a time. Each response of finite reward joins
+the population by the selector's update; one with a non-finite reward is dropped, its batch still counting toward the
+chain's visits and T. Each step logs every reward and response to wandb, -inf and "" included.
 
-Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/agent.py --config config/agent.py
+Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/simpletes-general.py --config config/simpletes-general.py
 """
 
 import sys
@@ -49,7 +49,7 @@ class Trainer(BaseTrainer):
 
 
 if __name__ == "__main__":
-    config_flags.DEFINE_config_file("config", "config/agent.py", "Agent configuration.")
+    config_flags.DEFINE_config_file("config", "config/simpletes-general.py", "SimpleTES-general configuration.")
     FLAGS(sys.argv)
     trainer = Trainer(FLAGS.config)
     trainer.run()

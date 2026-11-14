@@ -4,14 +4,14 @@ def get_config():
     config = ml_collections.ConfigDict()
 
     config.seed = 0
-    config.run_name = "agent"
+    config.run_name = "simpletes-general"
     config.task = ml_collections.ConfigDict()
     config.task.name = "circle-packing-26"
     config.task.concurrency = 64
 
     config.L = 100
     config.C = 1
-    config.K = 32
+    config.K = 16
     config.N = 3
 
     config.model = ml_collections.ConfigDict()
