@@ -7,8 +7,8 @@ evaluate_one_async replaced by the trainer's to return metrics, runs each code's
 config.task.concurrency at a time, killed after EngineConfig's eval_timeout, and its error is truncated to
 DEFAULT_METRICS_ERROR_MAX_CHARS. The seed is evaluated EngineConfig.init_eval_repeats times, keeping the best metrics.
 
-Every one of config.L steps samples each of config.C chains once. SimpleTES's RPUCG policy, at EngineConfig's puct_c and
-rpucg_gamma as SimpleTES's engine passes them, picks up to config.N of the chain's nodes, the generator's prompt holds
+Every one of config.L steps samples each of config.N chains once. SimpleTES's RPUCG policy, at EngineConfig's puct_c and
+rpucg_gamma as SimpleTES's engine passes them, picks up to config.E of the chain's nodes, the generator's prompt holds
 them with their metrics and reflections and the chain's failure patterns, and the model answers it config.K times under
 its generation config, thinking at config.model.reasoning_effort when config.model.enable_thinking.
 Each chain's best new node then gets its reflection, as the policy's reflection_mode would: the model answers the
@@ -51,8 +51,8 @@ class Trainer(BaseTrainer):
         super().__init__(config)
         self.db = NodeDatabase()
         self.selector = RpucgPolicy(
-            num_chains=config.C,
-            max_generations=config.L * config.C * config.K,
+            num_chains=config.N,
+            max_generations=config.L * config.N * config.K,
             k=config.K,
             c=EngineConfig.puct_c,
             gamma=EngineConfig.rpucg_gamma,
@@ -81,12 +81,12 @@ class Trainer(BaseTrainer):
         chain's in-context examples with their metrics and reflections and the chain's failure patterns.
 
         Args:
-            all_in_contexts: list (C) of list of Node, each chain's in-context examples from the selector
-            all_failure_patterns: list (C) of dict of str to float, each chain's failure patterns from the selector
+            all_in_contexts: list (N) of list of Node, each chain's in-context examples from the selector
+            all_failure_patterns: list (N) of dict of str to float, each chain's failure patterns from the selector
 
         Returns:
-            prompts: list (C) of str, each chain's prompt, its children's llm_input
-            responses: list (C × K) of str, chain c's response k at c × K + k, each its answer: after its </think> when
+            prompts: list (N) of str, each chain's prompt, its children's llm_input
+            responses: list (N × K) of str, chain c's response k at c × K + k, each its answer: after its </think> when
                 thinking, empty when its thinking never ends; the whole response otherwise
         """
         K = self.config.K
@@ -111,18 +111,18 @@ class Trainer(BaseTrainer):
         the batches to their chains.
 
         Args:
-            all_in_contexts: list (C) of list of Node, each chain's in-context examples, its nodes' parents
-            chain_idxs: list (C) of int, each chain's index
-            gen_ids: list (C) of int, each chain's batch, registered with the selector
-            prompts: list (C) of str, each chain's prompt, its nodes' llm_input
-            responses: list (C × K) of str, chain c's response k at c × K + k
+            all_in_contexts: list (N) of list of Node, each chain's in-context examples, its nodes' parents
+            chain_idxs: list (N) of int, each chain's index
+            gen_ids: list (N) of int, each chain's batch, registered with the selector
+            prompts: list (N) of str, each chain's prompt, its nodes' llm_input
+            responses: list (N × K) of str, chain c's response k at c × K + k
 
         Returns:
-            (C × K) float64, each response's reward: its node's score, -inf without an EVOLVE-BLOCK
+            (N × K) float64, each response's reward: its node's score, -inf without an EVOLVE-BLOCK
         """
-        C, K = self.config.C, self.config.K
+        N, K = self.config.N, self.config.K
         nodes, pendings = [], []  # nodes: each response's node, None without an EVOLVE-BLOCK
-        for (c, _), response in zip(itertools.product(range(C), range(K)), responses):
+        for (c, _), response in zip(itertools.product(range(N), range(K)), responses):
             code, _ = extract_code_detailed(response, self.evolve_context)
             if code is None:
                 pendings.append(self.selector.on_generation_failed(gen_ids[c]))
@@ -150,12 +150,12 @@ class Trainer(BaseTrainer):
 
     def run(self):
         """Runs config.L steps of SimpleTES from the seed program."""
-        L, C, K, N = self.config.L, self.config.C, self.config.K, self.config.N
+        L, N, K, E = self.config.L, self.config.N, self.config.K, self.config.E
         self.add_init_program()
         for l in range(L):
             selections = []
-            for _ in range(C):
-                in_contexts, failure_patterns, chain_idx = self.selector.select(self.db, N, stats=None, eval_concurrency=0, backpressure_multiplier=0)
+            for _ in range(N):
+                in_contexts, failure_patterns, chain_idx = self.selector.select(self.db, E, stats=None, eval_concurrency=0, backpressure_multiplier=0)
                 gen_id = self.generator.next_gen_id()
                 self.selector.register_batch(gen_id, chain_idx, [node.id for node in in_contexts], K)
                 selections.append((in_contexts, failure_patterns, chain_idx, gen_id))
@@ -163,7 +163,7 @@ class Trainer(BaseTrainer):
             prompts, responses = self.generate(all_in_contexts, all_failure_patterns)
             rewards = self.commit(all_in_contexts, chain_idxs, gen_ids, prompts, responses)
 
-            objective_evaluations = (l + 1) * C * K
+            objective_evaluations = (l + 1) * N * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
             self.log_responses(objective_evaluations=objective_evaluations, rewards=rewards, responses=responses)
 

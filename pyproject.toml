@@ -12,6 +12,7 @@ dependencies = [
     "transformers==5.19.*",
     "wandb",
     "ml-collections",
+    "math-verify==0.9.*",
     "pandas",
     "matplotlib",
     "numpy",
@@ -33,7 +34,10 @@ dependencies = [
     "rdkit",
     "meeko",
     "gemmi",  # meeko imports it without depending on it
-    "vina",
+    "vina>=1.2.4",
+
+    # Math
+    "math-verify",
 ]
 
 [tool.pixi.workspace]
@@ -56,7 +60,7 @@ torchvision = { version = "==0.29.*", index = "https://download.pytorch.org/whl/
 torchaudio = { version = "*", env-markers = "sys_platform == 'never'" }
 
 [tool.pixi.activation.env]
-LD_LIBRARY_PATH = "$CONDA_PREFIX/cuda-compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+LD_LIBRARY_PATH = "$CONDA_PREFIX/cuda-compat:$CONDA_PREFIX/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 PYTHONPATH = "$PIXI_WORKSPACE_ROOT:$PIXI_WORKSPACE_ROOT/packages/SimpleTES"
 
 # Uni-Dock gets its own environment because conda-forge builds it for CUDA 12 only.

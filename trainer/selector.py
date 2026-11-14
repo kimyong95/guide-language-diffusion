@@ -1,4 +1,4 @@
-"""Selectors over C chains of responses: Rpucg of in-context examples, for SimpleTES's RPUCG, and PromptsRewards of a
+"""Selectors over N chains of responses: Rpucg of in-context examples, for SimpleTES's RPUCG, and PromptsRewards of a
 chain's guide prompts."""
 
 import collections
@@ -12,10 +12,10 @@ GAMMA = 0.8
 
 
 class Rpucg:
-    """SimpleTES's RPUCG policy: C chains over one population of responses of finite reward, each chain's history
+    """SimpleTES's RPUCG policy: N chains over one population of responses of finite reward, each chain's history
     rooted at the seed and holding its best response of every batch with any finite reward.
 
-    A chain's in-context examples are up to N of its history's nodes s by Q(s) + PUCT_C P(s) √(1 + T) / (1 + n(s)),
+    A chain's in-context examples are up to E of its history's nodes s by Q(s) + PUCT_C P(s) √(1 + T) / (1 + n(s)),
     picked greedily, each pick excluding its parents and children from the rest. P and Q are the percentile ranks, over
     the population, of the reward r and of V(s) = max(r(s), GAMMA max_children V); T is the chain's batches so far and
     n(s) the times s was among its in-context examples, both counting batches whose rewards are all non-finite.
@@ -25,22 +25,22 @@ class Rpucg:
         rewards: list (S) of float
         all_parents: list (S) of list of int, each response's parents
         all_children: list (S) of list of int, each response's children
-        histories: list (C) of list of int, each chain's nodes, of finite reward
-        all_visits: list (C) of collections.Counter, each chain's n
-        expansions: list (C) of int, each chain's T
+        histories: list (N) of list of int, each chain's nodes, of finite reward
+        all_visits: list (N) of collections.Counter, each chain's n
+        expansions: list (N) of int, each chain's T
     """
 
-    def __init__(self, response, reward, C):
+    def __init__(self, response, reward, N):
         """
         Args:
             response: str, the seed
             reward: float, finite, the seed's
-            C: int, chains
+            N: int, chains
         """
         self.responses, self.rewards, self.all_parents, self.all_children = [response], [reward], [[]], [[]]
-        self.histories = [[0] for _ in range(C)]
-        self.all_visits = [collections.Counter() for _ in range(C)]
-        self.expansions = [0] * C
+        self.histories = [[0] for _ in range(N)]
+        self.all_visits = [collections.Counter() for _ in range(N)]
+        self.expansions = [0] * N
 
     @staticmethod
     def percentile_ranks(values):
@@ -54,14 +54,14 @@ class Rpucg:
         """
         return torch.searchsorted(values.sort().values, values) / len(values)
 
-    def select(self, N):
+    def select(self, E):
         """Each chain's in-context examples.
 
         Args:
-            N: int, in-context examples per chain at most
+            E: int, in-context examples per chain at most
 
         Returns:
-            list (C) of list of int, each chain's in-context examples, best first
+            list (N) of list of int, each chain's in-context examples, best first
         """
         values = list(self.rewards)
         for s in reversed(range(len(values))):
@@ -75,7 +75,7 @@ class Rpucg:
             scores = {s: Q[s] + PUCT_C * P[s] * math.sqrt(1 + T) / (1 + visits[s]) for s in history}
             in_contexts, excluded = [], set()
             for s in sorted(history, key=scores.get, reverse=True):
-                if len(in_contexts) == N:
+                if len(in_contexts) == E:
                     break
                 if s not in excluded:
                     in_contexts.append(s)
@@ -88,9 +88,9 @@ class Rpucg:
         appends its best of them to its history and counts the batch, a batch of no finite reward included.
 
         Args:
-            all_in_contexts: list (C) of list of int, from select
-            all_responses: list (C) of list (K) of str
-            all_rewards: list (C) of list (K) of float
+            all_in_contexts: list (N) of list of int, from select
+            all_responses: list (N) of list (K) of str
+            all_rewards: list (N) of list (K) of float
         """
         for c, (in_contexts, responses, rewards) in enumerate(zip(all_in_contexts, all_responses, all_rewards)):
             children = []

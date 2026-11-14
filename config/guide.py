@@ -12,7 +12,8 @@ def get_config():
     config.L = 100
 
     config.N = 5    # number of distributions
-    config.M = 100   # dataset size
+    config.E = 3    # number of in-context examples
+    config.M = 10   # number of recent steps in the dataset
     config.K = 32   # number of new samples
 
     config.model = ml_collections.ConfigDict()

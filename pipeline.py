@@ -207,9 +207,8 @@ class Pipeline:
         return torch.tensor(log_P, dtype=torch.float64).view(len(prompts), len(responses)), torch.tensor([len(response) for response in response_tokens])
 
     def group_generate(self, all_prompts, all_utilities):
-        """Samples one response per group of prompts, each token from log p_B + Σ_{g_k > 0} g_k Δ_k +
-        min(Σ_{g_k < 0} g_k Δ_k, 0) under the pipeline's sampling_params, each response filling max_total_tokens with
-        the group's longest prompt at most.
+        """Samples one response per group of prompts, each token from log p_B + Σ_k g_k Δ_k under the pipeline's
+        sampling_params, each response filling max_total_tokens with the group's longest prompt at most.
 
         Over a group of G prompts, p_k is the model under prompt k after its repetition and presence penalties, the base
         log p_B = (1/G) Σ_k log p_k, Δ_k = log p_k - log p_B and g_k = W_k - 1/G, W being extend_sglang's weights of the
