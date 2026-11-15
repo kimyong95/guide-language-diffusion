@@ -14,7 +14,7 @@ def get_config():
     config.N = 5    # number of distributions
     config.E = 3    # number of in-context examples
     config.M = 10   # number of recent steps in the dataset
-    config.K = 32   # number of new samples
+    config.K = 16   # number of new samples
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"
