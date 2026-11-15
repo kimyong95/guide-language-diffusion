@@ -45,6 +45,11 @@ QUANT_MODELS = {
         "fp8": "Qwen/Qwen3.5-4B",
         "nvfp4": "Qwen/Qwen3.5-4B",
     },
+    "qwen3.5-9b": {
+        "int4": "Qwen/Qwen3.5-9B",
+        "fp8": "Qwen/Qwen3.5-9B",
+        "nvfp4": "Qwen/Qwen3.5-9B",
+    },
 }
 
 # Qwen's recommended sampling parameters for general tasks, from each model's card on Hugging Face.
