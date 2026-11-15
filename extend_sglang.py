@@ -77,13 +77,14 @@ def weights(utilities):
 
 
 class GroupLogitProcessor(CustomLogitProcessor):
-    """Samples each group's next token from its guided log probabilities under the group's sampling parameters, as
-    SGLang's Sampler samples a request's, and leaves it the only finite logit in each of the group's rows.
+    """Samples each group's next token from its guided probabilities under the group's sampling parameters, as SGLang's
+    Sampler samples a request's, and leaves it the only finite logit in each of the group's rows.
 
-    The guided log probabilities are log p_B + Σ_k g_k Δ_k: p_k the model
-    under the group's request k, the base log p_B = (1/G) Σ_k log p_k over its G requests, Δ_k = log p_k - log p_B and
-    g_k = W_k - 1/G, W being weights of the requests' utilities. A row's custom_params hold its group, the group's size
-    G and its request's utility.
+    The guided probabilities are guide-new.md's per-token mixture max(0, Σ_k W_k p_k), renormalized: p_k the model under
+    the group's request k, after SGLang's penalties and before any temperature, top-k, top-p or min-p, and W the weights
+    of the group's requests' utilities, summing to 1 and possibly negative. The temperature, top-k, top-p and min-p then
+    apply to the guided probabilities. A row's custom_params hold its group, the group's size G and its request's
+    utility.
     """
 
     def __call__(self, logits, custom_param_list):
@@ -109,20 +110,18 @@ class GroupLogitProcessor(CustomLogitProcessor):
         if any(len(members) != custom_param_list[members[0]]["size"] for members in groups.values()):
             raise RuntimeError(f"groups split across batches, requests per group: { {group: len(members) for group, members in groups.items()} }")
 
-        rows_group, guidance = [0] * len(rows), [0.0] * len(rows)
+        rows_group, row_weights = [0] * len(rows), [0.0] * len(rows)
         for g, members in enumerate(groups.values()):
             for i, weight in zip(members, weights([custom_param_list[i]["utility"] for i in members])):
-                rows_group[i], guidance[i] = g, weight - 1 / len(members)
+                rows_group[i], row_weights[i] = g, weight
         all_sampling_params = [custom_param_list[members[0]]["__req__"].sampling_params for members in groups.values()]
         temperatures = torch.tensor([sampling_params.temperature for sampling_params in all_sampling_params], device=logits.device)
         # Every TP rank samples on its own, so this must be deterministic.
         rows_group = torch.tensor(rows_group, device=logits.device)
         groups_rows = torch.nn.functional.one_hot(rows_group).T.float()
-        guidance = groups_rows * torch.tensor(guidance, device=logits.device)
-        log_p = logits[rows].float().log_softmax(-1)
-        log_p_base = groups_rows @ log_p / groups_rows.sum(1, keepdim=True)
-        # Σ_k g_k Δ_k as Σ_k g_k log p_k - (Σ_k g_k) log p_B.
-        log_p_guided = (log_p_base + guidance @ log_p - guidance.sum(1, keepdim=True) * log_p_base) / temperatures[:, None]
+        groups_weights = groups_rows * torch.tensor(row_weights, device=logits.device)
+        p_guided = (groups_weights @ logits[rows].float().softmax(-1)).clamp_(min=0)
+        log_p_guided = (p_guided / p_guided.sum(1, keepdim=True)).log() / temperatures[:, None]
         tokens = sample_tokens(log_p_guided.softmax(-1), all_sampling_params)
         logits[rows] = torch.full_like(logits[rows], float("-inf")).scatter_(1, tokens[rows_group, None].long(), 0)
         return logits

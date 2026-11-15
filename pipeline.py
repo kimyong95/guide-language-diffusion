@@ -1,7 +1,7 @@
 """Generation with SGLang, tensor parallel over every visible GPU, from text prompts under the model's chat template.
 
 generate samples one response per prompt. group_generate samples one response per group of prompts, one request per
-prompt, through extend_sglang: each token is drawn from the group's guided log probabilities over its requests and
+prompt, through extend_sglang: each token is drawn from the group's guided probabilities over its requests and
 given to all of them, so they advance and stop together. Both sample under the model's SAMPLING_PARAMS of its mode,
 thinking or instruct. log_probs scores responses after prompts.
 
@@ -212,13 +212,13 @@ class Pipeline:
         return torch.tensor(log_P, dtype=torch.float64).view(len(prompts), len(responses)), torch.tensor([len(response) for response in response_tokens])
 
     def group_generate(self, all_prompts, all_utilities):
-        """Samples one response per group of prompts, each token from log p_B + Σ_k g_k Δ_k under the pipeline's
-        sampling_params, each response filling max_total_tokens with the group's longest prompt at most.
+        """Samples one response per group of prompts, each token from max(0, Σ_k W_k p_k), renormalized, under the
+        pipeline's sampling_params, each response filling max_total_tokens with the group's longest prompt at most.
 
-        Over a group of G prompts, p_k is the model under prompt k after its repetition and presence penalties, the base
-        log p_B = (1/G) Σ_k log p_k, Δ_k = log p_k - log p_B and g_k = W_k - 1/G, W being extend_sglang's weights of the
-        prompts' utilities. The temperature, top-k, top-p and min-p apply to it as they do in generate, so a group of one
-        prompt samples as generate does.
+        Over a group of G prompts, p_k is the model's next-token distribution under prompt k after its repetition and
+        presence penalties and before its temperature, and W are extend_sglang's weights of the prompts' utilities,
+        summing to 1. The temperature, top-k, top-p and min-p apply to the mixture as they do in generate, so a group
+        of one prompt samples as generate does.
 
         Args:
             all_prompts: list (B) of list (G_b) of str, each group's prompts
