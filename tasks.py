@@ -1,7 +1,6 @@
 import asyncio
 import concurrent.futures
 import functools
-import glob
 import inspect
 import math
 import multiprocessing
@@ -16,14 +15,15 @@ import shapely
 import simpletes
 import torch
 import trimesh
+from baselines.problems.problem_utils import PROBLEMS_DIR, ProblemConfig
+from baselines.problems.short.geometry.pack_circ26.evaluator import CirclePackingEvaluator
+from baselines.problems.short.geometry.pack_circ26.problem import CirclePackingProblem
 from datasets import load_dataset
 from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
-from simpletes.config import EngineConfig, resolve_eval_python, task_dir_from_evaluator_path
+from simpletes.config import EngineConfig, resolve_eval_python
 from simpletes.evaluator import EvaluatorWorker
-from simpletes.generator import Generator
 from simpletes.node import score_from_metrics
 from simpletes.utils.code_extract import EvolveBlockContext, extract_code_detailed
-from simpletes.utils.task_prep import load_task_requirements
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, truncate_error_in_metrics
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -170,176 +170,74 @@ class OpenFOAM:
 
 
 class SimpletesTask:
-    """A SimpleTES task, its problem statement, seed program, evaluator and generation prompt taken from its directory
-    under SimpleTES's datasets; subclasses only pass that directory, the name of its score and which direction of it is
-    better. Its generator builds SimpleTES's rpucg prompt.
+    """A SimpleTES task in the no-initial-information (NI) setting of Hill Sampling (Beck et al., 2026): the model sees
+    no task statement and no system prompt, only the current code under the paper's editing prompt, the seed program
+    holding the function signature in its EDIT block and the evaluation code after it.
 
-    A response's code is the seed with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's own
+    A response's code is the seed with its EDIT block replaced by the response's, merged by SimpleTES's own
     extract_code_detailed, so only the code between the markers counts. Codes are evaluated as SimpleTES's engine
-    does: its EvaluatorWorker runs the task's evaluator in a fresh subprocess per code, concurrency at a time, killed
-    after EngineConfig's eval_timeout, its error truncated to DEFAULT_METRICS_ERROR_MAX_CHARS.
+    does: its EvaluatorWorker runs the task's evaluator under SimpleTES's datasets in a fresh subprocess per code,
+    concurrency at a time, killed after EngineConfig's eval_timeout, its error truncated to
+    DEFAULT_METRICS_ERROR_MAX_CHARS.
     """
 
+    START_MARKER = "# EDIT-START"
+    END_MARKER = "# EDIT-END"
+
     PROMPT_TEMPLATE = inspect.cleandoc("""
-        Task: {instruction}
-
-        Generation instruction (must follow exactly):
-        1) Only the code between `{start_marker_line}` and `{end_marker_line}` is extracted.
-        2) The final program is reconstructed as EXACT_PREFIX + evolved_block + EXACT_SUFFIX.
-        3) Keep marker lines exactly as written.
-        4) Return one {language_name} code block that includes both EVOLVE-BLOCK markers.
-
-        EXACT_PREFIX (kept unchanged):
-        ```{code_fence_tag}
-        {prefix}
-        ```
-
-        EXACT_SUFFIX (kept unchanged):
-        ```{code_fence_tag}
-        {suffix}
-        ```
-        {available_packages_text}
-        {in_context_text}
-    """)
-
-    UNLABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
-        In-context inspiration:
-        ```{code_fence_tag}
+        Here is the current code that you are modifying:
         {code}
-        ```
 
-        Create an improved program with {better} {metric}. Try diverse approaches to solve the problem. Think outside the box.
+        Replace the current code in the edit block with the code you want to use for this plan.
+        Your answer must include these comments and must use this format:
+        # EDIT-START
+        <your_new_code>
+        # EDIT-END
     """)
 
-    LABELLED_IN_CONTEXT_TEMPLATE = inspect.cleandoc("""
-        In-context inspirations (sorted by {metric}, {better} is better):
-
-        {item}
-
-        Analyze the inspirations above and create an improved program with {better} {metric}. Try diverse approaches to solve the problem. Think outside the box.
-    """)
-
-    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
-        --- Inspiration {index} ---
-        {metric} : {score}
-        Code:
-        ```{code_fence_tag}
-        {code}
-        ```
-    """)
-
-    def __init__(self, task: str, metric: str, better: str, concurrency: int):
+    def __init__(self, task: str, init_program: str, concurrency: int):
         """
         Args:
-            task: str, the task's directory under SimpleTES's datasets, e.g. "circle_packing/circle_packing_26"
-            metric: str, the score's name in the prompts, e.g. "sum_radii"
-            better: str, "higher" or "lower", the direction of metric that the prompts ask for
+            task: str, the task's directory under SimpleTES's datasets, e.g. "circle_packing/circle_packing_26", whose
+                evaluator.py scores the codes
+            init_program: str, the seed program, its EDIT block between a START_MARKER line and an END_MARKER line
             concurrency: int, codes evaluated at once
         """
-        self.metric = metric
-        self.better = better
+        self.init_program = init_program
         self.concurrency = concurrency
 
-        # Setup paths
-        task_dir = os.path.join(os.path.dirname(os.path.dirname(simpletes.__file__)), "datasets", task)
-        self.instruction_path = os.path.join(task_dir, f"{os.path.basename(task)}.txt")
-        self.evaluator_path = os.path.join(task_dir, "evaluator.py")
-        self.init_program_path = glob.glob(os.path.join(task_dir, "init_program.*"))[0]
-
-        # Setup prompt
-        with open(self.instruction_path) as f:
-            self.instruction = f.read()
-        with open(self.init_program_path) as f:
-            self.init_program = f.read()
-        self.evolve_context = EvolveBlockContext.from_program(self.init_program)
-        config = EngineConfig(
-            init_program=self.init_program_path,
-            evaluator_path=self.evaluator_path,
-            instruction_path=self.instruction_path,
-            gen_concurrency=0,
-            selector="rpucg",
-            eval_python=resolve_eval_python(evaluator_path=self.evaluator_path, eval_venv=None),
+        prefix, _, rest = init_program.partition(self.START_MARKER)
+        _, _, suffix = rest.partition(self.END_MARKER)
+        self.evolve_context = EvolveBlockContext(
+            prefix=prefix + self.START_MARKER,
+            suffix=self.END_MARKER + suffix,
+            has_markers=True,
+            start_marker_line=self.START_MARKER,
+            end_marker_line=self.END_MARKER,
         )
-        self.generator = Generator(config, self.instruction, self.evolve_context, load_task_requirements(task_dir_from_evaluator_path(self.evaluator_path))[1])
-        self.preformat_prompt_templates()
 
-        # Setup evaluator
+        evaluator_path = os.path.join(os.path.dirname(os.path.dirname(simpletes.__file__)), "datasets", task, "evaluator.py")
         self.evaluator = EvaluatorWorker(
-            self.evaluator_path,
-            timeout=config.eval_timeout,
-            python_executable=config.eval_python,
-            target_filename=f"program{os.path.splitext(self.init_program_path)[1]}",
+            evaluator_path,
+            timeout=EngineConfig.eval_timeout,
+            python_executable=resolve_eval_python(evaluator_path=evaluator_path, eval_venv=None),
+            target_filename="program.py",
         )
-
-    def preformat_prompt_templates(self):
-        """Replaces each prompt template, on the instance, by a functools.partial of its str.format pre-filling the
-        fields that the task fixes, taking the rest: PROMPT_TEMPLATE in_context_text,
-        UNLABELLED_IN_CONTEXT_TEMPLATE code, LABELLED_IN_CONTEXT_TEMPLATE item, LABELLED_IN_CONTEXT_ITEM_TEMPLATE index,
-        score and code."""
-        packages = self.generator._available_packages
-        self.PROMPT_TEMPLATE = functools.partial(
-            self.PROMPT_TEMPLATE.format,
-            instruction=self.instruction,
-            start_marker_line=self.evolve_context.start_marker_line,
-            end_marker_line=self.evolve_context.end_marker_line,
-            language_name=self.generator._language_name,
-            code_fence_tag=self.generator._code_fence_tag,
-            prefix=self.evolve_context.prefix.rstrip("\n"),
-            suffix=self.evolve_context.suffix.rstrip("\n"),
-            available_packages_text="\nAvailable packages from requirements.txt (these are the task-local dependencies you can use):\n" + "".join(f"- {package}\n" for package in packages) if packages else "",
-        )
-        self.UNLABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.UNLABELLED_IN_CONTEXT_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag, metric=self.metric, better=self.better)
-        self.LABELLED_IN_CONTEXT_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_TEMPLATE.format, metric=self.metric, better=self.better)
-        self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE = functools.partial(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format, code_fence_tag=self.generator._code_fence_tag, metric=self.metric)
 
     def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's code as the one in-context example of its own prompt, PROMPT_TEMPLATE's
-        in_context_text by UNLABELLED_IN_CONTEXT_TEMPLATE.
+        """Each response's code as the current code of its own PROMPT_TEMPLATE.
 
         Args:
-            responses: list (G) of str, each holding the EVOLVE-BLOCK markers, e.g. [init_program]
+            responses: list (G) of str, each holding the EDIT markers, e.g. [init_program]
 
         Returns:
             list (G) of str
         """
-        prompts = []
-        for response in responses:
-            in_context_text = self.UNLABELLED_IN_CONTEXT_TEMPLATE(code=self.extract_code(response))
-            prompts.append(self.PROMPT_TEMPLATE(in_context_text=in_context_text))
-        return prompts
-
-    def score_to_metric(self, score: float) -> float:
-        """The metric of a score, the score itself; a subclass whose score is not its metric overrides this.
-
-        Args:
-            score: float, finite, from evaluate
-
-        Returns:
-            float, shown in the prompts as the metric's value
-        """
-        return score
-
-    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's code as an in-context example of one prompt, PROMPT_TEMPLATE's in_context_text
-        by LABELLED_IN_CONTEXT_TEMPLATE, each by LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score_to_metric, numbered
-        from 1 by score, highest first.
-
-        Args:
-            responses: list (G) of str, each holding the EVOLVE-BLOCK markers
-            scores: list (G) of float
-
-        Returns:
-            str
-        """
-        in_contexts = []
-        for i, (score, response) in enumerate(sorted(zip(scores, responses), key=lambda pair: pair[0], reverse=True), 1):
-            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE(index=i, score=self.score_to_metric(score), code=self.extract_code(response)))
-        in_context_text = self.LABELLED_IN_CONTEXT_TEMPLATE(item="\n\n".join(in_contexts))
-        return self.PROMPT_TEMPLATE(in_context_text=in_context_text)
+        return [self.PROMPT_TEMPLATE.format(code=self.extract_code(response)) for response in responses]
 
     def extract_code(self, response: str) -> str | None:
-        """The response's code: the seed with its EVOLVE-BLOCK replaced by the response's, stripped; None without an
-        EVOLVE-BLOCK."""
+        """The response's code: the seed with its EDIT block replaced by the response's, stripped; None without an
+        EDIT block."""
         code, _ = extract_code_detailed(response, self.evolve_context)
         return code and code.strip()
 
@@ -349,7 +247,7 @@ class SimpletesTask:
         Ctrl+C cancels every evaluate_one_async, the EvaluatorWorker killing its subprocess, then raises KeyboardInterrupt.
 
         Args:
-            responses: list (N) of str, each holding the EVOLVE-BLOCK markers, preferably within a code block
+            responses: list (N) of str, each holding the EDIT markers, preferably within a code block
 
         Returns:
             list (N), each response's evaluate_one_async
@@ -370,7 +268,7 @@ class SimpletesTask:
 
         Returns:
             float, the metrics' score_from_metrics: their combined_score, -inf on any error; the metrics are
-            {"error": ..., "combined_score": -inf} without an EVOLVE-BLOCK or when the evaluator crashes, times out or
+            {"error": ..., "combined_score": -inf} without an EDIT block or when the evaluator crashes, times out or
             raises
         """
         code, reason = extract_code_detailed(response, self.evolve_context)
@@ -388,16 +286,99 @@ class SimpletesTask:
         return score_from_metrics(metrics)
 
 
-class CirclePacking26(SimpletesTask):
+class CirclePacking:
+    """26 circles packed in the unit square for the largest sum of radii, as in Gideoni et al. (2026)'s baselines.
+
+    The prompts are the paper's own: CirclePackingProblem's minimal domain-knowledge instruction, its time limit
+    MAX_EXECUTION_TIME as in the paper's Table 1, alone for IID random sampling and the first generation of sequential
+    conditioned sampling (SCS), followed by solutions from previous attempts for SCS's later generations. There is no
+    seed program.
+
+    A response's code is its last code block. CirclePackingEvaluator runs the
+    code's pack_circles in a fresh subprocess killed after MAX_EXECUTION_TIME, concurrency at a time, and validates the
+    circles up to np.isclose; the reward is the sum_radii pack_circles returns.
+
+    Attributes:
+        problem: CirclePackingProblem, its max_execution_time MAX_EXECUTION_TIME
+        evaluator: CirclePackingEvaluator
+        instruction: str, the problem's instruction
+    """
+
+    MAX_EXECUTION_TIME = 300.0
+    CODE_BLOCK = re.compile(r"```(?:python)?\n?(.*?)```", re.DOTALL)
+    IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
+        {instruction}
+        Here are some example solutions from previous attempts, please improve on them:
+
+        {item}
+
+        Please now provide your new, better solution.
+    """)
+    IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        # Solution {index}:
+        ```
+        {code}
+        ```
+        This solution, solution {index}, got a sum of radii of {reward}.
+    """)
 
     def __init__(self, concurrency: int):
-        super().__init__("circle_packing/circle_packing_26", metric="sum_radii", better="higher", concurrency=concurrency)
+        """
+        Args:
+            concurrency: int, codes evaluated at once
+        """
+        self.concurrency = concurrency
+        config = ProblemConfig(PROBLEMS_DIR / "short/geometry/pack_circ26/config.json")
+        self.problem, self.evaluator = CirclePackingProblem(config), CirclePackingEvaluator(config)
+        self.problem.params["max_execution_time"] = self.MAX_EXECUTION_TIME
+        self.instruction = self.problem.generate_instruction()
 
+    def prompts(self) -> str:
+        """The instruction alone, the prompt of IID random sampling and of SCS's first generation."""
+        return self.instruction
 
-class CirclePacking32(SimpletesTask):
+    def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
+        """Every response's code as a solution of one IN_CONTEXT_PROMPT_TEMPLATE, each by IN_CONTEXT_ITEM_TEMPLATE
+        with its sum of radii, numbered from 1 in the given order, as the paper's
+        ProblemWithArchive.generate_instruction writes them for SCS's later generations.
 
-    def __init__(self, concurrency: int):
-        super().__init__("circle_packing/circle_packing_32", metric="sum_radii", better="higher", concurrency=concurrency)
+        Args:
+            responses: list (G) of str, G ≥ 1, each holding code
+            rewards: list (G) of float, each response's evaluate, finite
+
+        Returns:
+            str
+        """
+        in_contexts = []
+        for i, (reward, response) in enumerate(zip(rewards, responses), 1):
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, reward=reward, code=self.extract_code(response)))
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.instruction, item="\n\n\n".join(in_contexts))  # The paper leaves two blank lines between solutions.
+
+    def extract_code(self, response: str) -> str | None:
+        """The response's last code block, its python tag dropped, stripped; None without one."""
+        codes = self.CODE_BLOCK.findall(response)
+        return codes[-1].strip() if codes else None
+
+    def evaluate_one(self, code: str | None) -> float:
+        """The sum of radii the code's pack_circles returns; -inf without code, when CirclePackingEvaluator rejects it
+        or when the sum is not finite."""
+        if not code:
+            return -math.inf
+        result = self.evaluator.evaluate_algorithm(code, self.problem)
+        reward = result.metrics[self.problem.config["conf_metric_name"]]
+        return reward if result.success and math.isfinite(reward) else -math.inf
+
+    def evaluate(self, responses: list[str]) -> list[float]:
+        """Evaluates the responses' codes with evaluate_one, concurrency at a time.
+
+        Args:
+            responses: list (N) of str
+
+        Returns:
+            list (N) of float, each response's sum of radii, higher is better; -inf without code or when it fails
+        """
+        with concurrent.futures.ThreadPoolExecutor(self.concurrency) as executor:
+            return list(executor.map(self.evaluate_one, map(self.extract_code, responses)))
 
 
 class AutocorrelationSecond(SimpletesTask):
@@ -409,7 +390,11 @@ class AutocorrelationSecond(SimpletesTask):
 class Story:
     """A story pulled toward a higher score of REWARD_MODEL_NAME as the reply to USER_PROMPT.
 
-    A response's story is its last code block's, of any language. A story's reward is REWARD_MODEL_NAME's score of the
+    The prompts are PROMPT_TEMPLATE without references, for the first generation of sequential conditioned sampling
+    (SCS), and IN_CONTEXT_PROMPT_TEMPLATE with references and their rewards for its later generations. There is no seed
+    story.
+
+    A response's story is its last code block's. A story's reward is REWARD_MODEL_NAME's score of the
     chat of USER_PROMPT and the story as the assistant's reply, in its chat template without a system turn as its model
     card recommends; REWARD_MODEL_NAME is loaded on the first visible GPU at construction and scores concurrency stories
     per forward pass.
@@ -417,35 +402,25 @@ class Story:
 
     REWARD_MODEL_NAME = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
     USER_PROMPT = "Write a story in one sentence."
-    init_program = inspect.cleandoc("""
-        ```text
-        A small boat drifted slowly across the quiet lake at dawn.
-        ```
-    """)
-    PLAIN_PROMPT_TEMPLATE = inspect.cleandoc("""
-        With reference to the following story, create a new story in one sentence.
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Create a story in one sentence.
 
-        Reference:
-        ```text
-        {story}
-        ```
-
-        Write a new story (different from the references) in a ```text block.
+        Write within a ```text block.
     """)
-    LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
+    IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
         With reference to the following story with their scores, create a new story in one sentence.
 
         {item}
 
         The score is the similarity to a hidden target story. Write a new story (different from the references) to improve the score. Write within a ```text block.
     """)
-    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
-        Reference {index} (score={score:.3f}):
+    IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        Reference {index} (score={reward:.3f}):
         ```text
         {story}
         ```
     """)
-    STORY_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
+    STORY_BLOCK = re.compile(r"```(?:text)?\n?(.*?)```", re.DOTALL)
 
     def __init__(self, concurrency: int):
         """Loads REWARD_MODEL_NAME on the first visible GPU.
@@ -457,36 +432,28 @@ class Story:
         self.tokenizer = AutoTokenizer.from_pretrained(self.REWARD_MODEL_NAME)
         self.reward_model = AutoModelForSequenceClassification.from_pretrained(self.REWARD_MODEL_NAME, dtype=torch.bfloat16, num_labels=1).cuda().eval()
 
-    def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's story as the one reference of its own PLAIN_PROMPT_TEMPLATE.
+    def prompts(self) -> str:
+        """PROMPT_TEMPLATE, the prompt of SCS's first generation."""
+        return self.PROMPT_TEMPLATE
+
+    def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
+        """Every response's story as a reference of one IN_CONTEXT_PROMPT_TEMPLATE, each by IN_CONTEXT_ITEM_TEMPLATE
+        with its reward, numbered from 1 in the given order, for SCS's later generations.
 
         Args:
-            responses: list (G) of str, each holding a code block, e.g. [init_program]
-
-        Returns:
-            list (G) of str
-        """
-        return [self.PLAIN_PROMPT_TEMPLATE.format(story=self.extract_story(response)) for response in responses]
-
-    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's story as a reference of one LABELLED_PROMPT_TEMPLATE, each by
-        LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the given order.
-
-        Args:
-            responses: list (G) of str, each holding a code block
-            scores: list (G) of float
+            responses: list (G) of str, G ≥ 1, each holding a code block
+            rewards: list (G) of float, each response's evaluate, finite
 
         Returns:
             str
         """
         in_contexts = []
-        for i, (score, response) in enumerate(zip(scores, responses), 1):
-            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, story=self.extract_story(response)))
-        return self.LABELLED_PROMPT_TEMPLATE.format(item="\n\n".join(in_contexts))
+        for i, (reward, response) in enumerate(zip(rewards, responses), 1):
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, reward=reward, story=self.extract_story(response)))
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(item="\n\n".join(in_contexts))
 
     def extract_story(self, response: str) -> str | None:
-        """The response's last code block, of any language, stripped, its closing fence optional at the end; None
-        without one or when it is empty."""
+        """The response's last code block, its text tag dropped, stripped; None without one or when it is empty."""
         stories = self.STORY_BLOCK.findall(response)
         return (stories[-1].strip() or None) if stories else None
 
@@ -663,6 +630,10 @@ class GepaAime2025:
 class Docking:
     """Scores molecules by negated AutoDock Vina affinity against TDC's receptor and search box.
 
+    The prompts are PROMPT_TEMPLATE without references, for the first generation of sequential conditioned sampling
+    (SCS), and IN_CONTEXT_PROMPT_TEMPLATE with references and their rewards for its later generations. There is no seed
+    molecule.
+
     Each response's last code block supplies a SMILES, canonicalized before caching. Workers embed it in 3D,
     converge MMFF optimization within 1,000 iterations, prepare it with Meeko, and return minus the best docked
     pose's energy in kcal/mol.
@@ -689,35 +660,25 @@ class Docking:
     EXHAUSTIVENESS = 8
     N_POSES = 10
     SEED = 1
-    init_program = inspect.cleandoc("""
-        ```smiles
-        CC(C)(C)c1ccc2occ(CC(=O)Nc3ccccc3F)c2c1
-        ```
-    """)
-    PLAIN_PROMPT_TEMPLATE = inspect.cleandoc("""
-        With reference to the following molecule, propose a new molecule that binds {protein} more strongly.
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Propose a molecule that binds {protein} as strongly as possible.
 
-        Reference:
-        ```smiles
-        {molecule}
-        ```
-
-        Write the new molecule's SMILES within a ```smiles block.
+        Write the molecule's SMILES within a ```smiles block.
     """)
-    LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
+    IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
         With reference to the following molecules, propose a new molecule that binds {protein} more strongly.
 
         {item}
 
-        The score is minus the AutoDock Vina docking score against {protein}, in kcal/mol, so a higher score is a more strongly bound molecule. Analyze the references with their scores, then write a new molecule (different from the references), either by crossover and mutation of the references or from your own chemical knowledge, within a ```smiles block.
+        The score is minus the AutoDock Vina docking score against {protein}, in kcal/mol, so a higher score is a more strongly bound molecule. Analyze the references with their scores, then write a new molecule (different from the references), either by crossover and mutation of the references or from your own chemical knowledge. Write the molecule's SMILES within a ```smiles block.
     """)
-    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+    IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
         Reference {index} (score={score:.2f}):
         ```smiles
         {molecule}
         ```
     """)
-    MOLECULE_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
+    MOLECULE_BLOCK = re.compile(r"```(?:smiles)?\n?(.*?)```", re.DOTALL)
 
     def __init__(self, concurrency: int):
         """Loads TDC's receptor and creates a pool that starts workers on the first evaluation.
@@ -748,32 +709,25 @@ class Docking:
         cls.vina.set_receptor(rigid_pdbqt_filename=receptor)
         cls.vina.compute_vina_maps(center=list(box["center"]), box_size=list(box["size"]))
 
-    def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's molecule as the one reference of its own PLAIN_PROMPT_TEMPLATE.
+    def prompts(self) -> str:
+        """PROMPT_TEMPLATE, the prompt of SCS's first generation."""
+        return self.PROMPT_TEMPLATE.format(protein=self.PROTEIN)
+
+    def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
+        """Every response's molecule as a reference of one IN_CONTEXT_PROMPT_TEMPLATE, each by
+        IN_CONTEXT_ITEM_TEMPLATE with its reward, numbered from 1 in the given order, for SCS's later generations.
 
         Args:
-            responses: list (G) of str, each holding a code block, e.g. [init_program]
-
-        Returns:
-            list (G) of str
-        """
-        return [self.PLAIN_PROMPT_TEMPLATE.format(protein=self.PROTEIN, molecule=self.extract_molecule(response)) for response in responses]
-
-    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's molecule as a reference of one LABELLED_PROMPT_TEMPLATE, each by
-        LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the given order.
-
-        Args:
-            responses: list (G) of str, each holding a code block
-            scores: list (G) of float
+            responses: list (G) of str, G ≥ 1, each holding a code block
+            rewards: list (G) of float, each response's evaluate, finite
 
         Returns:
             str
         """
         in_contexts = []
-        for i, (score, response) in enumerate(zip(scores, responses), 1):
-            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, molecule=self.extract_molecule(response)))
-        return self.LABELLED_PROMPT_TEMPLATE.format(protein=self.PROTEIN, item="\n\n".join(in_contexts))
+        for i, (reward, response) in enumerate(zip(rewards, responses), 1):
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=reward, molecule=self.extract_molecule(response)))
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(protein=self.PROTEIN, item="\n\n".join(in_contexts))
 
     def extract_molecule(self, response: str) -> str | None:
         """Returns canonical SMILES from the last code block, or None for missing or invalid molecules.
@@ -864,8 +818,7 @@ class DockingAdenosineA2A(Docking):
 
 TASKS_CLS = {
     "openfoam": OpenFOAM,
-    "circle-packing-26": CirclePacking26,
-    "circle-packing-32": CirclePacking32,
+    "circle-packing-26": CirclePacking,
     "autocorrelation-second": AutocorrelationSecond,
     "story": Story,
     "gepa-aime-2025": GepaAime2025,

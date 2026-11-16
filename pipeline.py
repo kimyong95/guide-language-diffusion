@@ -20,6 +20,7 @@ from sglang.srt.utils.common import get_device_sm
 from extend_sglang import GroupEngine, GroupLogitProcessor
 
 QUANT_MODELS = {
+    # tasks: circle packing
     "qwen-coder-next": {
         "int4": "inference-optimization/Qwen3-Coder-Next.w4a16",
         "fp8": "Qwen/Qwen3-Coder-Next-FP8",
@@ -40,6 +41,7 @@ QUANT_MODELS = {
         "fp8": "Qwen/Qwen3.8-27B-FP8",
         "nvfp4": "nvidia/Qwen3.8-27B-NVFP4",
     },
+    # tasks: story
     "qwen3.5-4b": {
         "int4": "Qwen/Qwen3.5-4B",
         "fp8": "Qwen/Qwen3.5-4B",
