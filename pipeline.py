@@ -102,12 +102,12 @@ def kv_cache(engine):
 class Pipeline:
     """Generation with SGLang, tensor parallel over every visible GPU, its KV cache held only while generating."""
 
-    def __init__(self, model_name, max_total_tokens, enable_thinking=False, reasoning_effort=None, seed=0, **kwargs):
+    def __init__(self, model_name, max_new_tokens, enable_thinking=False, reasoning_effort=None, seed=0, **kwargs):
         """Loads the model, sampling under its SAMPLING_PARAMS of the mode enable_thinking picks.
 
         Args:
             model_name: str, a QUANT_MODELS and SAMPLING_PARAMS name
-            max_total_tokens: int, bound on a prompt and its response together
+            max_new_tokens: int, bound on a response
             enable_thinking: bool, Qwen's chat-template switch; False raises for thinking-only templates that ignore it
             reasoning_effort: str | None, Qwen's chat-template thinking budget, e.g. "medium"; None leaves the
                 template's default
@@ -117,14 +117,13 @@ class Pipeline:
         Raises:
             KeyError: SAMPLING_PARAMS has no such model, or not its mode
         """
-        self.max_total_tokens = max_total_tokens
+        self.max_new_tokens = max_new_tokens
         self.enable_thinking = enable_thinking
         self.reasoning_effort = reasoning_effort
         self.sampling_params = SAMPLING_PARAMS[model_name]["thinking" if enable_thinking else "instruct"]
         self.engine = GroupEngine(
             model_path=model_path(model_name),
             tp_size=torch.cuda.device_count(),
-            context_length=max_total_tokens + 2,  # SGLang caps a prompt and its response together at context_length - 2
             random_seed=seed,
             enable_custom_logit_processor=True,
             disable_radix_cache=True,
@@ -173,8 +172,7 @@ class Pipeline:
         return answer if think_end else ""
 
     def generate(self, prompts, system_prompts=None, sampling_params=None):
-        """Samples one response per prompt under the pipeline's sampling_params, each filling max_total_tokens with its
-        prompt at most.
+        """Samples one response per prompt under the pipeline's sampling_params, each of max_new_tokens at most.
 
         Args:
             prompts: list (N) of str
@@ -188,7 +186,7 @@ class Pipeline:
         with kv_cache(self.engine):
             outputs = self.engine.generate(
                 input_ids=prompt_tokens,
-                sampling_params=[{**self.sampling_params, **(sampling_params or {}), "max_new_tokens": self.max_total_tokens - len(tokens)} for tokens in prompt_tokens],
+                sampling_params={**self.sampling_params, **(sampling_params or {}), "max_new_tokens": self.max_new_tokens},
             )
         return [self.strip_thinking(output["text"]) for output in outputs]
 
@@ -219,7 +217,7 @@ class Pipeline:
 
     def group_generate(self, all_prompts, all_utilities, mixture_mode):
         """Samples one response per group of prompts, each token from the group's mixture_mode mixture under the
-        pipeline's sampling_params, each response filling max_total_tokens with the group's longest prompt at most.
+        pipeline's sampling_params, each response of max_new_tokens at most.
 
         Over a group of G prompts, p_k is the model's next-token distribution under prompt k after its repetition and
         presence penalties and before its temperature, and W are extend_sglang's weights of the prompts' utilities,
@@ -247,9 +245,8 @@ class Pipeline:
             group_starts.append(len(input_ids))
             input_ids += prompt_tokens
             custom_params = {"group": uuid.uuid4().hex, "size": len(prompts), "mixture_mode": mixture_mode}
-            max_new_tokens = self.max_total_tokens - max(map(len, prompt_tokens))
             sampling_params += [
-                {**self.sampling_params, "max_new_tokens": max_new_tokens, "custom_params": {**custom_params, "utility": utility}}
+                {**self.sampling_params, "max_new_tokens": self.max_new_tokens, "custom_params": {**custom_params, "utility": utility}}
                 for utility in utilities
             ]
         with kv_cache(self.engine):

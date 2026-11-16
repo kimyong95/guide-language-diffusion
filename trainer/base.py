@@ -40,7 +40,7 @@ class BaseTrainer:
     def setup_pipeline(self, **kwargs):
         """Builds config.model's SGLang pipeline; kwargs go to sglang.Engine."""
         cfg = self.config.model
-        self.pipeline = Pipeline(cfg.name, cfg.max_total_tokens, enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort, seed=self.config.seed, **kwargs)
+        self.pipeline = Pipeline(cfg.name, cfg.max_new_tokens,enable_thinking=cfg.enable_thinking, reasoning_effort=cfg.reasoning_effort, seed=self.config.seed, **kwargs)
         self.task.pipeline = self.pipeline
 
     def log_code(self):

@@ -16,7 +16,7 @@ def get_config():
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"
-    config.model.max_total_tokens = 100000
+    config.model.max_new_tokens = 8192
     config.model.enable_thinking = False
     config.model.reasoning_effort = "medium"
 
