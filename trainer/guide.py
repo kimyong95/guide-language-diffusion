@@ -63,7 +63,7 @@ class Trainer(BaseTrainer):
                 q = (log_P / T).softmax(1)
                 r_hat = q @ r
 
-            responses = self.pipeline.group_generate([prompts] * K, [r_hat.tolist()] * K)
+            responses = self.pipeline.group_generate([prompts] * K, [r_hat.tolist()] * K, "sum")
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
             for response, reward in zip(responses, rewards.tolist()):
                 if math.isfinite(reward):

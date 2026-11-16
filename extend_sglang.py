@@ -76,15 +76,51 @@ def weights(utilities):
     return [1 / G + math.sqrt(G - 1 / G) * (u - mean) / norm for u in utilities]
 
 
+def sum_guided_log_probs(logits, groups_weights):
+    """Each group's log of guide.md's sum mixture max(0, Σ_k W_k p_k), renormalized.
+
+    Args:
+        logits: (B, V), one row per request
+        groups_weights: (H, B) float, a group's weight W_k at each of its rows, 0 elsewhere, H groups
+
+    Returns:
+        (H, V) float
+    """
+    p_guided = (groups_weights @ logits.float().softmax(-1)).clamp_(min=0)
+    return (p_guided / p_guided.sum(1, keepdim=True)).log()
+
+
+def product_guided_log_probs(logits, groups_rows, groups_weights):
+    """Each group's guide.md product mixture Π_k p_k^(W_k) as the unnormalized log probabilities
+    log p_B + Σ_{g_k > 0} g_k Δ_k + min(Σ_{g_k < 0} g_k Δ_k, 0), the negative guidance clipped to lower probabilities only.
+
+    Over a group's G rows, the base log p_B = (1/G) Σ_k log p_k, Δ_k = log p_k - log p_B and g_k = W_k - 1/G.
+
+    Args:
+        logits: (B, V), one row per request
+        groups_rows: (H, B) float, 1 at a group's rows, 0 elsewhere, H groups
+        groups_weights: (H, B) float, a group's weight W_k at each of its rows, 0 elsewhere
+
+    Returns:
+        (H, V) float
+    """
+    log_p = logits.float().log_softmax(-1)
+    log_p_base = groups_rows @ log_p / groups_rows.sum(1, keepdim=True)
+    guidance = groups_weights - groups_rows / groups_rows.sum(1, keepdim=True)
+    # Σ_k g_k Δ_k as Σ_k g_k log p_k - (Σ_k g_k) log p_B, over the positive and over the negative g_k.
+    guidance_positive, guidance_negative = (g @ log_p - g.sum(1, keepdim=True) * log_p_base for g in (guidance.clamp(min=0), guidance.clamp(max=0)))
+    return log_p_base + guidance_positive + guidance_negative.clamp(max=0)
+
+
 class GroupLogitProcessor(CustomLogitProcessor):
     """Samples each group's next token from its guided probabilities under the group's sampling parameters, as SGLang's
     Sampler samples a request's, and leaves it the only finite logit in each of the group's rows.
 
-    The guided probabilities are guide-new.md's per-token mixture max(0, Σ_k W_k p_k), renormalized: p_k the model under
-    the group's request k, after SGLang's penalties and before any temperature, top-k, top-p or min-p, and W the weights
-    of the group's requests' utilities, summing to 1 and possibly negative. The temperature, top-k, top-p and min-p then
-    apply to the guided probabilities. A row's custom_params hold its group, the group's size G and its request's
-    utility.
+    The guided probabilities are the group's mixture_mode mixture of p_k, the model under the group's request k, after
+    SGLang's penalties and before any temperature, top-k, top-p or min-p, with W the weights of the group's requests'
+    utilities, summing to 1 and possibly negative: "sum" by sum_guided_log_probs, "product" by
+    product_guided_log_probs. The temperature, top-k, top-p and min-p then apply to the guided probabilities. A row's
+    custom_params hold its group, the group's size G and mixture_mode, and its request's utility.
     """
 
     def __call__(self, logits, custom_param_list):
@@ -115,13 +151,22 @@ class GroupLogitProcessor(CustomLogitProcessor):
             for i, weight in zip(members, weights([custom_param_list[i]["utility"] for i in members])):
                 rows_group[i], row_weights[i] = g, weight
         all_sampling_params = [custom_param_list[members[0]]["__req__"].sampling_params for members in groups.values()]
+        mixture_modes = [custom_param_list[members[0]]["mixture_mode"] for members in groups.values()]
         temperatures = torch.tensor([sampling_params.temperature for sampling_params in all_sampling_params], device=logits.device)
         # Every TP rank samples on its own, so this must be deterministic.
         rows_group = torch.tensor(rows_group, device=logits.device)
         groups_rows = torch.nn.functional.one_hot(rows_group).T.float()
         groups_weights = groups_rows * torch.tensor(row_weights, device=logits.device)
-        p_guided = (groups_weights @ logits[rows].float().softmax(-1)).clamp_(min=0)
-        log_p_guided = (p_guided / p_guided.sum(1, keepdim=True)).log() / temperatures[:, None]
+        log_p_guided = torch.empty(len(groups), logits.shape[1], device=logits.device)
+        for mixture_mode in set(mixture_modes):
+            selected = torch.tensor([mode == mixture_mode for mode in mixture_modes], device=logits.device)
+            if mixture_mode == "sum":
+                log_p_guided[selected] = sum_guided_log_probs(logits[rows], groups_weights[selected])
+            elif mixture_mode == "product":
+                log_p_guided[selected] = product_guided_log_probs(logits[rows], groups_rows[selected], groups_weights[selected])
+            else:
+                raise NotImplementedError(f"Mixture mode {mixture_mode} not implemented")
+        log_p_guided = log_p_guided / temperatures[:, None]
         tokens = sample_tokens(log_p_guided.softmax(-1), all_sampling_params)
         logits[rows] = torch.full_like(logits[rows], float("-inf")).scatter_(1, tokens[rows_group, None].long(), 0)
         return logits

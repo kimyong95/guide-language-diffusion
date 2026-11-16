@@ -73,6 +73,10 @@ SAMPLING_PARAMS = {
         "thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
         "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
     },
+    "qwen3.5-9b": {
+        "thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+        "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+    },
 }
 
 
@@ -213,28 +217,36 @@ class Pipeline:
         log_P = [sum(logprob for logprob, _, _ in output["meta_info"]["input_token_logprobs"][1:]) for output in outputs]
         return torch.tensor(log_P, dtype=torch.float64).view(len(prompts), len(responses)), torch.tensor([len(response) for response in response_tokens])
 
-    def group_generate(self, all_prompts, all_utilities):
-        """Samples one response per group of prompts, each token from max(0, Σ_k W_k p_k), renormalized, under the
+    def group_generate(self, all_prompts, all_utilities, mixture_mode):
+        """Samples one response per group of prompts, each token from the group's mixture_mode mixture under the
         pipeline's sampling_params, each response filling max_total_tokens with the group's longest prompt at most.
 
         Over a group of G prompts, p_k is the model's next-token distribution under prompt k after its repetition and
         presence penalties and before its temperature, and W are extend_sglang's weights of the prompts' utilities,
-        summing to 1. The temperature, top-k, top-p and min-p apply to the mixture as they do in generate, so a group
-        of one prompt samples as generate does.
+        summing to 1. The mixture is max(0, Σ_k W_k p_k), renormalized, for "sum", and Π_k p_k^(W_k) with its negative
+        guidance clipped to lower probabilities only for "product", as extend_sglang's GroupLogitProcessor samples. The
+        temperature, top-k, top-p and min-p apply to the mixture as they do in generate, so a group of one prompt
+        samples as generate does.
 
         Args:
             all_prompts: list (B) of list (G_b) of str, each group's prompts
             all_utilities: list (B) of list (G_b) of float, finite, each group's prompts' utilities
+            mixture_mode: str, "sum" or "product"
 
         Returns:
             list (B) of str, each response after strip_thinking
+
+        Raises:
+            NotImplementedError: mixture_mode is neither "sum" nor "product"
         """
+        if mixture_mode not in ("sum", "product"):
+            raise NotImplementedError(f"Mixture mode {mixture_mode} not implemented")
         input_ids, sampling_params, group_starts = [], [], []
         for prompts, utilities in zip(all_prompts, all_utilities):
             prompt_tokens = self.apply_chat_template(prompts, enable_thinking=self.enable_thinking, reasoning_effort=self.reasoning_effort)
             group_starts.append(len(input_ids))
             input_ids += prompt_tokens
-            custom_params = {"group": uuid.uuid4().hex, "size": len(prompts)}
+            custom_params = {"group": uuid.uuid4().hex, "size": len(prompts), "mixture_mode": mixture_mode}
             max_new_tokens = self.max_total_tokens - max(map(len, prompt_tokens))
             sampling_params += [
                 {**self.sampling_params, "max_new_tokens": max_new_tokens, "custom_params": {**custom_params, "utility": utility}}

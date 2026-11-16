@@ -14,6 +14,7 @@ def get_config():
     config.N = 5    # number of distributions
     config.E = 3    # number of in-context examples
     config.C = 8    # number of independent runs
+    config.mixture_mode = "sum"  # "sum" or "product"
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"
