@@ -6,7 +6,7 @@ def get_config():
     config.seed = 0
     config.run_name = "simpletes"
     config.task = ml_collections.ConfigDict()
-    config.task.name = "circle-packing-26"
+    config.task.name = "circle-packing"
     config.task.concurrency = 64
 
     config.L = 100

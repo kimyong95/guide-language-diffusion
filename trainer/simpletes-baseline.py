@@ -1,6 +1,6 @@
 """Runs SimpleTES on config.task.name's seed program with config.model.name inside SGLang, in synchronous steps.
 
-config.task.name names a tasks.py SimpleTES task, e.g. "circle-packing-26", whose seed program, SimpleTES generator, for
+config.task.name names a tasks.py SimpleTES task, e.g. "circle-packing", whose seed program, SimpleTES generator, for
 prompts, and EvaluatorWorker, built as SimpleTES's engine builds them, the trainer takes. A response's code is the seed
 with its EVOLVE-BLOCK replaced by the response's, merged by SimpleTES's extract_code_detailed. The task's evaluate, its
 evaluate_one_async replaced by the trainer's to return metrics, runs each code's EvaluatorWorker in a fresh subprocess,

@@ -818,7 +818,7 @@ class DockingAdenosineA2A(Docking):
 
 TASKS_CLS = {
     "openfoam": OpenFOAM,
-    "circle-packing-26": CirclePacking,
+    "circle-packing": CirclePacking,
     "autocorrelation-second": AutocorrelationSecond,
     "story": Story,
     "gepa-aime-2025": GepaAime2025,
@@ -830,7 +830,7 @@ TASKS_CLS = {
 def get_reward_fn(task_name: str, concurrency: int):
     """
     Args:
-        task_name: str, a TASKS_CLS name, e.g. "circle-packing-26"
+        task_name: str, a TASKS_CLS name, e.g. "circle-packing"
         concurrency: int, the task's evaluations at once
     """
     return TASKS_CLS[task_name](concurrency=concurrency)
