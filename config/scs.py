@@ -10,10 +10,9 @@ def get_config():
     config.task.concurrency = 64
 
     config.L = 25   # number of steps
-    config.K = 64   # number of new samples per run
+    config.K = 64   # number of new samples per step
     config.E = 3    # number of in-context examples
-    config.selection_policy = "random"  # "random" or "greedy"
-    config.C = 8    # number of independent runs
+    config.selection_policy = "random"  # "random", "best" or "best+random"
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-coder-next"

@@ -1,15 +1,14 @@
 """Searches config.task.name's programs toward a higher reward by sequential conditioned sampling (SCS, Gideoni et al.,
-2026) with config.model.name inside SGLang, no training, in config.C independent runs.
+2026) with config.model.name inside SGLang, no training.
 
-Run c's dataset is its responses of finite reward of its latest step that has any, with their rewards, empty at first.
-Every one of config.L steps samples config.K responses per run under the pipeline's sampling parameters, all C × K in
-one generate call, and evaluates each once: each to the task's prompts while its run's dataset is empty, otherwise to
-its prompts_with_rewards of up to config.E in-context examples selected from that dataset by config.selection_policy,
-"random" as the paper does or "greedy". A run's step without a response of finite reward keeps its dataset, so its next
-step selects from it again, as the paper retries such a generation.
+The dataset is the responses of finite reward of the latest step that has any, with their rewards, empty at first.
+Every one of config.L steps samples config.K responses under the pipeline's sampling parameters, all K in one generate
+call, and evaluates each once: each to the task's prompts while the dataset is empty, otherwise to its
+prompts_with_rewards of up to config.E in-context examples selected from the dataset by config.selection_policy,
+"random" as the paper does, "best" or "best+random". A step without a response of finite reward keeps the dataset, so
+the next step selects from it again, as the paper retries such a generation.
 
-Each step logs every reward and response to wandb, -inf and "" included, response idx belonging to run idx // K, the
-objective evaluations counting all runs.
+Each step logs every reward and response to wandb, -inf and "" included.
 
 Usage: CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=. python trainer/scs.py --config config/scs.py
 """
@@ -32,49 +31,49 @@ class Trainer(BaseTrainer):
 
     def select_in_contexts(self, dataset: list) -> list:
         """The dataset's in-context examples under config.selection_policy: config.E of them drawn at random without
-        replacement, or those of the config.E highest distinct rewards, highest first, an earlier one kept on ties.
+        replacement for "random", those of the config.E highest rewards, highest first, for "best", or the one of the
+        highest reward followed by config.E - 1 of the rest at random for "best+random". An earlier example comes first
+        on ties.
 
         Args:
-            dataset: list (D) of (str, float), a run's responses with their rewards, nonempty
+            dataset: list (D) of (str, float), the responses with their rewards, nonempty
 
         Returns:
-            list (min(config.E, D) for "random", at most config.E for "greedy") of (str, float)
+            list (min(config.E, D)) of (str, float)
 
         Raises:
-            NotImplementedError: config.selection_policy is neither "random" nor "greedy"
+            NotImplementedError: config.selection_policy is none of "random", "best" and "best+random"
         """
         E = self.config.E
         if self.config.selection_policy == "random":
             return random.sample(dataset, min(E, len(dataset)))
-        elif self.config.selection_policy == "greedy":
-            distinct = {}
-            for response, reward in sorted(dataset, key=lambda item: item[1], reverse=True):
-                distinct.setdefault(reward, response)
-            return [(response, reward) for reward, response in list(distinct.items())[:E]]
+        elif self.config.selection_policy == "best":
+            return sorted(dataset, key=lambda item: item[1], reverse=True)[:E]
+        elif self.config.selection_policy == "best+random":
+            dataset = sorted(dataset, key=lambda item: item[1], reverse=True)
+            best = dataset.pop(0)
+            return [best] + random.sample(dataset, min(E - 1, len(dataset)))
         else:
             raise NotImplementedError(f"Selection policy {self.config.selection_policy} not implemented")
 
     def run(self):
-        """Runs config.L steps of sampling config.K responses per run conditioned on its dataset, evaluating them and
-        replacing the datasets."""
-        task, L, K, C = self.task, self.config.L, self.config.K, self.config.C
-        datasets = [[] for _ in range(C)]
+        """Runs config.L steps of sampling config.K responses conditioned on the dataset, evaluating them and replacing
+        the dataset."""
+        task, L, K = self.task, self.config.L, self.config.K
+        dataset = []
         for l in range(L):
             prompts = []
-            for c in range(C):
-                for k in range(K):
-                    if datasets[c]:
-                        in_contexts = self.select_in_contexts(datasets[c])
-                        prompts.append(task.prompts_with_rewards([response for response, _ in in_contexts], [reward for _, reward in in_contexts]))
-                    else:
-                        prompts.append(task.prompts())
+            for k in range(K):
+                if dataset:
+                    in_contexts = self.select_in_contexts(dataset)
+                    prompts.append(task.prompts_with_rewards([response for response, _ in in_contexts], [reward for _, reward in in_contexts]))
+                else:
+                    prompts.append(task.prompts())
             responses = self.pipeline.generate(prompts)
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
-            for c in range(C):
-                responses_c, rewards_c = responses[c * K:(c + 1) * K], rewards[c * K:(c + 1) * K].tolist()
-                datasets[c] = [(response, reward) for response, reward in zip(responses_c, rewards_c) if math.isfinite(reward)] or datasets[c]
+            dataset = [(response, reward) for response, reward in zip(responses, rewards.tolist()) if math.isfinite(reward)] or dataset
 
-            objective_evaluations = (l + 1) * C * K
+            objective_evaluations = (l + 1) * K
             self.log_rewards(objective_evaluations=objective_evaluations, rewards=rewards)
             self.log_responses(objective_evaluations=objective_evaluations, rewards=rewards, responses=responses)
 

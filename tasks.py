@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import functools
+import importlib
 import inspect
 import math
 import multiprocessing
@@ -12,19 +13,11 @@ import tempfile
 import uuid
 import numpy as np
 import shapely
-import simpletes
 import torch
 import trimesh
 from baselines.problems.problem_utils import PROBLEMS_DIR, ProblemConfig
-from baselines.problems.short.geometry.pack_circ26.evaluator import CirclePackingEvaluator
-from baselines.problems.short.geometry.pack_circ26.problem import CirclePackingProblem
 from datasets import load_dataset
 from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
-from simpletes.config import EngineConfig, resolve_eval_python
-from simpletes.evaluator import EvaluatorWorker
-from simpletes.node import score_from_metrics
-from simpletes.utils.code_extract import EvolveBlockContext, extract_code_detailed
-from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, truncate_error_in_metrics
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
@@ -169,141 +162,28 @@ class OpenFOAM:
         return Cd
 
 
-class SimpletesTask:
-    """A SimpleTES task in the no-initial-information (NI) setting of Hill Sampling (Beck et al., 2026): the model sees
-    no task statement and no system prompt, only the current code under the paper's editing prompt, the seed program
-    holding the function signature in its EDIT block and the evaluation code after it.
+class ScsTask:
+    """A problem of Gideoni et al. (2026)'s baselines, PROBLEM_NAME, which a subclass sets.
 
-    A response's code is the seed with its EDIT block replaced by the response's, merged by SimpleTES's own
-    extract_code_detailed, so only the code between the markers counts. Codes are evaluated as SimpleTES's engine
-    does: its EvaluatorWorker runs the task's evaluator under SimpleTES's datasets in a fresh subprocess per code,
-    concurrency at a time, killed after EngineConfig's eval_timeout, its error truncated to
-    DEFAULT_METRICS_ERROR_MAX_CHARS.
-    """
-
-    START_MARKER = "# EDIT-START"
-    END_MARKER = "# EDIT-END"
-
-    PROMPT_TEMPLATE = inspect.cleandoc("""
-        Here is the current code that you are modifying:
-        {code}
-
-        Replace the current code in the edit block with the code you want to use for this plan.
-        Your answer must include these comments and must use this format:
-        # EDIT-START
-        <your_new_code>
-        # EDIT-END
-    """)
-
-    def __init__(self, task: str, init_program: str, concurrency: int):
-        """
-        Args:
-            task: str, the task's directory under SimpleTES's datasets, e.g. "circle_packing/circle_packing_26", whose
-                evaluator.py scores the codes
-            init_program: str, the seed program, its EDIT block between a START_MARKER line and an END_MARKER line
-            concurrency: int, codes evaluated at once
-        """
-        self.init_program = init_program
-        self.concurrency = concurrency
-
-        prefix, _, rest = init_program.partition(self.START_MARKER)
-        _, _, suffix = rest.partition(self.END_MARKER)
-        self.evolve_context = EvolveBlockContext(
-            prefix=prefix + self.START_MARKER,
-            suffix=self.END_MARKER + suffix,
-            has_markers=True,
-            start_marker_line=self.START_MARKER,
-            end_marker_line=self.END_MARKER,
-        )
-
-        evaluator_path = os.path.join(os.path.dirname(os.path.dirname(simpletes.__file__)), "datasets", task, "evaluator.py")
-        self.evaluator = EvaluatorWorker(
-            evaluator_path,
-            timeout=EngineConfig.eval_timeout,
-            python_executable=resolve_eval_python(evaluator_path=evaluator_path, eval_venv=None),
-            target_filename="program.py",
-        )
-
-    def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's code as the current code of its own PROMPT_TEMPLATE.
-
-        Args:
-            responses: list (G) of str, each holding the EDIT markers, e.g. [init_program]
-
-        Returns:
-            list (G) of str
-        """
-        return [self.PROMPT_TEMPLATE.format(code=self.extract_code(response)) for response in responses]
-
-    def extract_code(self, response: str) -> str | None:
-        """The response's code: the seed with its EDIT block replaced by the response's, stripped; None without an
-        EDIT block."""
-        code, _ = extract_code_detailed(response, self.evolve_context)
-        return code and code.strip()
-
-    def evaluate(self, responses: list[str]) -> list:
-        """Evaluates the responses with evaluate_one_async, concurrency at a time, blocking until all are done.
-
-        Ctrl+C cancels every evaluate_one_async, the EvaluatorWorker killing its subprocess, then raises KeyboardInterrupt.
-
-        Args:
-            responses: list (N) of str, each holding the EDIT markers, preferably within a code block
-
-        Returns:
-            list (N), each response's evaluate_one_async
-        """
-        semaphore = asyncio.Semaphore(self.concurrency)
-
-        async def evaluate_async():
-            return await asyncio.gather(*(self.evaluate_one_async(response, semaphore) for response in responses))
-
-        return asyncio.run(evaluate_async())
-
-    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float:
-        """Extracts the response's code and evaluates it as SimpleTES's engine's _evaluate_code does.
-
-        Args:
-            response: str
-            semaphore: asyncio.Semaphore, held during the evaluation
-
-        Returns:
-            float, the metrics' score_from_metrics: their combined_score, -inf on any error; the metrics are
-            {"error": ..., "combined_score": -inf} without an EDIT block or when the evaluator crashes, times out or
-            raises
-        """
-        code, reason = extract_code_detailed(response, self.evolve_context)
-
-        if code is None:
-            metrics = {"error": reason, "combined_score": -math.inf}
-        else:
-            async with semaphore:
-                try:
-                    metrics = (await self.evaluator.evaluate(code)).metrics
-                except Exception as exception:
-                    metrics = {"error": str(exception), "combined_score": -math.inf}
-            metrics = truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
-
-        return score_from_metrics(metrics)
-
-
-class CirclePacking:
-    """26 circles packed in the unit square for the largest sum of radii, as in Gideoni et al. (2026)'s baselines.
-
-    The prompts are the paper's own: CirclePackingProblem's minimal domain-knowledge instruction, its time limit
+    The prompts are the paper's own: the problem's minimal domain-knowledge instruction, its time limit
     MAX_EXECUTION_TIME as in the paper's Table 1, alone for IID random sampling and the first generation of sequential
     conditioned sampling (SCS), followed by solutions from previous attempts for SCS's later generations. There is no
     seed program.
 
-    A response's code is its last code block. CirclePackingEvaluator runs the
-    code's pack_circles in a fresh subprocess killed after MAX_EXECUTION_TIME, concurrency at a time, and validates the
-    circles up to np.isclose; the reward is the sum_radii pack_circles returns.
+    A response's code is its last code block. The problem's evaluator runs the code's function in a fresh subprocess
+    killed after MAX_EXECUTION_TIME, concurrency at a time, and validates what it returns. The metric is the
+    problem's config's conf_metric_name; the reward is reward_sign * metric, so a higher reward is better whether the
+    problem maximises or minimises its metric.
 
     Attributes:
-        problem: CirclePackingProblem, its max_execution_time MAX_EXECUTION_TIME
-        evaluator: CirclePackingEvaluator
+        concurrency: int, codes evaluated at once
+        problem: BaseProblem, its max_execution_time MAX_EXECUTION_TIME
+        evaluator: BaseEvaluator
         instruction: str, the problem's instruction
+        reward_sign: int, -1 when the config's lower_is_better, else 1
     """
 
+    PROBLEM_NAME = None  # The problem's directory under PROBLEMS_DIR, e.g. "short/geometry/pack_circ26".
     MAX_EXECUTION_TIME = 300.0
     CODE_BLOCK = re.compile(r"```(?:python)?\n?(.*?)```", re.DOTALL)
     IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
@@ -319,7 +199,7 @@ class CirclePacking:
         ```
         {code}
         ```
-        This solution, solution {index}, got a sum of radii of {reward}.
+        This solution, solution {index}, got a {metric_name} of {metric}.
     """)
 
     def __init__(self, concurrency: int):
@@ -328,10 +208,13 @@ class CirclePacking:
             concurrency: int, codes evaluated at once
         """
         self.concurrency = concurrency
-        config = ProblemConfig(PROBLEMS_DIR / "short/geometry/pack_circ26/config.json")
-        self.problem, self.evaluator = CirclePackingProblem(config), CirclePackingEvaluator(config)
+        config = ProblemConfig(PROBLEMS_DIR / self.PROBLEM_NAME / "config.json")
+        module_name = f"baselines.problems.{self.PROBLEM_NAME.replace('/', '.')}"
+        self.problem = getattr(importlib.import_module(f"{module_name}.problem"), config["problem_class"])(config)
+        self.evaluator = getattr(importlib.import_module(f"{module_name}.evaluator"), config["evaluator_class"])(config)
         self.problem.params["max_execution_time"] = self.MAX_EXECUTION_TIME
         self.instruction = self.problem.generate_instruction()
+        self.reward_sign = -1 if config.get("lower_is_better", True) else 1
 
     def prompts(self) -> str:
         """The instruction alone, the prompt of IID random sampling and of SCS's first generation."""
@@ -339,7 +222,7 @@ class CirclePacking:
 
     def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
         """Every response's code as a solution of one IN_CONTEXT_PROMPT_TEMPLATE, each by IN_CONTEXT_ITEM_TEMPLATE
-        with its sum of radii, numbered from 1 in the given order, as the paper's
+        with its metric, reward_sign * reward, numbered from 1 in the given order, as the paper's
         ProblemWithArchive.generate_instruction writes them for SCS's later generations.
 
         Args:
@@ -349,9 +232,10 @@ class CirclePacking:
         Returns:
             str
         """
+        metric_name = self.problem.config["metric_name"]
         in_contexts = []
         for i, (reward, response) in enumerate(zip(rewards, responses), 1):
-            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, reward=reward, code=self.extract_code(response)))
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric_name=metric_name, metric=self.reward_sign * reward, code=self.extract_code(response)))
         return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.instruction, item="\n\n\n".join(in_contexts))  # The paper leaves two blank lines between solutions.
 
     def extract_code(self, response: str) -> str | None:
@@ -360,12 +244,12 @@ class CirclePacking:
         return codes[-1].strip() if codes else None
 
     def evaluate_one(self, code: str | None) -> float:
-        """The sum of radii the code's pack_circles returns; -inf without code, when CirclePackingEvaluator rejects it
-        or when the sum is not finite."""
+        """reward_sign * the metric of what the code's function returns; -inf without code, when the evaluator rejects
+        it or when the metric is not finite."""
         if not code:
             return -math.inf
         result = self.evaluator.evaluate_algorithm(code, self.problem)
-        reward = result.metrics[self.problem.config["conf_metric_name"]]
+        reward = self.reward_sign * result.metrics[self.problem.config["conf_metric_name"]]
         return reward if result.success and math.isfinite(reward) else -math.inf
 
     def evaluate(self, responses: list[str]) -> list[float]:
@@ -375,16 +259,30 @@ class CirclePacking:
             responses: list (N) of str
 
         Returns:
-            list (N) of float, each response's sum of radii, higher is better; -inf without code or when it fails
+            list (N) of float, each response's reward, higher is better; -inf without code or when it fails
         """
         with concurrent.futures.ThreadPoolExecutor(self.concurrency) as executor:
             return list(executor.map(self.evaluate_one, map(self.extract_code, responses)))
 
 
-class AutocorrelationSecond(SimpletesTask):
+class CirclePacking(ScsTask):
+    """26 circles packed in the unit square for the largest sum of radii, validated up to np.isclose."""
 
-    def __init__(self, concurrency: int):
-        super().__init__("autocorrelation/autocorrelation_second", metric="c2", better="higher", concurrency=concurrency)
+    PROBLEM_NAME = "short/geometry/pack_circ26"
+
+
+class KissingNumber(ScsTask):
+    """The most points C in 11 dimensions, 0 ∉ C, whose smallest pairwise distance is at least their largest norm,
+    a lower bound of the kissing number."""
+
+    PROBLEM_NAME = "short/geometry/kissing_11d"
+
+
+class AutocorrelationSecond(ScsTask):
+    """The step heights of a nonnegative step function f for the largest lower bound K of the second autocorrelation
+    inequality's constant C, ‖f*f‖₂² ≤ C ‖f*f‖₁ ‖f*f‖∞."""
+
+    PROBLEM_NAME = "short/analysis/sec_autocorr"
 
 
 class Story:
@@ -819,6 +717,7 @@ class DockingAdenosineA2A(Docking):
 TASKS_CLS = {
     "openfoam": OpenFOAM,
     "circle-packing": CirclePacking,
+    "kissing-number": KissingNumber,
     "autocorrelation-second": AutocorrelationSecond,
     "story": Story,
     "gepa-aime-2025": GepaAime2025,
