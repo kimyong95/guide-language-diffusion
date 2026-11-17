@@ -9,8 +9,8 @@ def get_config():
     config.task.name = "circle-packing"
     config.task.concurrency = 64
 
-    config.L = 25   # number of steps
-    config.K = 64   # number of new samples per step
+    config.L = 10   # number of steps
+    config.K = 20   # number of new samples per step
     config.E = 3    # number of in-context examples
     config.selection_policy = "random"  # "random", "best" or "best+random"
 

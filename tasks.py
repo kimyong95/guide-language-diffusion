@@ -16,8 +16,6 @@ import shapely
 import torch
 import trimesh
 from baselines.problems.problem_utils import PROBLEMS_DIR, ProblemConfig
-from datasets import load_dataset
-from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
@@ -278,11 +276,17 @@ class KissingNumber(ScsTask):
     PROBLEM_NAME = "short/geometry/kissing_11d"
 
 
-class AutocorrelationSecond(ScsTask):
-    """The step heights of a nonnegative step function f for the largest lower bound K of the second autocorrelation
-    inequality's constant C, ‖f*f‖₂² ≤ C ‖f*f‖₁ ‖f*f‖∞."""
+class MaxMinDistanceRatio(ScsTask):
+    """16 points in the plane for the smallest squared ratio of their largest to their smallest pairwise distance."""
 
-    PROBLEM_NAME = "short/analysis/sec_autocorr"
+    PROBLEM_NAME = "short/geometry/maxmin_dist_ratio"
+
+
+class SumDifferenceSets(ScsTask):
+    """A set U of integers for the largest lower bound K = 1 + log(|U-U| / |U+U|) / log(2 max(U) + 1) of the sums and
+    differences of sets constant C."""
+
+    PROBLEM_NAME = "short/combinatorics/sumdiff_sets"
 
 
 class Story:
@@ -390,139 +394,6 @@ class Story:
         stories_valid = [story for story in stories if story]
         rewards = iter(self.judge(stories_valid) if stories_valid else [])
         return [next(rewards) if story else -math.inf for story in stories]
-
-
-class GepaAime2025:
-    r"""A system prompt pulled toward a higher accuracy of the pipeline's own model on AIME 2025, as in GEPA's AIME
-    example but with scores only and the answer in \boxed{}.
-
-    A response's instruction is its last code block's, of any language. An instruction's reward is the fraction of data the model
-    answers correctly under it: each question answered once, greedily, with the instruction followed by ANSWER_FORMAT as
-    the system turn and the question as the user turn, as GEPA's DefaultAdapter asks. An assistant response is graded by math_verify, its
-    answer parsed with EXTRACTION_CONFIG, \boxed{} first, and verified against the ground truth. Every assistant
-    response comes from one generate call of the pipeline.
-
-    The prompts are GEPA's InstructionProposalSignature.default_prompt_template, its inputs, assistant responses and
-    feedback replaced by a description of the task and its score.
-
-    Attributes:
-        pipeline: pipeline.Pipeline, whose model answers; set by the trainer before the first evaluate
-        data: list (P) of dict, MathArena's AIME 2025: "question" the problem, "answer" its integer answer as str
-    """
-
-    EXTRACTION_CONFIG = [LatexExtractionConfig(boxed_match_priority=0), ExprExtractionConfig()]
-    INSTRUCTION_BLOCK = re.compile(r"```[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
-    ANSWER_FORMAT = r"Put your final answer in \boxed{}."
-
-    init_program = inspect.cleandoc("""
-        ```
-        You are a helpful assistant. Answer the question.
-        ```
-    """)
-    PLAIN_PROMPT_TEMPLATE = inspect.cleandoc("""
-        Here is a system prompt for an assistant that solves math problems:
-        ```
-        {instruction}
-        ```
-
-        Write an improved system prompt, different from the above, that helps the assistant solve more problems correctly. Write the new system prompt in a ``` block.
-    """)
-    LABELLED_PROMPT_TEMPLATE = inspect.cleandoc("""
-        Here are several system prompts for an assistant that solves math problems, each shown with its score:
-
-        {item}
-
-        Write an improved system prompt, different from the above, that helps the assistant solve more problems correctly. Write the new system prompt in a ``` block.
-    """)
-    LABELLED_IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
-        System prompt {index} (score={score:.3f}):
-        ```
-        {instruction}
-        ```
-    """)
-
-    def __init__(self, concurrency: int):
-        """Loads AIME 2025.
-
-        Args:
-            concurrency: int, unused, the engine batching every assistant response itself
-        """
-        self.pipeline = None
-        dataset = load_dataset("MathArena/aime_2025", split="train")
-        self.data = [{'question': x, 'answer': str(y)} for x, y in zip(dataset['problem'], dataset['answer'])]
-
-    def prompts(self, responses: list[str]) -> list[str]:
-        """Each response's instruction as the one instruction of its own PLAIN_PROMPT_TEMPLATE.
-
-        Args:
-            responses: list (G) of str, each holding an instruction, e.g. [init_program]
-
-        Returns:
-            list (G) of str
-        """
-        return [self.PLAIN_PROMPT_TEMPLATE.format(instruction=self.extract_instruction(response)) for response in responses]
-
-    def prompts_with_scores(self, responses: list[str], scores: list[float]) -> str:
-        """Every response's instruction as an instruction of one LABELLED_PROMPT_TEMPLATE, each by
-        LABELLED_IN_CONTEXT_ITEM_TEMPLATE with its score, numbered from 1 in the given order.
-
-        Args:
-            responses: list (G) of str, each holding an instruction
-            scores: list (G) of float
-
-        Returns:
-            str
-        """
-        in_contexts = []
-        for i, (score, response) in enumerate(zip(scores, responses), 1):
-            in_contexts.append(self.LABELLED_IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=score, instruction=self.extract_instruction(response)))
-        return self.LABELLED_PROMPT_TEMPLATE.format(item="\n\n".join(in_contexts))
-
-    def extract_instruction(self, response: str) -> str | None:
-        """The response's last code block, of any language, stripped, its closing fence optional at the end; None
-        without one or when it is empty."""
-        instructions = self.INSTRUCTION_BLOCK.findall(response)
-        return (instructions[-1].strip() or None) if instructions else None
-
-    def is_correct(self, data_id: int, assistant_response: str) -> bool:
-        """Whether math_verify verifies the assistant response's answer against data[data_id]'s, both parsed with
-        EXTRACTION_CONFIG."""
-        answer = parse(assistant_response, extraction_config=self.EXTRACTION_CONFIG)
-        ground_truth = parse(f"${self.data[data_id]['answer']}$", extraction_config=self.EXTRACTION_CONFIG)
-        return verify(ground_truth, answer)
-
-    def accuracies(self, instructions: list[str]) -> list[float]:
-        """The fraction of data the pipeline's model answers correctly under each instruction.
-
-        Args:
-            instructions: list (B) of str, each nonempty
-
-        Returns:
-            list (B) of float, in [0, 1], a multiple of 1 / P
-        """
-        P = len(self.data)
-        assistant_responses = self.pipeline.generate(
-            [data_i["question"] for _ in instructions for data_i in self.data],
-            system_prompts=[f"{instruction}\n\n{self.ANSWER_FORMAT}" for instruction in instructions for _ in self.data],
-            sampling_params={"temperature": 0},
-        )
-        corrects = torch.tensor([self.is_correct(i % P, assistant_response) for i, assistant_response in enumerate(assistant_responses)], dtype=torch.float64)
-        return corrects.view(len(instructions), P).mean(1).tolist()
-
-    def evaluate(self, responses: list[str]) -> list[float]:
-        """Evaluates the responses' instructions in one generate call of the pipeline.
-
-        Args:
-            responses: list (N) of str, each holding an instruction
-
-        Returns:
-            list (N) of float, the fraction of data the pipeline's model answers correctly under each response's
-            instruction, in [0, 1]; -inf without an instruction
-        """
-        instructions = [self.extract_instruction(response) for response in responses]
-        instructions_valid = [instruction for instruction in instructions if instruction]
-        rewards = iter(self.accuracies(instructions_valid) if instructions_valid else [])
-        return [next(rewards) if instruction else -math.inf for instruction in instructions]
 
 
 class Docking:
@@ -696,19 +567,19 @@ class Docking:
         return [self.scores[molecule] if molecule else -math.inf for molecule in molecules]
 
 
-class DockingDRD3(Docking):
+class Docking3PBL(Docking):
 
     PDB_ID = "3pbl"
     PROTEIN = "the dopamine receptor D3 (DRD3)"
 
 
-class DockingEGFR(Docking):
+class Docking2RGP(Docking):
 
     PDB_ID = "2rgp"
     PROTEIN = "the epidermal growth factor receptor (EGFR)"
 
 
-class DockingAdenosineA2A(Docking):
+class Docking3EML(Docking):
 
     PDB_ID = "3eml"
     PROTEIN = "the adenosine A2A receptor"
@@ -718,12 +589,12 @@ TASKS_CLS = {
     "openfoam": OpenFOAM,
     "circle-packing": CirclePacking,
     "kissing-number": KissingNumber,
-    "autocorrelation-second": AutocorrelationSecond,
+    "maxmin-distance-ratio": MaxMinDistanceRatio,
+    "sum-difference-sets": SumDifferenceSets,
     "story": Story,
-    "gepa-aime-2025": GepaAime2025,
-    "docking-drd3": DockingDRD3,
-    "docking-egfr": DockingEGFR,
-    "docking-adenosine-a2a": DockingAdenosineA2A,
+    "docking-3pbl": Docking3PBL,
+    "docking-2rgp": Docking2RGP,
+    "docking-3eml": Docking3EML,
 }
 
 def get_reward_fn(task_name: str, concurrency: int):
