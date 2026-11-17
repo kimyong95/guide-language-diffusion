@@ -61,7 +61,8 @@ class BaseTrainer:
         self.best_reward = max(self.best_reward, reward_best)
         log_dict = {
             "objective-evaluations": objective_evaluations,
-            "rewards": rewards_finite.mean().item(),
+            "rewards-mean": rewards_finite.mean().item(),
+            "rewards-median": rewards_finite.median().item() if len(rewards_finite) else math.nan,
             "reward-finite-ratio": len(rewards_finite) / len(rewards),
             "rewards-best": reward_best,
             "rewards-best-so-far": self.best_reward,
