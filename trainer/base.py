@@ -23,7 +23,7 @@ class BaseTrainer:
             columns=["objective-evaluations", "idx", "reward", "response"],
             log_mode="INCREMENTAL",
         )
-        self.best_reward = -math.inf
+        self.log_best_so_far_rewards = -math.inf
 
     def set_seed(self):
         """Seeds Python's random, NumPy and torch with config.seed."""
@@ -58,14 +58,14 @@ class BaseTrainer:
     def log_rewards(self, objective_evaluations, rewards, extra={}):
         rewards_finite = rewards[rewards.isfinite()]
         reward_best = rewards_finite.max().item() if len(rewards_finite) else -math.inf
-        self.best_reward = max(self.best_reward, reward_best)
+        self.log_best_so_far_rewards = max(self.log_best_so_far_rewards, reward_best)
         log_dict = {
             "objective-evaluations": objective_evaluations,
             "rewards-mean": rewards_finite.mean().item(),
             "rewards-median": rewards_finite.median().item() if len(rewards_finite) else math.nan,
             "reward-finite-ratio": len(rewards_finite) / len(rewards),
             "rewards-best": reward_best,
-            "rewards-best-so-far": self.best_reward,
+            "rewards-best-so-far": self.log_best_so_far_rewards,
             **extra,
         }
         wandb.log(log_dict)
