@@ -3,7 +3,7 @@
 
 The dataset is the responses of finite reward of the latest step that has any, with their rewards, empty at first.
 Every one of config.L steps samples config.K responses under the pipeline's sampling parameters, all K in one generate
-call, and evaluates each once: each to the task's prompts while the dataset is empty, otherwise to its
+call, and evaluates each once: each to the task's prompt while the dataset is empty, otherwise to its
 prompts_with_rewards of up to config.E in-context examples selected from the dataset by config.selection_policy,
 "random" as the paper does, "best" or "best+random". A step without a response of finite reward keeps the dataset, so
 the next step selects from it again, as the paper retries such a generation.
@@ -68,7 +68,7 @@ class Trainer(BaseTrainer):
                     in_contexts = self.select_in_contexts(dataset)
                     prompts.append(task.prompts_with_rewards([response for response, _ in in_contexts], [reward for _, reward in in_contexts]))
                 else:
-                    prompts.append(task.prompts())
+                    prompts.append(task.prompt())
             responses = self.pipeline.generate(prompts)
             rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
             dataset = [(response, reward) for response, reward in zip(responses, rewards.tolist()) if math.isfinite(reward)] or dataset

@@ -1,6 +1,5 @@
 import asyncio
 import concurrent.futures
-import functools
 import importlib
 import inspect
 import math
@@ -55,14 +54,32 @@ class OpenFOAM:
     and its wheels do not rotate, being part of the car's one surface.
     """
 
-    SYSTEM_PROMPT = None
-    PROMPT_TEMPLATE = ""
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Design a car with the lowest possible drag coefficient, evaluated with OpenFOAM.
 
-    init_program = inspect.cleandoc("""
-        import bpy
+        Write a Blender Python script using bpy to build the car, including its wheels, in metres.
+        Place its length along x, its front facing -x, and its front axle at x = 0.
+        The scene is exported to STL, centered along y and placed on the ground before simulation.
+        The metric is the drag coefficient C_d; lower is better.
 
-        bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 0))
+        Write the script within a ```python block.
     """)
+    IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
+        {instruction}
+        Here are some example solutions from previous attempts, please improve on them:
+
+        {item}
+
+        Please now provide your new, better solution.
+    """)
+    IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        # Solution {index}:
+        ```python
+        {code}
+        ```
+        This solution, solution {index}, got a drag coefficient C_d of {metric}.
+    """)
+    CODE_BLOCK = re.compile(r"```(?:python)?\n?(.*?)```", re.DOTALL)
 
     IMAGE = "microfluidica/openfoam:14"
     AVERAGE_LAST = 100
@@ -100,9 +117,30 @@ class OpenFOAM:
         self.concurrency = concurrency
 
     def prompt(self) -> str:
+        """Returns the instruction for the first generation."""
         return self.PROMPT_TEMPLATE
 
-    def evaluate(self, responses: list[str]) -> list[float | None]:
+    def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
+        """Returns the instruction with previous solutions and their drag coefficients.
+
+        Args:
+            responses: Responses containing scripts, in example order.
+            rewards: Corresponding finite rewards, each equal to -C_d.
+
+        Returns:
+            One prompt requesting an improved solution.
+        """
+        in_contexts = []
+        for i, (reward, response) in enumerate(zip(rewards, responses), 1):
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric=-reward, code=self.extract_code(response)))
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.prompt(), item="\n\n\n".join(in_contexts))
+
+    def extract_code(self, response: str) -> str | None:
+        """Returns the last code block stripped of its python tag, or None without code."""
+        codes = self.CODE_BLOCK.findall(response)
+        return (codes[-1].strip() or None) if codes else None
+
+    def evaluate(self, responses: list[str]) -> list[float]:
         """Evaluates the responses with evaluate_one_async, concurrency at a time, blocking until all are done.
 
         Ctrl+C cancels every evaluate_one_async, each removing its container and temporary directory, then raises
@@ -112,7 +150,7 @@ class OpenFOAM:
             responses: list (N) of str
 
         Returns:
-            list (N) of float, each response's C_d, None where it failed
+            list (N) of float, each response's -C_d, higher is better; -inf where it failed.
         """
         semaphore = asyncio.Semaphore(self.concurrency)
 
@@ -121,7 +159,7 @@ class OpenFOAM:
 
         return asyncio.run(evaluate_async())
 
-    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float | None:
+    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float:
         """Builds the response's car in Blender, simulates it in a docker container and reads its drag coefficient.
 
         Every file lives in one temporary directory, removed with the container on any exception or cancellation.
@@ -131,14 +169,16 @@ class OpenFOAM:
             semaphore: asyncio.Semaphore, held from building the car to the end of its simulation
 
         Returns:
-            float, C_d averaged over the last AVERAGE_LAST iterations, its reference area the car's frontal area; None,
-            the failure printed to stderr, when the response has no python code block or any step raises
+            Negated C_d averaged over the last AVERAGE_LAST iterations, using the car's frontal reference area;
+            -inf without code, for a nonfinite metric or when any step raises, with exceptions printed to stderr.
         """
+        script = self.extract_code(response)
+        if not script:
+            return -math.inf
         name = f"openfoam-{uuid.uuid4().hex}"
         async with semaphore:
             with tempfile.TemporaryDirectory() as home:
                 try:
-                    script = re.findall(r"```python\n(.*?)```", response, re.DOTALL)[-1]
                     with open(f"{home}/car.py", "w") as f:
                         f.write(script)
                     await subprocess_run("blender -b --factory-startup --python-exit-code 1 --python-expr".split() + [self.BLENDER_SCRIPT], cwd=home, stdout=subprocess.DEVNULL)
@@ -154,10 +194,10 @@ class OpenFOAM:
                     Cd = float(np.loadtxt(lines, comments="#")[-self.AVERAGE_LAST:, header.index("Cd")].mean())
                 except Exception as exception:
                     print(f"OpenFOAM.evaluate_one_async failed: {exception!r}", file=sys.stderr)
-                    return None
+                    return -math.inf
                 finally:
                     subprocess.run(f"docker rm -f {name}".split(), capture_output=True)
-        return Cd
+        return -Cd if math.isfinite(Cd) else -math.inf
 
 
 class ScsTask:
@@ -194,7 +234,7 @@ class ScsTask:
     """)
     IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
         # Solution {index}:
-        ```
+        ```python
         {code}
         ```
         This solution, solution {index}, got a {metric_name} of {metric}.
@@ -214,7 +254,7 @@ class ScsTask:
         self.instruction = self.problem.generate_instruction()
         self.reward_sign = -1 if config.get("lower_is_better", True) else 1
 
-    def prompts(self) -> str:
+    def prompt(self) -> str:
         """The instruction alone, the prompt of IID random sampling and of SCS's first generation."""
         return self.instruction
 
@@ -307,20 +347,24 @@ class Story:
     PROMPT_TEMPLATE = inspect.cleandoc("""
         Create a story in one sentence.
 
+        The metric is the reward model score; higher is better.
+
         Write within a ```text block.
     """)
     IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
-        With reference to the following story with their scores, create a new story in one sentence.
+        {instruction}
+        Here are some example solutions from previous attempts, please improve on them:
 
         {item}
 
-        The score is the similarity to a hidden target story. Write a new story (different from the references) to improve the score. Write within a ```text block.
+        Please now provide your new, better solution.
     """)
     IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
-        Reference {index} (score={reward:.3f}):
+        # Solution {index}:
         ```text
         {story}
         ```
+        This solution, solution {index}, got a reward model score of {metric}.
     """)
     STORY_BLOCK = re.compile(r"```(?:text)?\n?(.*?)```", re.DOTALL)
 
@@ -334,7 +378,7 @@ class Story:
         self.tokenizer = AutoTokenizer.from_pretrained(self.REWARD_MODEL_NAME)
         self.reward_model = AutoModelForSequenceClassification.from_pretrained(self.REWARD_MODEL_NAME, dtype=torch.bfloat16, num_labels=1).cuda().eval()
 
-    def prompts(self) -> str:
+    def prompt(self) -> str:
         """PROMPT_TEMPLATE, the prompt of SCS's first generation."""
         return self.PROMPT_TEMPLATE
 
@@ -351,8 +395,8 @@ class Story:
         """
         in_contexts = []
         for i, (reward, response) in enumerate(zip(rewards, responses), 1):
-            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, reward=reward, story=self.extract_story(response)))
-        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(item="\n\n".join(in_contexts))
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric=reward, story=self.extract_story(response)))
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.prompt(), item="\n\n\n".join(in_contexts))
 
     def extract_story(self, response: str) -> str | None:
         """The response's last code block, its text tag dropped, stripped; None without one or when it is empty."""
@@ -397,21 +441,6 @@ class Story:
 
 
 class Docking:
-    """Scores molecules by negated AutoDock Vina affinity against TDC's receptor and search box.
-
-    The prompts are PROMPT_TEMPLATE without references, for the first generation of sequential conditioned sampling
-    (SCS), and IN_CONTEXT_PROMPT_TEMPLATE with references and their rewards for its later generations. There is no seed
-    molecule.
-
-    Each response's last code block supplies a SMILES, canonicalized before caching. Workers embed it in 3D,
-    converge MMFF optimization within 1,000 iterations, prepare it with Meeko, and return minus the best docked
-    pose's energy in kcal/mol.
-    RDKit and Vina use the same fixed positive SEED. Reproducibility also requires fixed dependency versions.
-
-    A persistent pool prepares and docks up to concurrency molecules at once, each on N_CPUS CPUs. Each worker
-    builds its affinity maps once. Invalid responses and molecules receive -inf. System errors propagate without
-    updating the batch's score cache. Call close() when discarding the task to release its workers.
-    """
 
     import tdc.metadata
     import tdc.utils
@@ -432,41 +461,41 @@ class Docking:
     PROMPT_TEMPLATE = inspect.cleandoc("""
         Propose a molecule that binds {protein} as strongly as possible.
 
+        The metric is the AutoDock Vina docking score in kcal/mol; lower (more negative) is better.
+
         Write the molecule's SMILES within a ```smiles block.
     """)
     IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
-        With reference to the following molecules, propose a new molecule that binds {protein} more strongly.
+        {instruction}
+        Here are some example solutions from previous attempts, please improve on them:
 
         {item}
 
-        The score is minus the AutoDock Vina docking score against {protein}, in kcal/mol, so a higher score is a more strongly bound molecule. Analyze the references with their scores, then write a new molecule (different from the references), either by crossover and mutation of the references or from your own chemical knowledge. Write the molecule's SMILES within a ```smiles block.
+        Please now provide your new, better solution.
     """)
     IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
-        Reference {index} (score={score:.2f}):
+        # Solution {index}:
         ```smiles
         {molecule}
         ```
+        This solution, solution {index}, got a Vina score of {metric}.
     """)
     MOLECULE_BLOCK = re.compile(r"```(?:smiles)?\n?(.*?)```", re.DOTALL)
 
     def __init__(self, concurrency: int):
-        """Loads TDC's receptor and creates a pool that starts workers on the first evaluation.
+        """Loads TDC's receptor and creates a pool whose workers start on evaluation.
 
         Args:
             concurrency: Maximum simultaneous molecules, each docking on N_CPUS CPUs.
         """
         self.concurrency = concurrency
-        self.scores = {}
-        box = self.tdc.metadata.docking_target_info[self.PDB_ID]
+        self.box = self.tdc.metadata.docking_target_info[self.PDB_ID]
         self.tdc.utils.receptor_load(self.PDB_ID, path=self.RECEPTOR_DIR)
+        self.receptor = os.path.join(self.RECEPTOR_DIR, f"{self.PDB_ID}.pdbqt")
         self.executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=concurrency, mp_context=multiprocessing.get_context("spawn"), initializer=self.init_worker,
-            initargs=(os.path.join(self.RECEPTOR_DIR, f"{self.PDB_ID}.pdbqt"), box, self.N_CPUS, self.SEED),
+            max_workers=self.concurrency, mp_context=multiprocessing.get_context("spawn"), initializer=self.init_worker,
+            initargs=(self.receptor, self.box, self.N_CPUS, self.SEED),
         )
-
-    def close(self) -> None:
-        """Waits for pending docking jobs and releases the worker processes."""
-        self.executor.shutdown()
 
     @classmethod
     def init_worker(cls, receptor: str, box: dict, cpu: int, seed: int) -> None:
@@ -478,13 +507,14 @@ class Docking:
         cls.vina.set_receptor(rigid_pdbqt_filename=receptor)
         cls.vina.compute_vina_maps(center=list(box["center"]), box_size=list(box["size"]))
 
-    def prompts(self) -> str:
+    def prompt(self) -> str:
         """PROMPT_TEMPLATE, the prompt of SCS's first generation."""
         return self.PROMPT_TEMPLATE.format(protein=self.PROTEIN)
 
     def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
         """Every response's molecule as a reference of one IN_CONTEXT_PROMPT_TEMPLATE, each by
-        IN_CONTEXT_ITEM_TEMPLATE with its reward, numbered from 1 in the given order, for SCS's later generations.
+        IN_CONTEXT_ITEM_TEMPLATE with its Vina score, -reward, numbered from 1 in the given order,
+        for SCS's later generations.
 
         Args:
             responses: list (G) of str, G ≥ 1, each holding a code block
@@ -495,8 +525,8 @@ class Docking:
         """
         in_contexts = []
         for i, (reward, response) in enumerate(zip(rewards, responses), 1):
-            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, score=reward, molecule=self.extract_molecule(response)))
-        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(protein=self.PROTEIN, item="\n\n".join(in_contexts))
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric=-reward, molecule=self.extract_molecule(response)))
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.prompt(), item="\n\n\n".join(in_contexts))
 
     def extract_molecule(self, response: str) -> str | None:
         """Returns canonical SMILES from the last code block, or None for missing or invalid molecules.
@@ -519,8 +549,10 @@ class Docking:
             return None
 
     @classmethod
-    def dock_one(cls, molecule: str, exhaustiveness: int, n_poses: int) -> float:
+    def evaluate_one(cls, molecule: str | None) -> float:
         """Returns negated best-pose affinity, or -inf when a molecule cannot be prepared or docked."""
+        if not molecule:
+            return -math.inf
         try:
             mol = cls.Chem.MolFromSmiles(molecule)
             if mol is None or mol.GetNumAtoms() == 0 or len(cls.Chem.GetMolFrags(mol)) != 1:
@@ -541,30 +573,24 @@ class Docking:
             if "PDBQT parsing error" not in str(error):
                 raise
             return -math.inf
-        cls.vina.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
+        cls.vina.dock(exhaustiveness=cls.EXHAUSTIVENESS, n_poses=cls.N_POSES)
         energies = cls.vina.energies(n_poses=1)
         if len(energies) == 0:
             return -math.inf
-        score = -float(energies[0][0])
-        return score if math.isfinite(score) else -math.inf
+        reward = -float(energies[0][0])
+        return reward if math.isfinite(reward) else -math.inf
 
     def evaluate(self, responses: list[str]) -> list[float]:
-        """Scores uncached molecules in parallel and returns rewards in response order.
+        """Evaluates every molecule without caching, reusing the pool and its affinity maps.
 
         Args:
-            responses: Responses containing SMILES code blocks.
+            responses: list (N) of str, each holding a SMILES code block.
 
         Returns:
-            Negated best-pose affinities in kcal/mol, or -inf for rejected responses and molecules.
-            System errors propagate without caching the failed batch.
+            list (N) of float, negated best-pose affinities in kcal/mol, higher is better;
+            -inf without a molecule or when it is rejected. System errors propagate.
         """
-        molecules = [self.extract_molecule(response) for response in responses]
-        pending = list(dict.fromkeys(molecule for molecule in molecules if molecule and molecule not in self.scores))
-        if pending:
-            dock = functools.partial(self.dock_one, exhaustiveness=self.EXHAUSTIVENESS, n_poses=self.N_POSES)
-            scores = list(self.executor.map(dock, pending))
-            self.scores.update(zip(pending, scores))
-        return [self.scores[molecule] if molecule else -math.inf for molecule in molecules]
+        return list(self.executor.map(self.evaluate_one, map(self.extract_molecule, responses)))
 
 
 class Docking3PBL(Docking):

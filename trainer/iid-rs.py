@@ -28,7 +28,7 @@ class Trainer(BaseTrainer):
         """Samples config.M responses to the task's prompts in one generate call, evaluates them, and logs each
         response's reward as its own objective evaluation, in sampling order."""
         task, M = self.task, self.config.M
-        responses = self.pipeline.generate([task.prompts()] * M)
+        responses = self.pipeline.generate([task.prompt()] * M)
         rewards = torch.tensor(task.evaluate(responses), dtype=torch.float64)
 
         for m in range(M):
