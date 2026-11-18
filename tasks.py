@@ -596,7 +596,7 @@ class Docking:
 class Docking3PBL(Docking):
 
     PDB_ID = "3pbl"
-    PROTEIN = "the dopamine receptor D3 (DRD3)"
+    PROTEIN = "the dopamine type 3 receptor (DRD3)"
 
 
 class Docking2RGP(Docking):
