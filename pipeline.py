@@ -11,6 +11,7 @@ task's evaluation has that GPU memory.
 
 import contextlib
 import os
+import statistics
 import uuid
 
 import torch
@@ -20,7 +21,6 @@ from sglang.srt.utils.common import get_device_sm
 from extend_sglang import GroupEngine, GroupLogitProcessor
 
 QUANT_MODELS = {
-    # tasks: circle packing
     "qwen-coder-next": {
         "int4": "inference-optimization/Qwen3-Coder-Next.w4a16",
         "fp8": "Qwen/Qwen3-Coder-Next-FP8",
@@ -41,7 +41,6 @@ QUANT_MODELS = {
         "fp8": "Qwen/Qwen3.8-27B-FP8",
         "nvfp4": "nvidia/Qwen3.8-27B-NVFP4",
     },
-    # tasks: story
     "qwen3.5-4b": {
         "int4": "Qwen/Qwen3.5-4B",
         "fp8": "Qwen/Qwen3.5-4B",
@@ -191,16 +190,15 @@ class Pipeline:
         return [self.strip_thinking(output["text"]) for output in outputs]
 
     def log_probs(self, prompts, responses):
-        """Each response's log probability under the model at temperature 1 after each prompt, the response being its
-        tokens and the EOS right after the prompt's chat template.
+        """Each response's length-normalized log probability under the model at temperature 1 after each prompt, the
+        response being its tokens and the EOS right after the prompt's chat template.
 
         Args:
             prompts: list (N) of str
             responses: list (M) of str
 
         Returns:
-            (N, M) float64, the sum of the response's token log probabilities after the prompt; (M) int64, each
-            response's tokens with its EOS
+            (N, M) float64, the mean of the response's token log probabilities after the prompt, its EOS included
         """
         prompt_tokens = self.apply_chat_template(prompts, enable_thinking=self.enable_thinking, reasoning_effort=self.reasoning_effort)
         response_tokens = [self.tokenizer(response, add_special_tokens=False).input_ids + [self.tokenizer.eos_token_id] for response in responses]
@@ -212,43 +210,38 @@ class Pipeline:
                 logprob_start_len=[len(tokens) - 1 for tokens in prompt_tokens for _ in response_tokens],
             )
         # Each list starts at the prompt's last token, whose entry is None.
-        log_P = [sum(logprob for logprob, _, _ in output["meta_info"]["input_token_logprobs"][1:]) for output in outputs]
-        return torch.tensor(log_P, dtype=torch.float64).view(len(prompts), len(responses)), torch.tensor([len(response) for response in response_tokens])
+        log_P = [statistics.fmean(logprob for logprob, _, _ in output["meta_info"]["input_token_logprobs"][1:]) for output in outputs]
+        return torch.tensor(log_P, dtype=torch.float64).view(len(prompts), len(responses))
 
-    def group_generate(self, all_prompts, all_utilities, mixture_mode):
-        """Samples one response per group of prompts, each token from the group's mixture_mode mixture under the
-        pipeline's sampling_params, each response of max_new_tokens at most.
+    def group_generate(self, all_prompts, all_utilities, group_logit_processor=GroupLogitProcessor):
+        """Samples one response per group of prompts, each token from group_logit_processor's mixture of the group's
+        prompts under the pipeline's sampling_params, each response of max_new_tokens at most.
 
         Over a group of G prompts, p_k is the model's next-token distribution under prompt k after its repetition and
-        presence penalties and before its temperature, and W are extend_sglang's weights of the prompts' utilities,
-        summing to 1. The mixture is max(0, Σ_k W_k p_k), renormalized, for "sum", and Π_k p_k^(W_k) with its negative
-        guidance clipped to lower probabilities only for "product", as extend_sglang's GroupLogitProcessor samples. The
-        temperature, top-k, top-p and min-p apply to the mixture as they do in generate, so a group of one prompt
-        samples as generate does.
+        presence penalties and before its temperature, and w are group_logit_processor's weights of the prompts'
+        utilities. GroupLogitProcessor's mixture is guide.md's product Π_k p_k^(w_k) with its negative guidance relative
+        to the geometric mean Π_k p_k^(1/G) clipped to lower probabilities only, of w summing to 1. The temperature,
+        top-k, top-p and min-p apply to the mixture as they do in generate, so a group of one prompt samples as
+        generate does.
 
         Args:
             all_prompts: list (B) of list (G_b) of str, each group's prompts
-            all_utilities: list (B) of list (G_b) of float, finite, each group's prompts' utilities
-            mixture_mode: str, "sum" or "product"
+            all_utilities: list (B) of list (G_b) of float, each group's prompts' utilities, such as β
+            group_logit_processor: GroupLogitProcessor or a subclass of it, sampling the mixture
 
         Returns:
             list (B) of str, each response after strip_thinking
-
-        Raises:
-            NotImplementedError: mixture_mode is neither "sum" nor "product"
         """
-        if mixture_mode not in ("sum", "product"):
-            raise NotImplementedError(f"Mixture mode {mixture_mode} not implemented")
         input_ids, sampling_params, group_starts = [], [], []
         for prompts, utilities in zip(all_prompts, all_utilities):
             prompt_tokens = self.apply_chat_template(prompts, enable_thinking=self.enable_thinking, reasoning_effort=self.reasoning_effort)
             group_starts.append(len(input_ids))
             input_ids += prompt_tokens
-            custom_params = {"group": uuid.uuid4().hex, "size": len(prompts), "mixture_mode": mixture_mode}
+            custom_params = {"group": uuid.uuid4().hex, "size": len(prompts)}
             sampling_params += [
                 {**self.sampling_params, "max_new_tokens": self.max_new_tokens, "custom_params": {**custom_params, "utility": utility}}
                 for utility in utilities
             ]
         with kv_cache(self.engine):
-            outputs = self.engine.generate(input_ids=input_ids, sampling_params=sampling_params, custom_logit_processor=GroupLogitProcessor.to_str())
+            outputs = self.engine.generate(input_ids=input_ids, sampling_params=sampling_params, custom_logit_processor=group_logit_processor.to_str())
         return [self.strip_thinking(outputs[group_start]["text"]) for group_start in group_starts]

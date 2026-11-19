@@ -1,7 +1,10 @@
+import ast
 import asyncio
 import concurrent.futures
+import glob
 import importlib
 import inspect
+import json
 import math
 import multiprocessing
 import os
@@ -14,12 +17,15 @@ import numpy as np
 import shapely
 import torch
 import trimesh
+from arc_agi_benchmarking.prompts.prompt_manager import convert_task_pairs_to_prompt
+from arc_agi_benchmarking.utils.parsing import parse_and_validate_json
+from arc_agi_benchmarking.utils.task_utils import get_test_pairs_from_task, get_train_pairs_from_task
 from baselines.problems.problem_utils import PROBLEMS_DIR, ProblemConfig
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
-async def subprocess_run(args, **kwargs):
-    """subprocess.run(args, check=True, **kwargs) on asyncio, killing the process if cancelled.
+async def subprocess_run(args, input=None, **kwargs):
+    """subprocess.run(args, input=input, check=True, **kwargs) on asyncio, killing the process if cancelled.
 
     Returns:
         bytes, the process's stdout if kwargs pipe it, else None
@@ -29,7 +35,7 @@ async def subprocess_run(args, **kwargs):
     """
     process = await asyncio.create_subprocess_exec(*args, **kwargs)
     try:
-        stdout, _ = await process.communicate()
+        stdout, _ = await process.communicate(input)
     finally:
         if process.returncode is None:
             process.kill()
@@ -329,6 +335,158 @@ class SumDifferenceSets(ScsTask):
     PROBLEM_NAME = "short/combinatorics/sumdiff_sets"
 
 
+class BinPacking:
+    """Online 1D bin packing of FunSearch's (Romera-Paredes et al., 2024) DATASET_NAME instances, the priority
+    function of its skeleton evolved.
+
+    The prompt is PROMPT_TEMPLATE with the notebook's skeleton, its best-fit priority the seed, for IID random sampling
+    and the first generation of sequential conditioned sampling (SCS); IN_CONTEXT_PROMPT_TEMPLATE adds previous
+    solutions and their metrics for SCS's later generations.
+
+    A response's code is its last code block. It runs before the skeleton's online_binpack and evaluate, so it cannot
+    replace them, in a fresh `python -I` process in a temporary directory, killed after MAX_EXECUTION_TIME. Its reward
+    is the skeleton's evaluate, the negated average number of bins over the instances, deterministic for a
+    deterministic priority.
+
+    Attributes:
+        concurrency: int, codes evaluated at once
+        skeleton: str, the notebook's skeleton program
+        instances: dict, the DATASET_NAME instances by name, each with its capacity, num_items and items
+    """
+
+    NOTEBOOK = "packages/funsearch/bin_packing/bin_packing.ipynb"
+    DATASET_NAME = "Weibull 5k"  # Weibull 5k or OR3
+    MAX_EXECUTION_TIME = 300.0
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Design a heuristic for online 1D bin packing that uses as few bins as possible.
+
+        Items arrive one at a time, and this program puts each into the bin of the highest priority among those it fits in:
+        ```python
+        {skeleton}
+        ```
+
+        Write a better `priority` function with the imports it needs; the rest of the program stays as it is.
+        The metric is the average number of bins used on FunSearch's {dataset_name} dataset, {num_instances} instances of {num_items} items with bins of capacity {capacity}; lower is better.
+
+        Write the function within a ```python block.
+    """)
+    IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
+        {instruction}
+        Here are some example solutions from previous attempts, please improve on them:
+
+        {item}
+
+        Please now provide your new, better solution.
+    """)
+    IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        # Solution {index}:
+        ```python
+        {code}
+        ```
+        This solution, solution {index}, got an average number of bins of {metric}.
+    """)
+    PROGRAM_TEMPLATE = inspect.cleandoc("""
+        import json
+        import sys
+        import numpy as np
+
+        {code}
+
+        {skeleton}
+
+        print(evaluate(json.load(sys.stdin)))
+    """)
+    CODE_BLOCK = re.compile(r"```(?:python)?\n?(.*?)```", re.DOTALL)
+
+    def __init__(self, concurrency: int):
+        """Loads the skeleton and the DATASET_NAME instances from NOTEBOOK, its data parsed without running it.
+
+        Args:
+            concurrency: int, codes evaluated at once
+        """
+        self.concurrency = concurrency
+        with open(self.NOTEBOOK) as f:
+            cells = ["".join(cell["source"]) for cell in json.load(f)["cells"] if cell["cell_type"] == "code"]
+        self.skeleton = next(cell for cell in cells if "@funsearch.evolve" in cell)
+        datasets = {
+            ast.literal_eval(node.targets[0].slice): ast.literal_eval(node.value)
+            for node in ast.parse(next(cell for cell in cells if "datasets = {}" in cell)).body
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript)
+        }
+        self.instances = datasets[self.DATASET_NAME]
+
+    def prompt(self) -> str:
+        """PROMPT_TEMPLATE, the prompt of IID random sampling and of SCS's first generation."""
+        instance = next(iter(self.instances.values()))
+        return self.PROMPT_TEMPLATE.format(skeleton=self.skeleton, dataset_name=self.DATASET_NAME, num_instances=len(self.instances), num_items=instance["num_items"], capacity=instance["capacity"])
+
+    def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
+        """Every response's code as a solution of one IN_CONTEXT_PROMPT_TEMPLATE, each by IN_CONTEXT_ITEM_TEMPLATE
+        with its average number of bins, -reward, numbered from 1 in the given order, for SCS's later generations.
+
+        Args:
+            responses: list (G) of str, G ≥ 1, each holding code
+            rewards: list (G) of float, each response's evaluate, finite
+
+        Returns:
+            str
+        """
+        in_contexts = []
+        for i, (reward, response) in enumerate(zip(rewards, responses), 1):
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric=-reward, code=self.extract_code(response)))
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.prompt(), item="\n\n\n".join(in_contexts))
+
+    def extract_code(self, response: str) -> str | None:
+        """The response's last code block, its python tag dropped, stripped; None without one or when it is empty."""
+        codes = self.CODE_BLOCK.findall(response)
+        return (codes[-1].strip() or None) if codes else None
+
+    def evaluate(self, responses: list[str]) -> list[float]:
+        """Evaluates the responses' codes with evaluate_one_async, concurrency at a time, blocking until all are done.
+
+        Args:
+            responses: list (N) of str
+
+        Returns:
+            list (N) of float, each response's negated average number of bins, higher is better; -inf without code or
+            when it fails
+        """
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def evaluate_async():
+            return await asyncio.gather(*(self.evaluate_one_async(self.extract_code(response), semaphore) for response in responses))
+
+        return asyncio.run(evaluate_async())
+
+    async def evaluate_one_async(self, code: str | None, semaphore: asyncio.Semaphore) -> float:
+        """The skeleton's evaluate of the instances with the code's priority.
+
+        Args:
+            code: str or None, defining priority
+            semaphore: asyncio.Semaphore, held while the program runs
+
+        Returns:
+            The negated average number of bins; -inf without code, when the program exits non-zero, prints no number
+            last or exceeds MAX_EXECUTION_TIME, or for a nonfinite score.
+        """
+        if not code:
+            return -math.inf
+        program = self.PROGRAM_TEMPLATE.format(code=code, skeleton=self.skeleton.partition("# @funsearch.evolve")[0])
+        async with semaphore:
+            with tempfile.TemporaryDirectory() as home:
+                with open(f"{home}/program.py", "w") as f:
+                    f.write(program)
+                try:
+                    stdout = await asyncio.wait_for(subprocess_run(
+                        [sys.executable, "-I", "program.py"], input=json.dumps(self.instances).encode(), cwd=home,
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    ), self.MAX_EXECUTION_TIME)
+                    reward = float(stdout.decode().splitlines()[-1])
+                except (subprocess.CalledProcessError, TimeoutError, ValueError, IndexError):
+                    return -math.inf
+        return reward if math.isfinite(reward) else -math.inf
+
+
 class Story:
     """A story pulled toward a higher score of REWARD_MODEL_NAME as the reply to USER_PROMPT.
 
@@ -611,22 +769,139 @@ class Docking3EML(Docking):
     PROTEIN = "the adenosine A2A receptor"
 
 
+class ArcAgi:
+    """A test input of an ARC-AGI task in DATA_DIR's training or evaluation set, DATA_DIR set by a subclass.
+
+    The prompt is arcprize/arc-agi-benchmarking's, the official prompt of the ARC Prize leaderboard, for IID random
+    sampling and the first generation of sequential conditioned sampling (SCS); IN_CONTEXT_PROMPT_TEMPLATE adds
+    previous attempts' grids and rewards for SCS's later generations.
+
+    A response's grid is the official parse_and_validate_json's. Its reward is the cell accuracy of OpenCompass's
+    ARCPrizeEvaluator against the test output: the cells equal to the test output's over the cells of the smallest
+    rectangle holding both grids, 1 iff the grid is the test output.
+
+    Attributes:
+        training_pairs: list of ARCPair, the task's training pairs
+        test_pair: ARCPair, the test input and its output
+    """
+
+    DATA_DIR = None
+    IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
+        {instruction}
+
+        The metric is the cell accuracy, the fraction of cells matching the correct output; higher is better, and 1 is correct.
+        Here are some example solutions from previous attempts, please improve on them:
+
+        {item}
+
+        Please now provide your new, better solution.
+    """)
+    IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
+        # Solution {index}:
+        {grid}
+        This solution, solution {index}, got a cell accuracy of {metric}.
+    """)
+
+    def __init__(self, concurrency: int, task_id: str, pair_index: int | str):
+        """Loads the task's training pairs and test pair from DATA_DIR's training or evaluation set.
+
+        Args:
+            concurrency: int, unused, a grid's evaluation being a comparison
+            task_id: str, a task's file name in DATA_DIR/training or DATA_DIR/evaluation without .json, unique
+                across both, e.g. "00576224"
+            pair_index: int or its str, the test input's index among the task's test pairs
+        """
+        self.concurrency = concurrency
+        [task_file] = glob.glob(f"{self.DATA_DIR}/*/{task_id}.json")
+        data_dir = os.path.dirname(task_file)
+        self.training_pairs = get_train_pairs_from_task(data_dir, task_id)
+        self.test_pair = get_test_pairs_from_task(data_dir, task_id)[int(pair_index)]
+
+    def prompt(self) -> str:
+        """The official prompt of the test input, the prompt of IID random sampling and of SCS's first generation."""
+        return convert_task_pairs_to_prompt(self.training_pairs, self.test_pair)
+
+    def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
+        """Every response's grid as a solution of one IN_CONTEXT_PROMPT_TEMPLATE, each by IN_CONTEXT_ITEM_TEMPLATE
+        with its cell accuracy, numbered from 1 in the given order, for SCS's later generations. The official prompt
+        enters it without its closing "Your response:".
+
+        Args:
+            responses: list (G) of str, G ≥ 1, each holding a grid
+            rewards: list (G) of float, each response's evaluate, finite
+
+        Returns:
+            str
+        """
+        in_contexts = []
+        for i, (reward, response) in enumerate(zip(rewards, responses), 1):
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric=reward, grid=json.dumps(self.extract_grid(response))))
+        instruction = self.prompt().removesuffix("Your response:").rstrip()
+        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=instruction, item="\n\n\n".join(in_contexts))
+
+    def extract_grid(self, response: str) -> list[list] | None:
+        """The official parse_and_validate_json's grid: the first \\boxed{} list of lists, else the last list of
+        lists; None without one."""
+        try:
+            return parse_and_validate_json(response)
+        except ValueError:
+            return None
+
+    def evaluate_one(self, grid: list[list] | None) -> float:
+        """The grid's cell accuracy against the test output; -inf without a grid."""
+        if grid is None:
+            return -math.inf
+        output = self.test_pair.output
+        rows = max(len(grid), len(output))
+        cols = max(map(len, grid + output))
+        return sum(cell == cell_output for row, row_output in zip(grid, output) for cell, cell_output in zip(row, row_output)) / (rows * cols)
+
+    def evaluate(self, responses: list[str]) -> list[float]:
+        """Evaluates the responses' grids with evaluate_one.
+
+        Args:
+            responses: list (N) of str
+
+        Returns:
+            list (N) of float, each response's cell accuracy in [0, 1], 1 iff its grid is the test output, higher is
+            better; -inf without a grid
+        """
+        return [self.evaluate_one(self.extract_grid(response)) for response in responses]
+
+
+class ArcAgi1(ArcAgi):
+    """A test input of ARC-AGI-1's public training or evaluation set, of 400 + 400 tasks and 416 + 419 test inputs."""
+
+    DATA_DIR = "packages/ARC-AGI/data"
+
+
+class ArcAgi2(ArcAgi):
+    """A test input of ARC-AGI-2's public training or evaluation set, of 1000 + 120 tasks and 1076 + 167 test inputs."""
+
+    DATA_DIR = "packages/ARC-AGI-2/data"
+
+
 TASKS_CLS = {
     "openfoam": OpenFOAM,
     "circle-packing": CirclePacking,
     "kissing-number": KissingNumber,
     "maxmin-distance-ratio": MaxMinDistanceRatio,
     "sum-difference-sets": SumDifferenceSets,
+    "bin-packing": BinPacking,
     "story": Story,
     "docking-3pbl": Docking3PBL,
     "docking-2rgp": Docking2RGP,
     "docking-3eml": Docking3EML,
+    "arc-agi-1": ArcAgi1,
+    "arc-agi-2": ArcAgi2,
 }
 
 def get_reward_fn(task_name: str, concurrency: int):
     """
     Args:
-        task_name: str, a TASKS_CLS name, e.g. "circle-packing"
+        task_name: str, a TASKS_CLS name, e.g. "circle-packing", optionally followed by the class's arguments after
+            concurrency in brackets, comma-separated and passed positionally as str, e.g. "arc-agi-2[136b0064,0]"
         concurrency: int, the task's evaluations at once
     """
-    return TASKS_CLS[task_name](concurrency=concurrency)
+    name, *args = re.findall(r"[\w-]+", task_name)
+    return TASKS_CLS[name](concurrency, *args)
