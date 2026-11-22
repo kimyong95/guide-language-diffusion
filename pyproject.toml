@@ -1,4 +1,8 @@
-# git clone https://github.com/wq-will/SimpleTES packages/SimpleTES
+# git clone https://github.com/arcprize/arc-agi-benchmarking packages/arc-agi-benchmarking
+# git clone https://github.com/fchollet/ARC-AGI packages/ARC-AGI
+# git clone https://github.com/arcprize/ARC-AGI-2 packages/ARC-AGI-2
+# git clone https://github.com/google-deepmind/funsearch packages/funsearch
+# git clone --branch v3.9 https://github.com/ProjectPhysX/FluidX3D packages/FluidX3D && make -C packages/FluidX3D Linux -j
 # pixi install
 # pixi shell
 
@@ -19,10 +23,7 @@ dependencies = [
     "scipy",
     "scikit-learn",
 
-    # SimpleTES
-    "litellm==1.83.*",
-    "rich",
-    "cvxpy",
+    # code_evo_simple_baselines
     "psutil",
 
     # Blender
@@ -33,7 +34,7 @@ dependencies = [
     "PyTDC",
     "rdkit",
     "meeko",
-    "gemmi",  # meeko imports it without depending on it
+    "gemmi",
     "vina>=1.2.4",
 
     # Math
@@ -61,7 +62,7 @@ torchaudio = { version = "*", env-markers = "sys_platform == 'never'" }
 
 [tool.pixi.activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/cuda-compat:$CONDA_PREFIX/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-PYTHONPATH = "$PIXI_WORKSPACE_ROOT:$PIXI_WORKSPACE_ROOT/packages/SimpleTES"
+PYTHONPATH = "$PIXI_WORKSPACE_ROOT:$PIXI_WORKSPACE_ROOT/packages/code_evo_simple_baselines:$PIXI_WORKSPACE_ROOT/packages/arc-agi-benchmarking/src"
 
 # Uni-Dock gets its own environment because conda-forge builds it for CUDA 12 only.
 [tool.pixi.feature.unidock.dependencies]

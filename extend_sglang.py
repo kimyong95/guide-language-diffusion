@@ -1,6 +1,5 @@
 """SGLang 0.5.23 extended with group generation: requests sharing custom_params["group"] sample the same tokens, each
-from guide.md's product mixture of the group's requests, its negative guidance clipped, under their sampling
-parameters, and are scheduled together.
+from guide.md's product mixture of the group's requests under their sampling parameters, and are scheduled together.
 
 GroupLogitProcessor samples each group's token and gives it to all of its requests. GroupEngine's scheduler keeps a
 group's requests in the same batches: GroupPrefillAdder prefills them through SGLang's chunked prefill, each up to its
@@ -87,9 +86,7 @@ class GroupLogitProcessor(CustomLogitProcessor):
 
     @staticmethod
     def guided_log_probs(logits, groups_rows, groups_weights):
-        """Each group's log of guide.md's product mixture Π_k p_k^(w_k) of its rows' p_k, its negative guidance
-        clipped to lower probabilities only: the unnormalized log p_B + Σ_{g_k > 0} g_k Δ_k + min(Σ_{g_k < 0} g_k Δ_k, 0),
-        p_B the geometric mean Π_k p_k^(1/G) of the group's G rows, g_k = w_k - 1/G and Δ_k = log p_k - log p_B.
+        """Each group's log of guide.md's product mixture Π_k p_k^(w_k) of its rows' p_k, unnormalized.
 
         Args:
             logits: (B, V), one row per request
@@ -97,15 +94,9 @@ class GroupLogitProcessor(CustomLogitProcessor):
             groups_weights: (H, B) float, a group's weight w_k at each of its rows, 0 elsewhere
 
         Returns:
-            (H, V) float
+            (H, V) float, Σ_k w_k log p_k
         """
-        log_p = logits.float().log_softmax(-1)
-        groups_base = groups_rows / groups_rows.sum(1, keepdim=True)
-        log_p_base = groups_base @ log_p
-        guidance = groups_weights - groups_base
-        # Σ_k g_k Δ_k as Σ_k g_k log p_k - (Σ_k g_k) log p_B, over the positive and over the negative g_k.
-        guidance_positive, guidance_negative = (g @ log_p - g.sum(1, keepdim=True) * log_p_base for g in (guidance.clamp(min=0), guidance.clamp(max=0)))
-        return log_p_base + guidance_positive + guidance_negative.clamp(max=0)
+        return groups_weights @ logits.float().log_softmax(-1)
 
     def __call__(self, logits, custom_param_list):
         """
@@ -145,6 +136,42 @@ class GroupLogitProcessor(CustomLogitProcessor):
         tokens = sample_tokens(log_p_guided.softmax(-1), all_sampling_params)
         logits[rows] = torch.full_like(logits[rows], float("-inf")).scatter_(1, tokens[rows_group, None].long(), 0)
         return logits
+
+
+class WeightLogitProcessor(GroupLogitProcessor):
+    """GroupLogitProcessor whose requests' utilities are their weights w_k, of its product mixture."""
+
+    weights = staticmethod(lambda utilities: utilities)
+
+
+class SumLogitProcessor(WeightLogitProcessor):
+    """WeightLogitProcessor of the sum mixture, max(0, Σ_k w_k p_k) renormalized."""
+
+    @staticmethod
+    def guided_log_probs(logits, groups_rows, groups_weights):
+        p_guided = (groups_weights @ logits.float().softmax(-1)).clamp(min=0)
+        return (p_guided / p_guided.sum(1, keepdim=True)).log()
+
+
+class ProductLogitProcessor(WeightLogitProcessor):
+    """WeightLogitProcessor of the product mixture, Π_k p_k^(w_k) renormalized, without clipping."""
+
+    @staticmethod
+    def guided_log_probs(logits, groups_rows, groups_weights):
+        return groups_weights @ logits.float().log_softmax(-1)
+
+
+class PowerMeanLogitProcessor(WeightLogitProcessor):
+    """WeightLogitProcessor of the power mean mixture of order RHO, max(0, Σ_k w_k p_k^RHO)^(1/RHO) renormalized: the sum
+    mixture at RHO = 1, the product mixture as RHO → 0.
+    """
+
+    RHO = 0.5
+
+    @classmethod
+    def guided_log_probs(cls, logits, groups_rows, groups_weights):
+        log_p = logits.float().log_softmax(-1)
+        return (groups_weights @ (cls.RHO * log_p).exp()).clamp(min=0).log() / cls.RHO
 
 
 class GroupPrefillAdder(PrefillAdder):

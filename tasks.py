@@ -2,13 +2,14 @@ import ast
 import asyncio
 import concurrent.futures
 import glob
+import hashlib
 import importlib
 import inspect
 import json
 import math
-import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from arc_agi_benchmarking.prompts.prompt_manager import convert_task_pairs_to_pr
 from arc_agi_benchmarking.utils.parsing import parse_and_validate_json
 from arc_agi_benchmarking.utils.task_utils import get_test_pairs_from_task, get_train_pairs_from_task
 from baselines.problems.problem_utils import PROBLEMS_DIR, ProblemConfig
+from secret_tasks import Docking2RGP, Docking3EML, Docking3PBL
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
@@ -45,23 +47,17 @@ async def subprocess_run(args, input=None, **kwargs):
     return stdout
 
 
-class OpenFOAM:
-    """Drag coefficient of a car, simulated with OpenFOAM v14 (Foundation) following its official drivaerFastback case.
+class Aerodynamic:
+    """Drag coefficient of a car built by a response's bpy script, simulated by a subclass's evaluate_one_async.
 
-    evaluate_one_async builds the car by running the response's bpy script in headless Blender and exporting the scene to STL,
-    BLENDER_SCRIPT as execute-blender.py does before rendering. It then runs IMAGE, microfluidica's docker image of the
-    Foundation's own packages, on a copy of the image's tutorials/incompressibleFluid/drivaerFastback. OPENFOAM_COMMAND changes
-    only the entries tagged by their source: [DrivAerNet++] following Elrefaie et al. (NeurIPS 2024), [ours] otherwise.
-    Everything else is the official case run by its own Allrun, MESH_SIZE being one of its mesh sizes: the domain,
-    snappyHexMesh refinement, k-ω SST model, numerics, moving ground, 16 m/s inlet and 1000 iterations.
-
-    The car keeps its scale and x position, so it must be built in the official frame: metres, length along x, front
-    facing -x and front axle at x = 0. [ours] It is moved down onto the ground and sideways to be symmetric about y = 0,
-    and its wheels do not rotate, being part of the car's one surface.
+    build_car runs the script in headless Blender and exports the scene to STL, BLENDER_SCRIPT as execute-blender.py
+    does before rendering. The car is in metres, its length along x and its front facing -x. [ours] It is moved down
+    onto the ground and sideways to be symmetric about y = 0, and its wheels do not rotate, being part of the car's one
+    surface. The reward is -C_d over the car's frontal reference area.
     """
 
     PROMPT_TEMPLATE = inspect.cleandoc("""
-        Design a car with the lowest possible drag coefficient, evaluated with OpenFOAM.
+        Design a car with the lowest possible drag coefficient, evaluated with {simulation}.
 
         Write a Blender Python script using bpy to build the car, including its wheels, in metres.
         Place its length along x, its front facing -x, and its front axle at x = 0.
@@ -70,6 +66,7 @@ class OpenFOAM:
 
         Write the script within a ```python block.
     """)
+    SIMULATION = None  # Named in PROMPT_TEMPLATE, e.g. "OpenFOAM".
     IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
         {instruction}
         Here are some example solutions from previous attempts, please improve on them:
@@ -87,11 +84,6 @@ class OpenFOAM:
     """)
     CODE_BLOCK = re.compile(r"```(?:python)?\n?(.*?)```", re.DOTALL)
 
-    IMAGE = "microfluidica/openfoam:14"
-    AVERAGE_LAST = 100
-    N_CPUS = 6
-    MESH_SIZE = "S"  # S, M, L, XL
-
     BLENDER_SCRIPT = inspect.cleandoc("""
         import runpy
         import bpy
@@ -101,30 +93,16 @@ class OpenFOAM:
         bpy.ops.wm.stl_export(filepath="car.stl")
     """)
 
-    OPENFOAM_COMMAND = inspect.cleandoc("""
-        set -e
-        {
-            cp -r $FOAM_TUTORIALS/incompressibleFluid/drivaerFastback case && cd case
-            rm constant/geometry/*.obj.gz && mv ../car.obj constant/geometry/body.obj
-            foamDictionary system/snappyHexMeshDict.orig -entry geometry/frontWheels -remove
-            foamDictionary system/snappyHexMeshDict.orig -entry geometry/rearWheels -remove
-            foamDictionary system/snappyHexMeshDict.orig -entry "castellatedMeshControls/refinementSurfaces/.*Wheels" -remove
-            foamDictionary system/forceCoeffsIncompressible -entry Aref -set $AREF
-            ./Allrun -cores $N_CPUS -mesh $MESH_SIZE
-        } >&2
-        cat postProcessing/forceCoeffsIncompressible/0/forceCoeffs.dat
-    """)
-
     def __init__(self, concurrency: int):
         """
         Args:
-            concurrency: int, cars simulated at once, each in its own container of N_CPUS
+            concurrency: int, cars simulated at once
         """
         self.concurrency = concurrency
 
     def prompt(self) -> str:
         """Returns the instruction for the first generation."""
-        return self.PROMPT_TEMPLATE
+        return self.PROMPT_TEMPLATE.format(simulation=self.SIMULATION)
 
     def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
         """Returns the instruction with previous solutions and their drag coefficients.
@@ -149,7 +127,7 @@ class OpenFOAM:
     def evaluate(self, responses: list[str]) -> list[float]:
         """Evaluates the responses with evaluate_one_async, concurrency at a time, blocking until all are done.
 
-        Ctrl+C cancels every evaluate_one_async, each removing its container and temporary directory, then raises
+        Ctrl+C cancels every evaluate_one_async, each cleaning up its processes and temporary directory, then raises
         KeyboardInterrupt.
 
         Args:
@@ -164,6 +142,78 @@ class OpenFOAM:
             return await asyncio.gather(*(self.evaluate_one_async(response, semaphore) for response in responses))
 
         return asyncio.run(evaluate_async())
+
+    async def build_car(self, script: str, home: str) -> tuple[trimesh.Trimesh, float]:
+        """Builds the script's car in headless Blender, then moves it onto the ground and symmetric about y = 0.
+
+        Args:
+            script: str, a bpy script building the car in metres
+            home: str, a directory for the script and its exported car.stl
+
+        Returns:
+            The car's mesh in metres and its frontal reference area in m², the area of its projection on the y-z plane.
+
+        Raises:
+            subprocess.CalledProcessError: Blender fails
+        """
+        with open(f"{home}/car.py", "w") as f:
+            f.write(script)
+        await subprocess_run("blender -b --factory-startup --python-exit-code 1 --python-expr".split() + [self.BLENDER_SCRIPT], cwd=home, stdout=subprocess.DEVNULL)
+        mesh = trimesh.load_mesh(f"{home}/car.stl")
+        mesh.apply_translation([0, -mesh.bounds[:, 1].mean(), -mesh.bounds[0, 2]])  # [ours]
+        Aref = shapely.union_all(shapely.polygons(mesh.triangles[mesh.area_faces * np.abs(mesh.face_normals[:, 0]) > 1e-12][:, :, 1:])).area
+        return mesh, Aref
+
+    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float:
+        """Builds the response's car with build_car and simulates it.
+
+        Args:
+            response: str, its last python code block a bpy script building the car in metres
+            semaphore: asyncio.Semaphore, held from building the car to the end of its simulation
+
+        Returns:
+            -C_d; -inf without code, for a nonfinite C_d or when any step raises.
+        """
+        raise NotImplementedError
+
+
+class OpenFOAM(Aerodynamic):
+    """Drag coefficient of a car, simulated with OpenFOAM v14 (Foundation) following its official drivaerFastback case.
+
+    evaluate_one_async runs IMAGE, microfluidica's docker image of the Foundation's own packages, on a copy of the
+    image's tutorials/incompressibleFluid/drivaerFastback. OPENFOAM_COMMAND changes only the entries tagged by their
+    source: [DrivAerNet++] following Elrefaie et al. (NeurIPS 2024), [ours] otherwise. Everything else is the official
+    case run by its own Allrun, MESH_SIZE being one of its mesh sizes: the domain, snappyHexMesh refinement, k-ω SST
+    model, numerics, moving ground, 16 m/s inlet and 1000 iterations.
+
+    The car keeps its scale and x position, so the prompt's frame is the official one: front axle at x = 0.
+    """
+
+    SIMULATION = "OpenFOAM"
+    IMAGE = "microfluidica/openfoam:14"
+    AVERAGE_LAST = 100
+    N_CPUS = 6
+    MESH_SIZE = "S"  # S, M, L, XL
+    OPENFOAM_COMMAND = inspect.cleandoc("""
+        set -e
+        {
+            cp -r $FOAM_TUTORIALS/incompressibleFluid/drivaerFastback case && cd case
+            rm constant/geometry/*.obj.gz && mv ../car.obj constant/geometry/body.obj
+            foamDictionary system/snappyHexMeshDict.orig -entry geometry/frontWheels -remove
+            foamDictionary system/snappyHexMeshDict.orig -entry geometry/rearWheels -remove
+            foamDictionary system/snappyHexMeshDict.orig -entry "castellatedMeshControls/refinementSurfaces/.*Wheels" -remove
+            foamDictionary system/forceCoeffsIncompressible -entry Aref -set $AREF
+            ./Allrun -cores $N_CPUS -mesh $MESH_SIZE
+        } >&2
+        cat postProcessing/forceCoeffsIncompressible/0/forceCoeffs.dat
+    """)
+
+    def __init__(self, concurrency: int):
+        """
+        Args:
+            concurrency: int, cars simulated at once, each in its own container of N_CPUS
+        """
+        super().__init__(concurrency)
 
     async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float:
         """Builds the response's car in Blender, simulates it in a docker container and reads its drag coefficient.
@@ -185,13 +235,8 @@ class OpenFOAM:
         async with semaphore:
             with tempfile.TemporaryDirectory() as home:
                 try:
-                    with open(f"{home}/car.py", "w") as f:
-                        f.write(script)
-                    await subprocess_run("blender -b --factory-startup --python-exit-code 1 --python-expr".split() + [self.BLENDER_SCRIPT], cwd=home, stdout=subprocess.DEVNULL)
-                    mesh = trimesh.load_mesh(f"{home}/car.stl")
-                    mesh.apply_translation([0, -mesh.bounds[:, 1].mean(), -mesh.bounds[0, 2]])  # [ours]
+                    mesh, Aref = await self.build_car(script, home)
                     mesh.export(f"{home}/car.obj", include_normals=False, include_texture=False)
-                    Aref = shapely.union_all(shapely.polygons(mesh.triangles[mesh.area_faces * np.abs(mesh.face_normals[:, 0]) > 1e-12][:, :, 1:])).area
                     lines = (await subprocess_run(
                         f"docker run --rm --name {name} --cpus {self.N_CPUS} --user {os.getuid()}:{os.getgid()} -v {home}:/home/openfoam -e AREF={Aref} -e N_CPUS={self.N_CPUS} -e MESH_SIZE={self.MESH_SIZE} {self.IMAGE} bash -c".split() + [self.OPENFOAM_COMMAND],
                         stdout=subprocess.PIPE,
@@ -203,6 +248,182 @@ class OpenFOAM:
                     return -math.inf
                 finally:
                     subprocess.run(f"docker rm -f {name}".split(), capture_output=True)
+        return -Cd if math.isfinite(Cd) else -math.inf
+
+
+class FluidX3D(Aerodynamic):
+    """Drag coefficient of a car, simulated on a GPU with FluidX3D v3.9's lattice Boltzmann method following its Ahmed
+    body setup.
+
+    SETUP is the Ahmed body's main_setup with its extensions, DEFINES: FP16C,
+    D3Q19, SRT with Smagorinsky-Lilly LES, a box of BOX_SCALE car lengths by BOX_SCALE car widths by (BOX_SCALE - 1) / 2
+    car widths above the car's height, sized to MEMORY megabytes, the car's front half of (BOX_SCALE / 2 car lengths
+    less one car width) from the inlet, one cell above a stationary no-slip floor, equilibrium boundaries of LBM_U on
+    the other faces, the whole fluid starting at LBM_U, air of SI_NU and SI_RHO, and the drag from object_force over
+    ½ SI_RHO SI_U² Aref. [ours] The flow is along x, the car's length, instead of y; the inlet speed SI_U is
+    OpenFOAM's 16 m/s; each of the car's parts is voxelized on its own, as the setup of the Mercedes F1 car does, so
+    overlapping parts are solid; the run lasts FLOW_PASSES passes of the flow through the box, and the drag is averaged
+    every FORCE_INTERVAL steps over the last pass; the reference area is build_car's.
+
+    FluidX3D is built once per SETUP and DEFINES into FLUIDX3D_DIR/build, linked to FluidX3D's bundled OpenCL loader.
+    Each car is simulated in its own process on the GPU FluidX3D picks, the fastest visible one, without the caller's
+    LD_LIBRARY_PATH and with NVIDIA's compute cache disabled.
+    """
+
+    SIMULATION = "a lattice Boltzmann CFD simulation"
+    FLUIDX3D_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages/FluidX3D")
+    DEFINES = {
+        r"^#define FP16S\b": "//#define FP16S",
+        r"^//#define FP16C\b": "#define FP16C",
+        r"^#define BENCHMARK\b": "//#define BENCHMARK",
+        r"^//#define FORCE_FIELD\b": "#define FORCE_FIELD",
+        r"^//#define EQUILIBRIUM_BOUNDARIES\b": "#define EQUILIBRIUM_BOUNDARIES",
+        r"^//#define SUBGRID\b": "#define SUBGRID",
+    }
+    SETUP = inspect.cleandoc("""
+        #include "setup.hpp"
+
+        void main_setup() { // car in a wind tunnel, following the Ahmed body setup; parameters from FX3D_* environment variables
+            const uint memory = (uint)atoi(getenv("FX3D_MEMORY"));
+            const float lbm_u = (float)atof(getenv("FX3D_LBM_U"));
+            const float box_scale = (float)atof(getenv("FX3D_BOX_SCALE"));
+            const float si_u = (float)atof(getenv("FX3D_SI_U"));
+            const float si_nu = (float)atof(getenv("FX3D_SI_NU")), si_rho = (float)atof(getenv("FX3D_SI_RHO"));
+            const float si_length = (float)atof(getenv("FX3D_LENGTH")), si_width = (float)atof(getenv("FX3D_WIDTH")), si_height = (float)atof(getenv("FX3D_HEIGHT"));
+            const float si_A = (float)atof(getenv("FX3D_AREA"));
+            const float flow_passes = (float)atof(getenv("FX3D_FLOW_PASSES"));
+            const uint force_interval = (uint)atoi(getenv("FX3D_FORCE_INTERVAL"));
+            const uint parts = (uint)atoi(getenv("FX3D_PARTS"));
+            const uint3 lbm_N = resolution(float3(box_scale*si_length, box_scale*si_width, 0.5f*(box_scale-1.0f)*si_width+si_height), memory);
+            units.set_m_kg_s((float)lbm_N.x, lbm_u, 1.0f, box_scale*si_length, si_u, si_rho);
+            const float lbm_nu = units.nu(si_nu);
+            const ulong lbm_T = units.t(flow_passes*box_scale*si_length/si_u);
+            const ulong lbm_T_average = units.t(box_scale*si_length/si_u);
+            print_info("Re = "+to_string(to_uint(units.si_Re(si_width, si_u, si_nu))));
+            LBM lbm(lbm_N, lbm_nu);
+            const float3 offset = float3(units.x(0.5f*(0.5f*box_scale*si_length-si_width)), 0.5f*(float)lbm_N.y, 1.0f);
+            for(uint i=0u; i<parts; i++) {
+                Mesh* mesh = read_stl("car"+to_string(i)+".stl", units.x(1.0f), float3x3(1.0f), offset);
+                lbm.voxelize_mesh_on_device(mesh, TYPE_S|TYPE_X);
+            }
+            const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz(); parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
+                if(z==0u) lbm.flags[n] = TYPE_S;
+                if(lbm.flags[n]!=TYPE_S) lbm.u.x[n] = lbm_u;
+                if(x==0u||x==Nx-1u||y==0u||y==Ny-1u||z==Nz-1u) lbm.flags[n] = TYPE_E;
+            });
+            lbm.run(0u, lbm_T);
+            double force = 0.0;
+            ulong samples = 0ull;
+            while(lbm.get_t()<lbm_T) {
+                lbm.run(force_interval, lbm_T);
+                if(lbm.get_t()+lbm_T_average>lbm_T) {
+                    force += (double)lbm.object_force(TYPE_S|TYPE_X).x;
+                    samples++;
+                }
+            }
+            const float Cd = units.si_F((float)(force/(double)samples))/(0.5f*si_rho*sq(si_u)*si_A);
+            print_info("C_d = "+to_string(Cd, 6u));
+        }
+    """)
+    MEMORY = 2000
+    LBM_U = 0.05
+    BOX_SCALE = 6.0
+    SI_U = 16.0
+    SI_NU = 1.48e-5
+    SI_RHO = 1.225
+    FLOW_PASSES = 2.0
+    FORCE_INTERVAL = 10
+
+    def __init__(self, concurrency: int):
+        """Builds FluidX3D with SETUP and DEFINES unless already built.
+
+        Args:
+            concurrency: int, cars simulated at once, all on the GPU FluidX3D picks
+
+        Raises:
+            subprocess.CalledProcessError: g++ fails
+        """
+        super().__init__(concurrency)
+        self.binary = self.build()
+
+    @classmethod
+    def build(cls) -> str:
+        """Compiles FluidX3D's sources with SETUP as setup.cpp and DEFINES applied to defines.hpp, unless already built.
+
+        The build happens in a temporary directory moved into place at the end, so concurrent builds do not collide.
+
+        Returns:
+            str, the binary's path, FLUIDX3D_DIR/build/{hash of SETUP and DEFINES}/FluidX3D
+
+        Raises:
+            subprocess.CalledProcessError: g++ fails
+        """
+        build_dir = os.path.join(cls.FLUIDX3D_DIR, "build", hashlib.sha256((cls.SETUP + repr(cls.DEFINES)).encode()).hexdigest()[:16])
+        if os.path.exists(f"{build_dir}/FluidX3D"):
+            return f"{build_dir}/FluidX3D"
+        os.makedirs(os.path.dirname(build_dir), exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(build_dir)) as work:
+            shutil.copytree(f"{cls.FLUIDX3D_DIR}/src", f"{work}/src")
+            with open(f"{work}/src/setup.cpp", "w") as f:
+                f.write(cls.SETUP)
+            with open(f"{work}/src/defines.hpp") as f:
+                defines = f.read()
+            for pattern, replacement in cls.DEFINES.items():
+                defines, count = re.subn(pattern, replacement, defines, flags=re.MULTILINE)
+                assert count == 1, f"defines.hpp has {count} matches of {pattern!r}"
+            with open(f"{work}/src/defines.hpp", "w") as f:
+                f.write(defines)
+            os.makedirs(f"{work}/build")
+            shutil.copy(f"{work}/src/OpenCL/lib/libOpenCL.so", f"{work}/build/libOpenCL.so.1")
+            subprocess.run(
+                ["g++", *sorted(glob.glob(f"{work}/src/*.cpp")), "-o", f"{work}/build/FluidX3D", "-std=c++17", "-pthread", "-O", "-Wno-comment",
+                 f"-I{work}/src/OpenCL/include", f"-L{work}/src/OpenCL/lib", "-lOpenCL", "-Wl,-rpath,$ORIGIN"],
+                check=True,
+            )
+            try:
+                os.rename(f"{work}/build", build_dir)
+            except OSError:  # Another process built it first.
+                pass
+        return f"{build_dir}/FluidX3D"
+
+    async def evaluate_one_async(self, response: str, semaphore: asyncio.Semaphore) -> float:
+        """Builds the response's car in Blender, simulates it with FluidX3D in a new process and returns its -C_d.
+
+        The temporary directory is removed, and the process killed, on any exception or cancellation.
+
+        Args:
+            response: str, its last python code block a bpy script building the car in metres
+            semaphore: asyncio.Semaphore, held from building the car to the end of its simulation
+
+        Returns:
+            -C_d; -inf without code, for a nonfinite C_d or when any step raises, with exceptions printed to stderr.
+        """
+        script = self.extract_code(response)
+        if not script:
+            return -math.inf
+        async with semaphore:
+            with tempfile.TemporaryDirectory() as home:
+                try:
+                    mesh, Aref = await self.build_car(script, home)
+                    mesh.apply_translation([-mesh.bounds[0, 0], 0, 0])
+                    parts = mesh.split(only_watertight=False)
+                    for i, part in enumerate(parts):
+                        part.export(f"{home}/car{i}.stl")
+                    length, width, height = mesh.extents
+                    env = {
+                        "FX3D_MEMORY": self.MEMORY, "FX3D_LBM_U": self.LBM_U, "FX3D_BOX_SCALE": self.BOX_SCALE, "FX3D_SI_U": self.SI_U,
+                        "FX3D_SI_NU": self.SI_NU, "FX3D_SI_RHO": self.SI_RHO, "FX3D_LENGTH": length, "FX3D_WIDTH": width,
+                        "FX3D_HEIGHT": height, "FX3D_AREA": Aref, "FX3D_FLOW_PASSES": self.FLOW_PASSES,
+                        "FX3D_FORCE_INTERVAL": self.FORCE_INTERVAL, "FX3D_PARTS": len(parts),
+                    }
+                    # pixi's cuda-compat libraries make NVIDIA's OpenCL compiler emit PTX the driver rejects, and
+                    # NVIDIA's compute cache would replay such kernels.
+                    env = {**{k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}, "CUDA_CACHE_DISABLE": "1", **{k: str(v) for k, v in env.items()}}
+                    stdout = await subprocess_run([self.binary], cwd=home, env=env, stdout=subprocess.PIPE)
+                    Cd = float(re.findall(r"C_d = (\S+)", stdout.decode(errors="replace"))[-1])
+                except Exception as exception:
+                    print(f"FluidX3D.evaluate_one_async failed: {exception!r}", file=sys.stderr)
+                    return -math.inf
         return -Cd if math.isfinite(Cd) else -math.inf
 
 
@@ -335,41 +556,31 @@ class SumDifferenceSets(ScsTask):
     PROBLEM_NAME = "short/combinatorics/sumdiff_sets"
 
 
-class BinPacking:
-    """Online 1D bin packing of FunSearch's (Romera-Paredes et al., 2024) DATASET_NAME instances, the priority
-    function of its skeleton evolved.
+class FunSearchTask:
+    """A problem of FunSearch's (Romera-Paredes et al., 2024) notebooks, the priority function of its SKELETON_NAME
+    skeleton evolved; a subclass sets the constants left None.
 
-    The prompt is PROMPT_TEMPLATE with the notebook's skeleton, its best-fit priority the seed, for IID random sampling
-    and the first generation of sequential conditioned sampling (SCS); IN_CONTEXT_PROMPT_TEMPLATE adds previous
-    solutions and their metrics for SCS's later generations.
+    The prompt is PROMPT_TEMPLATE with the skeleton, its priority the seed, for IID random sampling and the first
+    generation of sequential conditioned sampling (SCS); IN_CONTEXT_PROMPT_TEMPLATE adds previous solutions and their
+    metrics for SCS's later generations.
 
-    A response's code is its last code block. It runs before the skeleton's online_binpack and evaluate, so it cannot
-    replace them, in a fresh `python -I` process in a temporary directory, killed after MAX_EXECUTION_TIME. Its reward
-    is the skeleton's evaluate, the negated average number of bins over the instances, deterministic for a
-    deterministic priority.
+    A response's code is its last code block. It runs before the skeleton's other functions, so it cannot replace them,
+    in a fresh `python -I` process in a temporary directory, killed after MAX_EXECUTION_TIME. Its reward is the
+    skeleton's evaluate of the inputs, higher is better; its metric is REWARD_SIGN * reward.
 
     Attributes:
         concurrency: int, codes evaluated at once
+        inputs: dict, the keyword arguments of the skeleton's evaluate
         skeleton: str, the notebook's skeleton program
-        instances: dict, the DATASET_NAME instances by name, each with its capacity, num_items and items
     """
 
-    NOTEBOOK = "packages/funsearch/bin_packing/bin_packing.ipynb"
-    DATASET_NAME = "Weibull 5k"  # Weibull 5k or OR3
-    MAX_EXECUTION_TIME = 300.0
-    PROMPT_TEMPLATE = inspect.cleandoc("""
-        Design a heuristic for online 1D bin packing that uses as few bins as possible.
-
-        Items arrive one at a time, and this program puts each into the bin of the highest priority among those it fits in:
-        ```python
-        {skeleton}
-        ```
-
-        Write a better `priority` function with the imports it needs; the rest of the program stays as it is.
-        The metric is the average number of bins used on FunSearch's {dataset_name} dataset, {num_instances} instances of {num_items} items with bins of capacity {capacity}; lower is better.
-
-        Write the function within a ```python block.
-    """)
+    NOTEBOOK = None
+    SKELETON_NAME = None  # The skeleton cell's docstring, e.g. "Finds large cap sets."
+    INPUTS = {}  # The keyword arguments of the skeleton's evaluate, e.g. {"n": 8}.
+    METRIC_NAME = None  # With its article, e.g. "a cap set size".
+    REWARD_SIGN = 1
+    MAX_EXECUTION_TIME = None
+    PROMPT_TEMPLATE = None  # Formatted with skeleton and the inputs.
     IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
         {instruction}
         Here are some example solutions from previous attempts, please improve on them:
@@ -383,7 +594,7 @@ class BinPacking:
         ```python
         {code}
         ```
-        This solution, solution {index}, got an average number of bins of {metric}.
+        This solution, solution {index}, got {metric_name} of {metric}.
     """)
     PROGRAM_TEMPLATE = inspect.cleandoc("""
         import json
@@ -394,35 +605,33 @@ class BinPacking:
 
         {skeleton}
 
-        print(evaluate(json.load(sys.stdin)))
+        print(evaluate(**json.load(sys.stdin)))
     """)
     CODE_BLOCK = re.compile(r"```(?:python)?\n?(.*?)```", re.DOTALL)
 
     def __init__(self, concurrency: int):
-        """Loads the skeleton and the DATASET_NAME instances from NOTEBOOK, its data parsed without running it.
+        """Loads the SKELETON_NAME skeleton from NOTEBOOK without running it.
 
         Args:
             concurrency: int, codes evaluated at once
         """
         self.concurrency = concurrency
-        with open(self.NOTEBOOK) as f:
-            cells = ["".join(cell["source"]) for cell in json.load(f)["cells"] if cell["cell_type"] == "code"]
-        self.skeleton = next(cell for cell in cells if "@funsearch.evolve" in cell)
-        datasets = {
-            ast.literal_eval(node.targets[0].slice): ast.literal_eval(node.value)
-            for node in ast.parse(next(cell for cell in cells if "datasets = {}" in cell)).body
-            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript)
-        }
-        self.instances = datasets[self.DATASET_NAME]
+        self.inputs = self.INPUTS
+        self.skeleton = next(cell for cell in self.code_cells() if cell.startswith(f'"""{self.SKELETON_NAME}"""'))
+
+    @classmethod
+    def code_cells(cls) -> list[str]:
+        """The sources of NOTEBOOK's code cells."""
+        with open(cls.NOTEBOOK) as f:
+            return ["".join(cell["source"]) for cell in json.load(f)["cells"] if cell["cell_type"] == "code"]
 
     def prompt(self) -> str:
         """PROMPT_TEMPLATE, the prompt of IID random sampling and of SCS's first generation."""
-        instance = next(iter(self.instances.values()))
-        return self.PROMPT_TEMPLATE.format(skeleton=self.skeleton, dataset_name=self.DATASET_NAME, num_instances=len(self.instances), num_items=instance["num_items"], capacity=instance["capacity"])
+        return self.PROMPT_TEMPLATE.format(skeleton=self.skeleton, **self.inputs)
 
     def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
         """Every response's code as a solution of one IN_CONTEXT_PROMPT_TEMPLATE, each by IN_CONTEXT_ITEM_TEMPLATE
-        with its average number of bins, -reward, numbered from 1 in the given order, for SCS's later generations.
+        with its metric, numbered from 1 in the given order, for SCS's later generations.
 
         Args:
             responses: list (G) of str, G ≥ 1, each holding code
@@ -433,7 +642,7 @@ class BinPacking:
         """
         in_contexts = []
         for i, (reward, response) in enumerate(zip(rewards, responses), 1):
-            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric=-reward, code=self.extract_code(response)))
+            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric_name=self.METRIC_NAME, metric=self.REWARD_SIGN * reward, code=self.extract_code(response)))
         return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.prompt(), item="\n\n\n".join(in_contexts))
 
     def extract_code(self, response: str) -> str | None:
@@ -448,8 +657,7 @@ class BinPacking:
             responses: list (N) of str
 
         Returns:
-            list (N) of float, each response's negated average number of bins, higher is better; -inf without code or
-            when it fails
+            list (N) of float, each response's reward, higher is better; -inf without code or when it fails
         """
         semaphore = asyncio.Semaphore(self.concurrency)
 
@@ -459,15 +667,15 @@ class BinPacking:
         return asyncio.run(evaluate_async())
 
     async def evaluate_one_async(self, code: str | None, semaphore: asyncio.Semaphore) -> float:
-        """The skeleton's evaluate of the instances with the code's priority.
+        """The skeleton's evaluate of the inputs with the code's priority.
 
         Args:
             code: str or None, defining priority
             semaphore: asyncio.Semaphore, held while the program runs
 
         Returns:
-            The negated average number of bins; -inf without code, when the program exits non-zero, prints no number
-            last or exceeds MAX_EXECUTION_TIME, or for a nonfinite score.
+            The reward; -inf without code, when the program exits non-zero, prints no number last or exceeds
+            MAX_EXECUTION_TIME, or for a nonfinite score.
         """
         if not code:
             return -math.inf
@@ -476,15 +684,110 @@ class BinPacking:
             with tempfile.TemporaryDirectory() as home:
                 with open(f"{home}/program.py", "w") as f:
                     f.write(program)
+                with open(f"{home}/inputs.json", "w") as f:
+                    json.dump(self.inputs, f)
                 try:
-                    stdout = await asyncio.wait_for(subprocess_run(
-                        [sys.executable, "-I", "program.py"], input=json.dumps(self.instances).encode(), cwd=home,
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    ), self.MAX_EXECUTION_TIME)
+                    with open(f"{home}/inputs.json", "rb") as stdin:
+                        stdout = await asyncio.wait_for(subprocess_run(
+                            [sys.executable, "-I", "program.py"], cwd=home,
+                            stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        ), self.MAX_EXECUTION_TIME)
                     reward = float(stdout.decode().splitlines()[-1])
                 except (subprocess.CalledProcessError, TimeoutError, ValueError, IndexError):
                     return -math.inf
         return reward if math.isfinite(reward) else -math.inf
+
+
+class BinPacking(FunSearchTask):
+    """Online 1D bin packing of FunSearch's DATASET_NAME instances; the reward is the negated average number of bins,
+    deterministic for a deterministic priority."""
+
+    NOTEBOOK = "packages/funsearch/bin_packing/bin_packing.ipynb"
+    SKELETON_NAME = "Finds heuristics for online 1d binpacking."
+    DATASET_NAME = "Weibull 5k"  # Weibull 5k or OR3
+    METRIC_NAME = "an average number of bins"
+    REWARD_SIGN = -1
+    MAX_EXECUTION_TIME = 300.0
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Design a heuristic for online 1D bin packing that uses as few bins as possible.
+
+        Items arrive one at a time, and this program puts each into the bin of the highest priority among those it fits in:
+        ```python
+        {skeleton}
+        ```
+
+        Write a better `priority` function with the imports it needs; the rest of the program stays as it is.
+        The metric is the average number of bins used on FunSearch's {dataset_name} dataset, {num_instances} instances of {num_items} items with bins of capacity {capacity}; lower is better.
+
+        Write the function within a ```python block.
+    """)
+
+    def __init__(self, concurrency: int):
+        """Loads the skeleton and the DATASET_NAME instances from NOTEBOOK, its data parsed without running it.
+
+        Args:
+            concurrency: int, codes evaluated at once
+        """
+        super().__init__(concurrency)
+        datasets = {
+            ast.literal_eval(node.targets[0].slice): ast.literal_eval(node.value)
+            for node in ast.parse(next(cell for cell in self.code_cells() if "datasets = {}" in cell)).body
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript)
+        }
+        self.inputs = {"instances": datasets[self.DATASET_NAME]}
+
+    def prompt(self) -> str:
+        """PROMPT_TEMPLATE, the prompt of IID random sampling and of SCS's first generation."""
+        instances = self.inputs["instances"]
+        instance = next(iter(instances.values()))
+        return self.PROMPT_TEMPLATE.format(skeleton=self.skeleton, dataset_name=self.DATASET_NAME, num_instances=len(instances), num_items=instance["num_items"], capacity=instance["capacity"])
+
+
+class CapSet(FunSearchTask):
+    """The largest cap set in n dimensions, built greedily by priority; FunSearch found 512 for n = 8."""
+
+    NOTEBOOK = "packages/funsearch/cap_set/cap_set.ipynb"
+    SKELETON_NAME = "Finds large cap sets."
+    INPUTS = {"n": 8}
+    METRIC_NAME = "a cap set size"
+    MAX_EXECUTION_TIME = 30.0
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Design a priority function that builds a cap set as large as possible: a set of vectors in {{0, 1, 2}}^{n}, no three distinct vectors of which sum to zero modulo 3.
+
+        This program builds the cap set greedily, adding the vector of highest priority among those that keep it a cap set:
+        ```python
+        {skeleton}
+        ```
+
+        Write a better `priority` function with the imports it needs; the rest of the program stays as it is.
+        The metric is the size of the cap set in n = {n} dimensions; higher is better.
+
+        Write the function within a ```python block.
+    """)
+
+
+class AdmissibleSet(FunSearchTask):
+    """The largest constant-weight admissible set A(n, w), built greedily by priority over all vectors of weight w;
+    FunSearch found the full size C(n, w) for (12, 7)."""
+
+    NOTEBOOK = "packages/funsearch/admissible_set/admissible_set.ipynb"
+    SKELETON_NAME = "Finds large admissible sets."
+    INPUTS = {"n": 12, "w": 7}
+    METRIC_NAME = "an admissible set size"
+    MAX_EXECUTION_TIME = 120.0
+    PROMPT_TEMPLATE = inspect.cleandoc("""
+        Design a priority function that builds a constant-weight admissible set A({n}, {w}) as large as possible: a set of vectors in {{0, 1, 2}}^{n}, each with {w} nonzero entries and a support no other vector has, such that any three distinct vectors have a coordinate where their values are {{0, 1, 2}}, {{0, 0, 1}} or {{0, 0, 2}}.
+
+        This program builds the admissible set greedily, adding the vector of highest priority among those that keep it admissible:
+        ```python
+        {skeleton}
+        ```
+
+        Write a better `priority` function with the imports it needs; the rest of the program stays as it is.
+        The metric is the size of the admissible set for n = {n} and w = {w}; higher is better.
+
+        Write the function within a ```python block.
+    """)
 
 
 class Story:
@@ -596,177 +899,6 @@ class Story:
         stories_valid = [story for story in stories if story]
         rewards = iter(self.judge(stories_valid) if stories_valid else [])
         return [next(rewards) if story else -math.inf for story in stories]
-
-
-class Docking:
-
-    import tdc.metadata
-    import tdc.utils
-    from meeko import MoleculePreparation, PDBQTWriterLegacy
-    from rdkit import Chem, RDLogger
-    from rdkit.Chem import AllChem
-
-    # A rejected molecule is logged by evaluate's caller, and RDKit's own parse errors raise from its Python logger.
-    RDLogger.DisableLog("rdApp.error")
-
-    PDB_ID = None
-    PROTEIN = None
-    RECEPTOR_DIR = "assets/docking"
-    N_CPUS = 4
-    EXHAUSTIVENESS = 8
-    N_POSES = 10
-    SEED = 1
-    PROMPT_TEMPLATE = inspect.cleandoc("""
-        Propose a molecule that binds {protein} as strongly as possible.
-
-        The metric is the AutoDock Vina docking score in kcal/mol; lower (more negative) is better.
-
-        Write the molecule's SMILES within a ```smiles block.
-    """)
-    IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
-        {instruction}
-        Here are some example solutions from previous attempts, please improve on them:
-
-        {item}
-
-        Please now provide your new, better solution.
-    """)
-    IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
-        # Solution {index}:
-        ```smiles
-        {molecule}
-        ```
-        This solution, solution {index}, got a Vina score of {metric}.
-    """)
-    MOLECULE_BLOCK = re.compile(r"```(?:smiles)?\n?(.*?)```", re.DOTALL)
-
-    def __init__(self, concurrency: int):
-        """Loads TDC's receptor and creates a pool whose workers start on evaluation.
-
-        Args:
-            concurrency: Maximum simultaneous molecules, each docking on N_CPUS CPUs.
-        """
-        self.concurrency = concurrency
-        self.box = self.tdc.metadata.docking_target_info[self.PDB_ID]
-        self.tdc.utils.receptor_load(self.PDB_ID, path=self.RECEPTOR_DIR)
-        self.receptor = os.path.join(self.RECEPTOR_DIR, f"{self.PDB_ID}.pdbqt")
-        self.executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=self.concurrency, mp_context=multiprocessing.get_context("spawn"), initializer=self.init_worker,
-            initargs=(self.receptor, self.box, self.N_CPUS, self.SEED),
-        )
-
-    @classmethod
-    def init_worker(cls, receptor: str, box: dict, cpu: int, seed: int) -> None:
-        """Initializes this worker's Vina and affinity maps before processing any ligands."""
-        from vina import Vina
-
-        cls.seed = seed
-        cls.vina = Vina(sf_name="vina", cpu=cpu, seed=seed, verbosity=0)
-        cls.vina.set_receptor(rigid_pdbqt_filename=receptor)
-        cls.vina.compute_vina_maps(center=list(box["center"]), box_size=list(box["size"]))
-
-    def prompt(self) -> str:
-        """PROMPT_TEMPLATE, the prompt of SCS's first generation."""
-        return self.PROMPT_TEMPLATE.format(protein=self.PROTEIN)
-
-    def prompts_with_rewards(self, responses: list[str], rewards: list[float]) -> str:
-        """Every response's molecule as a reference of one IN_CONTEXT_PROMPT_TEMPLATE, each by
-        IN_CONTEXT_ITEM_TEMPLATE with its Vina score, -reward, numbered from 1 in the given order,
-        for SCS's later generations.
-
-        Args:
-            responses: list (G) of str, G ≥ 1, each holding a code block
-            rewards: list (G) of float, each response's evaluate, finite
-
-        Returns:
-            str
-        """
-        in_contexts = []
-        for i, (reward, response) in enumerate(zip(rewards, responses), 1):
-            in_contexts.append(self.IN_CONTEXT_ITEM_TEMPLATE.format(index=i, metric=-reward, molecule=self.extract_molecule(response)))
-        return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.prompt(), item="\n\n\n".join(in_contexts))
-
-    def extract_molecule(self, response: str) -> str | None:
-        """Returns canonical SMILES from the last code block, or None for missing or invalid molecules.
-
-        A SMILES is ASCII, and RDKit's parser logs a byte-sliced window of its input that splits any multi-byte
-        character, raising SystemError out of the logger, so a non-ASCII block is rejected before parsing.
-        """
-        blocks = self.MOLECULE_BLOCK.findall(response)
-        if not blocks:
-            return None
-        smiles = blocks[-1].strip()
-        if not smiles.isascii():
-            return None
-        try:
-            molecule = self.Chem.MolFromSmiles(smiles)
-            if molecule is None or molecule.GetNumAtoms() == 0:
-                return None
-            return self.Chem.MolToSmiles(molecule)
-        except ValueError:
-            return None
-
-    @classmethod
-    def evaluate_one(cls, molecule: str | None) -> float:
-        """Returns negated best-pose affinity, or -inf when a molecule cannot be prepared or docked."""
-        if not molecule:
-            return -math.inf
-        try:
-            mol = cls.Chem.MolFromSmiles(molecule)
-            if mol is None or mol.GetNumAtoms() == 0 or len(cls.Chem.GetMolFrags(mol)) != 1:
-                return -math.inf
-            conformer = cls.Chem.AddHs(mol)
-            if cls.AllChem.EmbedMolecule(conformer, randomSeed=cls.seed) != 0:
-                return -math.inf
-            if cls.AllChem.MMFFOptimizeMolecule(conformer, maxIters=1000) != 0:
-                return -math.inf
-            pdbqt, success, error = cls.PDBQTWriterLegacy.write_string(cls.MoleculePreparation().prepare(conformer)[0])
-            if not success:
-                return -math.inf
-        except ValueError:
-            return -math.inf
-        try:
-            cls.vina.set_ligand_from_string(pdbqt)
-        except TypeError as error:
-            if "PDBQT parsing error" not in str(error):
-                raise
-            return -math.inf
-        cls.vina.dock(exhaustiveness=cls.EXHAUSTIVENESS, n_poses=cls.N_POSES)
-        energies = cls.vina.energies(n_poses=1)
-        if len(energies) == 0:
-            return -math.inf
-        reward = -float(energies[0][0])
-        return reward if math.isfinite(reward) else -math.inf
-
-    def evaluate(self, responses: list[str]) -> list[float]:
-        """Evaluates every molecule without caching, reusing the pool and its affinity maps.
-
-        Args:
-            responses: list (N) of str, each holding a SMILES code block.
-
-        Returns:
-            list (N) of float, negated best-pose affinities in kcal/mol, higher is better;
-            -inf without a molecule or when it is rejected. System errors propagate.
-        """
-        return list(self.executor.map(self.evaluate_one, map(self.extract_molecule, responses)))
-
-
-class Docking3PBL(Docking):
-
-    PDB_ID = "3pbl"
-    PROTEIN = "the dopamine type 3 receptor (DRD3)"
-
-
-class Docking2RGP(Docking):
-
-    PDB_ID = "2rgp"
-    PROTEIN = "the epidermal growth factor receptor (EGFR)"
-
-
-class Docking3EML(Docking):
-
-    PDB_ID = "3eml"
-    PROTEIN = "the adenosine A2A receptor"
 
 
 class ArcAgi:
@@ -883,11 +1015,14 @@ class ArcAgi2(ArcAgi):
 
 TASKS_CLS = {
     "openfoam": OpenFOAM,
+    "fluidx3d": FluidX3D,
     "circle-packing": CirclePacking,
     "kissing-number": KissingNumber,
     "maxmin-distance-ratio": MaxMinDistanceRatio,
     "sum-difference-sets": SumDifferenceSets,
     "bin-packing": BinPacking,
+    "cap-set": CapSet,
+    "admissible-set": AdmissibleSet,
     "story": Story,
     "docking-3pbl": Docking3PBL,
     "docking-2rgp": Docking2RGP,

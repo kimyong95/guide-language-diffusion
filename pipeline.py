@@ -219,10 +219,9 @@ class Pipeline:
 
         Over a group of G prompts, p_k is the model's next-token distribution under prompt k after its repetition and
         presence penalties and before its temperature, and w are group_logit_processor's weights of the prompts'
-        utilities. GroupLogitProcessor's mixture is guide.md's product Π_k p_k^(w_k) with its negative guidance relative
-        to the geometric mean Π_k p_k^(1/G) clipped to lower probabilities only, of w summing to 1. The temperature,
-        top-k, top-p and min-p apply to the mixture as they do in generate, so a group of one prompt samples as
-        generate does.
+        utilities. GroupLogitProcessor's mixture is guide.md's product Π_k p_k^(w_k), of w summing to 1. The
+        temperature, top-k, top-p and min-p apply to the mixture as they do in generate, so a group of one prompt
+        samples as generate does.
 
         Args:
             all_prompts: list (B) of list (G_b) of str, each group's prompts
