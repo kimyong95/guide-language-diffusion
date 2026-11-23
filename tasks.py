@@ -797,7 +797,7 @@ class Story:
     (SCS), and IN_CONTEXT_PROMPT_TEMPLATE with references and their rewards for its later generations. There is no seed
     story.
 
-    A response's story is its last code block's. A story's reward is REWARD_MODEL_NAME's score of the
+    A response's story is the whole response, stripped. A story's reward is REWARD_MODEL_NAME's score of the
     chat of USER_PROMPT and the story as the assistant's reply, in its chat template without a system turn as its model
     card recommends; REWARD_MODEL_NAME is loaded on the first visible GPU at construction and scores concurrency stories
     per forward pass.
@@ -810,7 +810,7 @@ class Story:
 
         The metric is the reward model score; higher is better.
 
-        Write within a ```text block.
+        Reply with the story only.
     """)
     IN_CONTEXT_PROMPT_TEMPLATE = inspect.cleandoc("""
         {instruction}
@@ -822,12 +822,9 @@ class Story:
     """)
     IN_CONTEXT_ITEM_TEMPLATE = inspect.cleandoc("""
         # Solution {index}:
-        ```text
         {story}
-        ```
         This solution, solution {index}, got a reward model score of {metric}.
     """)
-    STORY_BLOCK = re.compile(r"```(?:text)?\n?(.*?)```", re.DOTALL)
 
     def __init__(self, concurrency: int):
         """Loads REWARD_MODEL_NAME on the first visible GPU.
@@ -848,7 +845,7 @@ class Story:
         with its reward, numbered from 1 in the given order, for SCS's later generations.
 
         Args:
-            responses: list (G) of str, G ≥ 1, each holding a code block
+            responses: list (G) of str, G ≥ 1, each nonempty after stripping
             rewards: list (G) of float, each response's evaluate, finite
 
         Returns:
@@ -860,9 +857,8 @@ class Story:
         return self.IN_CONTEXT_PROMPT_TEMPLATE.format(instruction=self.prompt(), item="\n\n\n".join(in_contexts))
 
     def extract_story(self, response: str) -> str | None:
-        """The response's last code block, its text tag dropped, stripped; None without one or when it is empty."""
-        stories = self.STORY_BLOCK.findall(response)
-        return (stories[-1].strip() or None) if stories else None
+        """The response, stripped; None when it is empty."""
+        return response.strip() or None
 
     @torch.no_grad()
     def judge(self, stories: list[str]) -> list[float]:
@@ -889,11 +885,11 @@ class Story:
         """Evaluates the responses' stories, concurrency per forward pass of REWARD_MODEL_NAME.
 
         Args:
-            responses: list (N) of str, each holding a code block
+            responses: list (N) of str
 
         Returns:
             list (N) of float, REWARD_MODEL_NAME's score of each response's story as the reply to USER_PROMPT,
-            unbounded, higher is better; -inf without a story
+            unbounded, higher is better; -inf for an empty response
         """
         stories = [self.extract_story(response) for response in responses]
         stories_valid = [story for story in stories if story]
