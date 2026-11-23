@@ -9,7 +9,7 @@ def get_config():
     config.task.name = "circle-packing"
     config.task.concurrency = 64
 
-    config.M = 200  # number of samples
+    config.M = 10000  # number of samples
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen-next-instruct"
