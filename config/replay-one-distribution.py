@@ -4,22 +4,20 @@ def get_config():
     config = ml_collections.ConfigDict()
 
     config.seed = 0
-    config.run_name = "mix-distribution"
+    config.run_name = "replay-one-distribution"
     config.task = ml_collections.ConfigDict()
     config.task.name = "story"
     config.task.concurrency = 32
 
-    config.L = 1000  # number of steps
-    config.M = 100   # number of new samples per step
-    config.N = 5     # number of distributions
-    config.E = 3     # number of in-context examples per distribution
-    config.reward_policy = "random"  # "random", "random-exp", "random-flip-exp" or "measure"
+    config.L = 100  # number of steps
+    config.M = 100  # number of new samples per step
+    config.K = 5    # number of top distinct samples whose E-combinations are the candidates
+    config.E = 3    # number of in-context examples per distribution
 
     config.model = ml_collections.ConfigDict()
     config.model.name = "qwen3.5-4b"
     config.model.max_new_tokens = 8192
     config.model.enable_thinking = False
     config.model.reasoning_effort = None
-    config.model.sampling_params = "default"  # "default" or "raw"
 
     return config

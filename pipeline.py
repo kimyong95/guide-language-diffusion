@@ -11,7 +11,6 @@ task's evaluation has that GPU memory.
 
 import contextlib
 import os
-import statistics
 import uuid
 
 import torch
@@ -190,15 +189,15 @@ class Pipeline:
         return [self.strip_thinking(output["text"]) for output in outputs]
 
     def log_probs(self, prompts, responses):
-        """Each response's length-normalized log probability under the model at temperature 1 after each prompt, the
-        response being its tokens and the EOS right after the prompt's chat template.
+        """Each response's log probability under the model at temperature 1 after each prompt, the response being its
+        tokens and the EOS right after the prompt's chat template.
 
         Args:
             prompts: list (N) of str
             responses: list (M) of str
 
         Returns:
-            (N, M) float64, the mean of the response's token log probabilities after the prompt, its EOS included
+            (N, M) float64, the sum of the response's token log probabilities after the prompt, its EOS included
         """
         prompt_tokens = self.apply_chat_template(prompts, enable_thinking=self.enable_thinking, reasoning_effort=self.reasoning_effort)
         response_tokens = [self.tokenizer(response, add_special_tokens=False).input_ids + [self.tokenizer.eos_token_id] for response in responses]
@@ -210,7 +209,7 @@ class Pipeline:
                 logprob_start_len=[len(tokens) - 1 for tokens in prompt_tokens for _ in response_tokens],
             )
         # Each list starts at the prompt's last token, whose entry is None.
-        log_P = [statistics.fmean(logprob for logprob, _, _ in output["meta_info"]["input_token_logprobs"][1:]) for output in outputs]
+        log_P = [sum(logprob for logprob, _, _ in output["meta_info"]["input_token_logprobs"][1:]) for output in outputs]
         return torch.tensor(log_P, dtype=torch.float64).view(len(prompts), len(responses))
 
     def group_generate(self, all_prompts, all_utilities, group_logit_processor=GroupLogitProcessor):
